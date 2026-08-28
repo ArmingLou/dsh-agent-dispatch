@@ -53,6 +53,7 @@ const ctx = {
   commands: { register: d => { commands.push(d.name); return () => {} } },
   subagents: {},
   get: () => undefined,
+  on: () => () => {},
 }
 mod.apply(ctx)
 await new Promise(r => setTimeout(r, 300))
