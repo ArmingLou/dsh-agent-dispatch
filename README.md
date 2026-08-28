@@ -1,5 +1,7 @@
 # dsh-agent-dispatch
 
+[![CI](https://github.com/kiligzzz/dsh-agent-dispatch/actions/workflows/ci.yml/badge.svg)](https://github.com/kiligzzz/dsh-agent-dispatch/actions/workflows/ci.yml)
+
 > DeepSeek Harness 插件 · 自定义 Agent + 自动路由 + 小队编排
 >
 > [English](README.en.md) | **简体中文**

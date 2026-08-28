@@ -1,5 +1,7 @@
 # dsh-agent-dispatch
 
+[![CI](https://github.com/kiligzzz/dsh-agent-dispatch/actions/workflows/ci.yml/badge.svg)](https://github.com/kiligzzz/dsh-agent-dispatch/actions/workflows/ci.yml)
+
 > DeepSeek Harness plugin · User-defined agents + automatic routing + squad orchestration
 >
 > **简体中文** | English
