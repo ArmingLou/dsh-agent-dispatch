@@ -14,6 +14,15 @@
     "multi-agent"
   ],
   "license": "MIT",
+  "author": "kiligzzz <zyfkilig@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kiligzzz/dsh-agent-dispatch.git"
+  },
+  "homepage": "https://github.com/kiligzzz/dsh-agent-dispatch#readme",
+  "bugs": {
+    "url": "https://github.com/kiligzzz/dsh-agent-dispatch/issues"
+  },
   "type": "module",
   "main": "index.js",
   "exports": {
