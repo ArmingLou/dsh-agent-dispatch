@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.1 (2026-08-28)
+
+工程维护（无功能变更）：
+
+- 新增 `.gitignore`（node_modules、日志、OS 文件、本地数据目录）。
+- 新增 GitHub Actions CI：`node verify.mjs` 一致性断言 + 冒烟，push 与 PR 触发。
+- 修复 `verify.mjs` 冒烟桩缺 `ctx.on`，消除 `subagent/end 订阅失败` 误报。
+- `package.json` 补 `author` / `repository` / `homepage` / `bugs` 元数据。
+
 ## 1.1.0 (2026-08-28)
 
 破坏性重构：`expert` 全面改名 `agent`，删除全部内置 Agent 与小队。
