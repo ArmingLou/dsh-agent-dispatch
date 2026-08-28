@@ -1,0 +1,17 @@
+# @kiligzzz/dsh-agent-dispatch bundle patch: mounts the dual-face plugin
+# row into the profile roster. Applied as a profile bundle layer (the
+# dsh.bundle.patch manifest field) over dsh-base.
+#
+# The row is a bare plugin by package name: the node half (exports ".")
+# runs in the host process — it owns ALL business logic (the expert
+# registry at $DSH_HOME/data/dsh-agent-dispatch/experts.json, the
+# expert_dispatch / expert_followup / expert_list / expert_squad /
+# expert_import_skill tools over ctx.subagents.startContinuable, the
+# routing prompt section, and the /expert-api REST face). The dsh.client
+# declaration in package.json reserves the browser half (exports
+# "./client") which registers the main panel into the host
+# conversation.view slot, the session-header back button, the /
+# trigger Agent menu, and the floating action ball.
+- insert:
+    - id: dsh-agent-dispatch
+      name: '@kiligzzz/dsh-agent-dispatch'

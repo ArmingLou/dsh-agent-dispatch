@@ -1,0 +1,46 @@
+{
+  "name": "@kiligzzz/dsh-agent-dispatch",
+  "version": "1.0.0",
+  "description": "Pre-configured expert agents with automatic routing for DeepSeek Harness: fixed-persona continuable subagents (requirement analyst / code reviewer / log tracer / SQL analyst), per-expert model routes with failover, dispatch/followup/list/squad/import tools, and a routing prompt section. Dual-face dsh plugin (host + browser half), no DSH source changes.",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "plugin",
+    "subagent",
+    "expert",
+    "routing",
+    "dispatch",
+    "multi-agent"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.0 <5"
+  }
+}
