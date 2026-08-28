@@ -3,7 +3,7 @@
 //
 // 校验"包名全链路一致"：package.json name / cordis.patch.yml 插件行 /
 // （本插件无 tsdown banner，ModuleLoader id 由 exports 隐含 = 包名）。
-// 同时冒烟：模块可加载、apply 桩测试全绿、4 内置 Agent 齐备。
+// 同时冒烟：模块可加载、apply 桩测试全绿、无内置 Agent（v1.1 全清空）。
 
 import { readFileSync, existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
@@ -34,7 +34,7 @@ if (!clientJs.includes('window.__ModuleLoader__.load')) errors.push('lib/client.
 if (!clientJs.includes("id: '@kiligzzz/dsh-agent-dispatch'")) errors.push('lib/client.js ModuleLoader id 必须是裸包名 @kiligzzz/dsh-agent-dispatch')
 
 // 4. 关键文件存在
-for (const f of ['index.js', 'lib/client.js', 'lib/experts.js', 'lib/dispatch.js', 'lib/defaults.js', 'lib/squads.js', 'lib/squad-registry.js', 'lib/skill-import.js', 'README.md', 'CHANGELOG.md', 'LICENSE']) {
+for (const f of ['index.js', 'lib/client.js', 'lib/agents.js', 'lib/dispatch.js', 'lib/defaults.js', 'lib/squads.js', 'lib/squad-registry.js', 'lib/skill-import.js', 'README.md', 'CHANGELOG.md', 'LICENSE']) {
   if (!existsSync(path.join(root, f))) errors.push(`缺文件: ${f}`)
 }
 
@@ -56,16 +56,14 @@ const ctx = {
 }
 mod.apply(ctx)
 await new Promise(r => setTimeout(r, 300))
-for (const t of ['expert_dispatch', 'expert_followup', 'expert_list', 'expert_squad', 'expert_import_skill']) {
+for (const t of ['agent_dispatch', 'agent_followup', 'agent_list', 'agent_squad', 'agent_import_skill']) {
       // 小队注册表：内置 3 队可加载
   if (!tools.includes(t)) errors.push(`apply 未注册工具 ${t}`)
 }
-if (commands.includes('expert')) errors.push('v0.9.37: /expert 命令应已删除')
-const reg = JSON.parse(rf(path.join(tmp, 'data', 'dsh-agent-dispatch', 'experts.json'), 'utf8'))
-const need = ['requirement-analyst', 'code-reviewer', 'log-tracer', 'sql-analyst']
-for (const id of need) {
-  if (!reg.experts.some(e => e.id === id)) errors.push(`内置 Agent 缺 ${id}`)
-}
+if (commands.includes('agent')) errors.push('v0.9.37: /agent 命令应已删除')
+const reg = JSON.parse(rf(path.join(tmp, 'data', 'dsh-agent-dispatch', 'agents.json'), 'utf8'))
+// v1.1：不再预置任何内置 Agent，全新安装从空列表开始
+if (!Array.isArray(reg.agents) || reg.agents.length !== 0) errors.push(`v1.1: agents.json 应为空数组，实际 ${reg.agents?.length ?? '非数组'} 个`)
 rmSync(tmp, { recursive: true, force: true })
 
 if (errors.length) {
@@ -81,7 +79,7 @@ if (errors.length) {
   if (!c.includes('order: 21')) throw new Error('v0.6: conversation.view 注册缺 order=21')
   if (c.includes('slots.inject("settings.section"')) throw new Error('v0.9.36: settings.section 槽注册应已删除（设置页整体移除）')
   if (c.includes('agent-dispatch-settings')) throw new Error('v0.9.36: settings 分区 id agent-dispatch-settings 应已移除')
-  if (c.includes('agent-dispatch-experts') || c.includes('agent-dispatch-activity')) throw new Error('v0.6: 旧 settings 分区 id 应已移除')
+  if (c.includes('agent-dispatch-agents') || c.includes('agent-dispatch-activity')) throw new Error('v0.6: 旧 settings 分区 id 应已移除')
   if (!c.includes('mountAgentFab')) throw new Error('v0.6: 缺悬浮活动按钮 mountAgentFab')
   if (!c.includes('FAB_VIS_KEY')) throw new Error('v0.9.36: 缺悬浮球总开关持久化键 FAB_VIS_KEY')
   if (!c.includes('setFabVisible')) throw new Error('v0.9.36: 缺悬浮球总开关 setFabVisible')
@@ -100,14 +98,14 @@ const host = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
 if (!host.includes("ctx.on('subagent/end'")) throw new Error('v0.7.1: host 缺 subagent/end 订阅')
 if (!host.includes('onChildEnd')) throw new Error('v0.7.1: 缺 onChildEnd 生命周期终结')
 if (!host.includes('mergeDispatchHistory')) throw new Error('v0.7.1: 缺真实结局合并')
-// v0.9.16：最近委派按小队聚合需小队名/头像回填；子代理 label 带专家名前缀（任务管理页可辨人）
+// v0.9.16：最近委派按小队聚合需小队名/头像回填；子代理 label 带Agent名前缀（任务管理页可辨人）
 if (!host.includes('next.squadName = sq?.name')) throw new Error('v0.9.16: mergeDispatchHistory 应按 viaSquad 回填小队名')
-// v0.9.35：label 在专家名后拼 squadMark（S{n}/{total}）——断言 squadMark 构造与拼接逻辑存在
+// v0.9.35：label 在Agent名后拼 squadMark（S{n}/{total}）——断言 squadMark 构造与拼接逻辑存在
 const dispatchSrc = readFileSync(path.join(root, 'lib/dispatch.js'), 'utf8')
 if (!dispatchSrc.includes("const squadMark = viaSquad && totalSteps != null && stepIndex != null")) throw new Error('v0.9.35: dispatch 应构造 squadMark（S{n}/{total}）')
-if (!dispatchSrc.includes('`${expert.name}${squadMark} · ${taskLabel}`')) throw new Error('v0.9.35: startContinuable label 应带专家名 + squadMark 前缀')
+if (!dispatchSrc.includes('`${agent.name}${squadMark} · ${taskLabel}`')) throw new Error('v0.9.35: startContinuable label 应带Agent名 + squadMark 前缀')
 if (!dispatchSrc.includes('totalSteps = null')) throw new Error('v0.9.35: dispatch 应接收 totalSteps 参数')
-if (!host.includes('totalSteps: squad.steps.length')) throw new Error('v0.9.35: expert_squad 调用 dispatch 应传 totalSteps')
+if (!host.includes('totalSteps: squad.steps.length')) throw new Error('v0.9.35: agent_squad 调用 dispatch 应传 totalSteps')
 // v0.9.36/0.9.38：waitResult——默认 false（直接调 Agent 不阻塞），squad 步骤显式 true
 if (!dispatchSrc.includes('waitResult = false')) throw new Error('v0.9.38: dispatch 应默认 waitResult=false（直接调不阻塞）')
 if (!dispatchSrc.includes('waitTimeoutMs = 3600000')) throw new Error('v0.9.36: 等待超时应默认 1 小时')
@@ -120,12 +118,12 @@ if (!host.includes('（步骤 ${idx + 1} 结论）')) throw new Error('v0.9.36: 
 // v0.9.39：宿主 dsh-tools 不支持 type 数组——output 可空须 oneOf（type:['string','null'] 直接拒启动）
 if (!host.includes('output: { oneOf: [{ type: \'string\' }, { type: \'null\' }] }')) throw new Error('v0.9.39: output 应 oneOf 表达可空（禁 type 数组）')
 if (host.includes('output: { type: [\'string\', \'null\'] }')) throw new Error('v0.9.39: output 禁 type 数组（dsh-tools 拒）')
-// v0.9.40：activeChildren 改 childId 主 key（同专家并发步骤覆盖 → waiter 永挂 → 小队卡死/卡片缺）
+// v0.9.40：activeChildren 改 childId 主 key（同Agent并发步骤覆盖 → waiter 永挂 → 小队卡死/卡片缺）
 if (!dispatchSrc.includes('this.activeChildren.set(childId, {')) throw new Error('v0.9.40: activeChildren 应以 childId 为主 key')
-if (!dispatchSrc.includes('this.byExpert = new Map()')) throw new Error('v0.9.40: 缺 byExpert 二级索引（专家复用续聊）')
+if (!dispatchSrc.includes('this.byAgent = new Map()')) throw new Error('v0.9.40: 缺 byAgent 二级索引（Agent复用续聊）')
 if (!dispatchSrc.includes('const entry = this.activeChildren.get(childId)')) throw new Error('v0.9.40: onChildEnd 应 childId 直查')
 if (!dispatchSrc.includes('dedicatedChild = false')) throw new Error('v0.9.40: dispatch 应有 dedicatedChild 参数')
-if (!host.includes('waitResult: true, dedicatedChild: true')) throw new Error('v0.9.40: expert_squad 步骤应传 dedicatedChild: true')
+if (!host.includes('waitResult: true, dedicatedChild: true')) throw new Error('v0.9.40: agent_squad 步骤应传 dedicatedChild: true')
 // v0.9.37：完成呼吸光常驻 + 点击回退——断言 done-glow infinite、clearDoneGlow、poll 状态校正
 const clientSrc = readFileSync(path.join(root, 'lib/client.js'), 'utf8')
 if (!clientSrc.includes('ad-fab-glow-done 1.6s ease-in-out infinite')) throw new Error('v0.9.37: done-glow 应为无限循环（常驻）')
@@ -133,7 +131,7 @@ if (!clientSrc.includes('const clearDoneGlow = () => {')) throw new Error('v0.9.
 if (!clientSrc.includes('clearDoneGlow();')) throw new Error('v0.9.37: togglePop 应调用 clearDoneGlow')
 if (!clientSrc.includes('fab.classList.remove("done-glow")')) throw new Error('v0.9.37: poll 应去 done-glow（活跃让位）')
 if (!clientSrc.includes('doneCount > 0 && !fab.classList.contains("done-glow")')) throw new Error('v0.9.37: poll 应恢复完成光（doneCount>0 无活跃）')
-if (!host.includes('/expert-api/cancel')) throw new Error('v0.7.1: 缺 cancel 端点')
+if (!host.includes('/agent-api/cancel')) throw new Error('v0.7.1: 缺 cancel 端点')
 // v0.9.30：删除委派历史——ts 是 ISO 字符串（new Date().toISOString()），
 // 旧逻辑 Number(body.ts) → NaN → 一律 400「缺少有效 ts」；须兼容字符串/数字并按字符串比对
 if (!host.includes("typeof ts === 'string' ? ts.length > 0 : Number.isFinite(Number(ts))")) throw new Error('v0.9.30: remove 应兼容字符串/数字 ts 校验')
@@ -159,10 +157,10 @@ if (!c.includes('{ text: "$" + id + " ", continue: true }')) throw new Error('v0
 // v0.8.2：小队开关 + 执行流 SVG 图 + 删用量角标 + POST 路由合并
 if (!c.includes('function SquadFlowGraph')) throw new Error('v0.8.2: 缺小队执行流 SVG 拓扑图组件 SquadFlowGraph')
 if (!c.includes('ad-flow-svg')) throw new Error('v0.8.2: 缺执行流图 CSS ad-flow-svg')
-if (!c.includes('/expert-api/squad/toggle')) throw new Error('v0.8.2: 小队开关应调 /squad/toggle')
+if (!c.includes('/agent-api/squad/toggle')) throw new Error('v0.8.2: 小队开关应调 /squad/toggle')
 if (c.includes('近50次') || c.includes('ad-usage')) throw new Error('v0.8.2: Agent 卡用量角标（近50次）应已删除')
-if (!host.includes('case \'/expert-api/squad/toggle\'')) throw new Error('v0.8.2: host 缺 /squad/toggle 端点')
-if (!host.includes('squad.enabled === false')) throw new Error('v0.8.2: expert_squad 应拦截停用小队')
+if (!host.includes('case \'/agent-api/squad/toggle\'')) throw new Error('v0.8.2: host 缺 /squad/toggle 端点')
+if (!host.includes('squad.enabled === false')) throw new Error('v0.8.2: agent_squad 应拦截停用小队')
 if (host.split("if (req.method === 'POST')").length !== 2) throw new Error('v0.8.2: restHandler 应只有一个 POST 块（此前双块 default 404 吞 toggle）')
 // v0.8.3：DSH 官方 logo + 执行流弹窗大图 + 悬浮球随处可拖 + 历史兜底
 if (!c.includes('DSH_LOGO_PATH') || !c.includes('function DSHLogo')) throw new Error('v0.8.3: 缺内联 DSH 官方 logo（DSH_LOGO_PATH / DSHLogo）')
@@ -184,8 +182,8 @@ if (!c.includes('ad-modal-graph')) throw new Error('v0.9.3: 执行流弹窗应�
 if (!c.includes('textAnchor: "middle"')) throw new Error('v0.9.3: S 徽标文字应 text-anchor:middle 居中')
 if (!c.includes('width: W') || !c.includes('height: H')) throw new Error('v0.9.3: SVG 应设自然像素尺寸（防单节点拉伸撑满）')
 if (!c.includes('squadStepsText')) throw new Error('v0.9.3: 图下文字流摘要应走 squadStepsText')
-if (!c.includes('/expert-api/history/remove')) throw new Error('v0.8.5: 历史删除应调 /history/remove')
-if (!host.includes("case '/expert-api/history/remove'")) throw new Error('v0.8.5: host 缺 /history/remove 端点')
+if (!c.includes('/agent-api/history/remove')) throw new Error('v0.8.5: 历史删除应调 /history/remove')
+if (!host.includes("case '/agent-api/history/remove'")) throw new Error('v0.8.5: host 缺 /history/remove 端点')
 if (!c.includes('ad-fab-pop-head') || !c.includes('ad-fab-pop-foot')) throw new Error('v0.8.5: 悬浮球应改大浮动活动面板（头/体/脚）')
 if (c.includes('显示模式：一直') || c.includes('显示模式：自动')) throw new Error('v0.8.5: 右键菜单不应再有显示模式项')
 // v0.8.6：活动面板打开即时渲染（缓存 lastActive，不闪加载中）
@@ -209,7 +207,9 @@ if (c.includes('"🤖"') || c.includes('"🧩"')) throw new Error('v0.8.9: UI �
 if (!c.includes('function dshLogoSvg')) throw new Error('v0.8.9: 缺原生 DOM 场景的 dshLogoSvg helper')
 const def = readFileSync(new URL('./lib/defaults.js', import.meta.url), 'utf8')
 const sqd = readFileSync(new URL('./lib/squads.js', import.meta.url), 'utf8')
-if (!/emoji: ''/.test(def) || !/emoji: ''/.test(sqd)) throw new Error('v0.8.9: 内置 Agent/小队不应再预置 emoji')
+// v1.1：内置 Agent/小队全部清空，DEFAULT_AGENTS / DEFAULT_SQUADS 均为空数组
+if (!/DEFAULT_AGENTS = \[\]/.test(def)) throw new Error('v1.1: DEFAULT_AGENTS 应为空数组')
+if (!/DEFAULT_SQUADS = \[\]/.test(sqd)) throw new Error('v1.1: DEFAULT_SQUADS 应为空数组')
 // v0.8.9b：设置不自动返回（popView）、彩色流光 box-shadow 动画、色调 5 选、设置右上角、Agent 列表折叠分区、委派悬停双按钮
 if (!c.includes('popView') || !c.includes('popView === "main"')) throw new Error('v0.8.9b: 应加 popView 状态防止设置视图被异步重绘覆盖')
 // v0.9.32：悬停快捷按钮（⇱/⇲）移除——卡片点击统一直达主会话；小队整体卡不展开成员
@@ -293,14 +293,14 @@ if (!c.includes('ad-seg')) throw new Error('v0.9.17: 历史页应有 Agent/小�
 if (!c.includes('Agent 历史') || !c.includes('小队历史')) throw new Error('v0.9.17: 分段按钮文案缺失')
 if (!c.includes('function histHead')) throw new Error('v0.9.17: 两列表行头应统一（histHead）')
 if (!c.includes('st-done') || !c.includes('st-fail') || !c.includes('st-run')) throw new Error('v0.9.17: 执行流图应有节点状态着色类')
-if (!c.includes('statuses') || !c.includes('SquadFlowGraph({ steps, experts, large, onOpen, statuses })')) throw new Error('v0.9.17: SquadFlowGraph 应接收 statuses')
+if (!c.includes('statuses') || !c.includes('SquadFlowGraph({ steps, agents, large, onOpen, statuses })')) throw new Error('v0.9.17: SquadFlowGraph 应接收 statuses')
 if (!c.includes('remove-run')) throw new Error('v0.9.17: 应有删除整次运行（remove-run）')
 if (!c.includes('squadRunId')) throw new Error('v0.9.17: 客户端应按 squadRunId 聚合运行')
 // v0.9.17 宿主：运行日志两行（start 拓扑快照 + end 终态）+ dispatch 带 squadRunId/stepIndex + remove-run 端点
 if (!host.includes("kind: 'squad-run'")) throw new Error('v0.9.17: 宿主应写 squad-run 运行日志')
 if (!host.includes("phase: 'start'") || !host.includes("phase: 'end'")) throw new Error('v0.9.17: 运行日志应有 start/end 两阶段')
 if (!host.includes('viaSquad: squad.id, squadRunId, stepIndex: idx')) throw new Error('v0.9.17: 小队步骤派发应带 squadRunId+stepIndex')
-if (!host.includes("'/expert-api/history/remove-run'")) throw new Error('v0.9.17: 应有 remove-run 端点')
+if (!host.includes("'/agent-api/history/remove-run'")) throw new Error('v0.9.17: 应有 remove-run 端点')
 if (!host.includes("row.kind === 'squad-run'")) throw new Error('v0.9.17: mergeDispatchHistory 应透传运行日志行')
 // v0.9.21：历史页列头行 + 执行流图例 + 整面板毛玻璃（与悬浮球统一）
 if (!c.includes('ad-hist-colhead')) throw new Error('v0.9.21: 历史列表应有列头行（ad-hist-colhead）')
@@ -390,8 +390,10 @@ if (!c.includes('function bindPersistentState(getter, setter)')) throw new Error
 if (!c.includes('bindPersistentState(() => uiState.tab')) throw new Error('v0.9.29: AgentPanel tab 应走持久化状态')
 if (!c.includes('bindPersistentState(() => uiState.histSub') || !c.includes('bindPersistentState(() => uiState.histKey')) throw new Error('v0.9.29: 历史分段/展开行应走持久化状态')
 if (!c.includes('uiSubs')) throw new Error('v0.9.29: 持久化状态应有订阅同步机制（uiSubs）')
-  // UI 可见字符串里不应再有「专家」（REST 字段名/注释除外——只查 createElement 字符串字面量）
-  const uiStrings = c.match(/"[^"\n]*专家[^"\n]*"/g) || []
-  if (uiStrings.length > 0) throw new Error('v0.6: UI 字符串残留「专家」: ' + uiStrings.join(' | '))
+  // v1.1：UI 可见字符串里不应再残留「专家」与「expert」（REST 字段名/注释除外——只查 createElement 字符串字面量）
+  const uiExpertZh = c.match(/"[^"\n]*专家[^"\n]*"/g) || []
+  if (uiExpertZh.length > 0) throw new Error('v1.1: UI 字符串残留「专家」: ' + uiExpertZh.join(' | '))
+  const uiExpertEn = c.match(/"[^"\n]*expert[^"\n]*"/g) || []
+  if (uiExpertEn.length > 0) throw new Error('v1.1: UI 字符串残留「expert」: ' + uiExpertEn.join(' | '))
 }
-console.log(`OK: ${PKG_NAME} v${pkg.version} 一致性链 ${need.length} Agent + ${tools.length} 工具 + /${commands.join('/')} 命令`)
+console.log(`OK: ${PKG_NAME} v${pkg.version} 一致性链（无内置 Agent）+ ${tools.length} 工具 + /${commands.join('/')} 命令`)

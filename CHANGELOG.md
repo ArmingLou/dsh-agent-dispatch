@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.1.0 (2026-08-28)
+
+破坏性重构：`expert` 全面改名 `agent`，删除全部内置 Agent 与小队。
+
+**核心变更**
+- 工具改名：`expert_dispatch` / `expert_followup` / `expert_list` /
+  `expert_squad` / `expert_import_skill` → `agent_dispatch` / `agent_followup` /
+  `agent_list` / `agent_squad` / `agent_import_skill`。
+- 数据文件与字段：`experts.json` → `agents.json`；`expertId` / `expertName` /
+  `expert` / `experts` → `agentId` / `agentName` / `agent` / `agents`。
+- 类名：`ExpertRegistry` → `AgentRegistry`、`skillToExpert` → `skillToAgent`、
+  `ExpertForm` → `AgentForm`；文件 `lib/experts.js` → `lib/agents.js`。
+- REST 面：`/expert-api/*` → `/agent-api/*`。
+- **删除 4 个内置 Agent**（requirement-analyst / code-reviewer / log-tracer / sql-analyst）
+  与 **3 个内置小队**（dev-pipeline / debug-squad / review-squad）；`DEFAULT_AGENTS`、
+  `DEFAULT_SQUADS` 置空数组，全新安装从空列表开始。
+- 删除 `deletedIds` 防复活机制（无内置可删，不再需要）。
+- README 双语重写：悬浮球截图上移、换用户提供的 7 张真实 UI 图、扩充用法章节。
+
+**破坏性**
+- `expert_*` 工具名失效：既有会话/脚本里写 `expert_dispatch` 的需改为 `agent_dispatch`。
+- 已落盘的 `experts.json` 不再读取（改名 `agents.json`），历史委派记录清空重来。
+
 ## 1.0.0 (2026-08-28)
 
 首个对外正式版。经历 40 个内部迭代后定型：双面插件（host + browser），

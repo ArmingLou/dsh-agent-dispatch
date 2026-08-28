@@ -1,32 +1,32 @@
 // @kiligzzz/dsh-agent-dispatch — host half.
 //
-// 预置专家 agent + 自动路由 + 小队编排插件的宿主半。
+// 预置Agent agent + 自动路由 + 小队编排插件的宿主半。
 //
 // 职责：
-//   - 专家注册表（$DSH_HOME/data/dsh-agent-dispatch/experts.json，改完即生效）
-//   - 五个模型工具：expert_dispatch / expert_followup / expert_list /
-//     expert_squad / expert_import_skill
+//   - Agent 注册表（$DSH_HOME/data/dsh-agent-dispatch/agents.json，改完即生效）
+//   - 五个模型工具：agent_dispatch / agent_followup / agent_list /
+//     agent_squad / agent_import_skill
 //   - systemPrompt 路由表 section（引导主 agent 按任务领域自动委派）
-//   - /expert-api REST 面（v1.0：主面板 + 总览页 + 悬浮球全数据通道）
+//   - /agent-api REST 面（v1.0：主面板 + 总览页 + 悬浮球全数据通道）
 //
 // 委派走 ctx.subagents.startContinuable（宿主原生可续聊子代理），
-// persona 注入专家系统提示词，agentOptions 按专家 routes 做模型路由
+// persona 注入Agent系统提示词，agentOptions 按Agent routes 做模型路由
 // 与失败互备。零 @deepseek-ai/dsh-tools 依赖（规避官方双实例 bug
 // #1697/#783），工具注册用 ctx.tools.register 裸对象最小形状。
 //
 // 以 profile bundle 行挂载（cordis.patch.yml + dsh.bundle.patch）。
 // 浏览器半（lib/client.js）注册主面板到宿主 conversation.view 槽，
 // + 会话头部返回按钮 + / 触发器 Agent 候选菜单 + 悬浮活动球，
-// 统统走同源 fetch 调 /expert-api/*。
+// 统统走同源 fetch 调 /agent-api/*。
 
 import path from 'node:path'
 import os from 'node:os'
 import fs from 'node:fs'
-import { ExpertRegistry } from './lib/experts.js'
+import { AgentRegistry } from './lib/agents.js'
 import { Dispatcher } from './lib/dispatch.js'
 import { DEFAULT_SQUADS, renderInstruction, topoLayers } from './lib/squads.js'
 import { SquadRegistry } from './lib/squad-registry.js'
-import { listSkills, skillToExpert, defaultSkillsRoot } from './lib/skill-import.js'
+import { listSkills, skillToAgent, defaultSkillsRoot } from './lib/skill-import.js'
 
 export const name = '@kiligzzz/dsh-agent-dispatch'
 
@@ -37,7 +37,7 @@ export function apply(ctx) {
   const dataDir = path.join(dshHome, 'data', 'dsh-agent-dispatch')
 
   // ── 注册表与派遣器 ──
-  const registry = new ExpertRegistry(dataDir)
+  const registry = new AgentRegistry(dataDir)
   const dispatcher = new Dispatcher({ ctx, registry, dataDir })
 
   // v0.7.1：订阅宿主 'subagent/end' 生命周期事件 → 子 agent 终结即移出活跃映射 + 补记真实结果。
@@ -69,7 +69,7 @@ export function apply(ctx) {
 
   // ── 工具参数 schema（裸 JSON Schema，不经 schemastery/dsh-tools）──
   // v0.9.38：dispatch 返回值含 output（子代理结果文本）/ok——schema 必须同步声明，
-  // 否则 additionalProperties:false 把未声明字段判非法（用户现场：expert_dispatch 报
+  // 否则 additionalProperties:false 把未声明字段判非法（用户现场：agent_dispatch 报
   // 'value.output' is not a declared property）
   // v0.9.39：宿主 dsh-tools 校验不支持 type 数组（type:['string','null'] 直接拒——
   // JsonSchemaError: type must be a single type string）；可空字段用 oneOf 表达
@@ -77,34 +77,34 @@ export function apply(ctx) {
     type: 'object',
     additionalProperties: false,
     properties: {
-      expertId: { type: 'string' },
-      expertName: { type: 'string' },
+      agentId: { type: 'string' },
+      agentName: { type: 'string' },
       childId: { type: 'string' },
       taskLabel: { type: 'string' },
       output: { oneOf: [{ type: 'string' }, { type: 'null' }] },
       ok: { type: 'boolean' },
     },
-    required: ['expertId', 'expertName', 'childId', 'taskLabel'],
+    required: ['agentId', 'agentName', 'childId', 'taskLabel'],
   }
 
   const toolDisposers = []
 
-  // expert_dispatch：把任务委派给专家（建/复用可续聊子 agent）
+  // agent_dispatch：把任务委派给Agent（建/复用可续聊子 agent）
   toolDisposers.push(ctx.tools.register({
-    name: 'expert_dispatch',
+    name: 'agent_dispatch',
     description:
-      'Dispatch a task to a pre-configured expert agent (a continuable subagent with a fixed expert persona, its own context, and its own model route). Use this when the task falls in an expert\'s domain — requirement analysis, code review, production debugging, SQL analysis. The expert conversation persists, so a later expert_followup on the same expert continues with full context. Dispatch returns immediately with a durable child id; the result arrives as a subagent notice when the expert finishes.',
+      'Dispatch a task to a pre-configured agent agent (a continuable subagent with a fixed agent persona, its own context, and its own model route). Use this when the task falls in an agent\'s domain — requirement analysis, code review, production debugging, SQL analysis. The agent conversation persists, so a later agent_followup on the same agent continues with full context. Dispatch returns immediately with a durable child id; the result arrives as a subagent notice when the agent finishes.',
     parameters: {
       type: 'object',
       properties: {
-        expertId: {
+        agentId: {
           type: 'string',
-          description: 'The expert to dispatch to. Get exact ids from expert_list.',
+          description: 'The agent to dispatch to. Get exact ids from agent_list.',
         },
         task: {
           type: 'string',
           description:
-            'The complete, self-contained task for the expert. It does NOT see this conversation, so include all context it needs: file paths, code, logs, URLs, constraints.',
+            'The complete, self-contained task for the agent. It does NOT see this conversation, so include all context it needs: file paths, code, logs, URLs, constraints.',
         },
         run_in_background: {
           type: 'boolean',
@@ -112,14 +112,14 @@ export function apply(ctx) {
             'Kept for interface stability; dispatch is always async (startContinuable returns a durable child id immediately).',
         },
       },
-      required: ['expertId', 'task'],
+      required: ['agentId', 'task'],
     },
     output: {
       schema: OUTPUT_SCHEMA,
       render: (_args, value) => [
         {
           type: 'text',
-          text: `已委派 ${value.expertName}（${value.expertId}）· 子代理 ${value.childId}\n任务: ${value.taskLabel}`,
+          text: `已委派 ${value.agentName}（${value.agentId}）· 子代理 ${value.childId}\n任务: ${value.taskLabel}`,
         },
       ],
     },
@@ -127,26 +127,26 @@ export function apply(ctx) {
     async execute(args, exec) {
       await ready
       const parent = exec.agent
-      if (!parent) throw new Error('expert_dispatch 需要调用方 agent（exec.agent 为空）')
-      return dispatcher.dispatch(parent, args.expertId, args.task)
+      if (!parent) throw new Error('agent_dispatch 需要调用方 agent（exec.agent 为空）')
+      return dispatcher.dispatch(parent, args.agentId, args.task)
     },
   }))
 
-  // expert_followup：对已存在的专家追问（上下文延续）
+  // agent_followup：对已存在的Agent追问（上下文延续）
   toolDisposers.push(ctx.tools.register({
-    name: 'expert_followup',
+    name: 'agent_followup',
     description:
-      'Send a follow-up message to a live expert child subagent started earlier via expert_dispatch. The expert keeps its full conversation context, so state only what is new. Use this to ask the same expert another question or give it more information.',
+      'Send a follow-up message to a live agent child subagent started earlier via agent_dispatch. The agent keeps its full conversation context, so state only what is new. Use this to ask the same agent another question or give it more information.',
     parameters: {
       type: 'object',
       properties: {
         childId: {
           type: 'string',
-          description: 'The durable child id returned by expert_dispatch.',
+          description: 'The durable child id returned by agent_dispatch.',
         },
         message: {
           type: 'string',
-          description: 'The follow-up message. The expert already knows its earlier task; state only what is new.',
+          description: 'The follow-up message. The agent already knows its earlier task; state only what is new.',
         },
       },
       required: ['childId', 'message'],
@@ -159,23 +159,23 @@ export function apply(ctx) {
     async execute(args, exec) {
       await ready
       const parent = exec.agent
-      if (!parent) throw new Error('expert_followup 需要调用方 agent（exec.agent 为空）')
+      if (!parent) throw new Error('agent_followup 需要调用方 agent（exec.agent 为空）')
       return dispatcher.followup(parent, args.childId, args.message)
     },
   }))
 
-  // expert_list：列出专家目录（供主 agent 路由判断）
+  // agent_list：列出Agent目录（供主 agent 路由判断）
   toolDisposers.push(ctx.tools.register({
-    name: 'expert_list',
+    name: 'agent_list',
     description:
-      'List the configured expert agents with their ids, names, trigger domains, and model routes. Call this before expert_dispatch when unsure which expert fits, or when the user asks what experts exist.',
+      'List the configured agent agents with their ids, names, trigger domains, and model routes. Call this before agent_dispatch when unsure which agent fits, or when the user asks what agents exist.',
     parameters: { type: 'object', properties: {}, required: [] },
     output: {
       schema: {
         type: 'object',
         additionalProperties: false,
         properties: {
-          experts: {
+          agents: {
             type: 'array',
             items: {
               type: 'object',
@@ -192,12 +192,12 @@ export function apply(ctx) {
             },
           },
         },
-        required: ['experts'],
+        required: ['agents'],
       },
       render: (_args, value) => [
         {
           type: 'text',
-          text: value.experts
+          text: value.agents
             .map((e) => `${e.emoji ?? ''}${e.name}（${e.id}）· 适用: ${e.triggers}${e.enabled ? '' : ' · 已停用'}${e.routes?.length ? ' · 模型: ' + e.routes.join(' → ') : ''}`)
             .join('\n'),
         },
@@ -207,7 +207,7 @@ export function apply(ctx) {
     async execute() {
       await ready
       return {
-        experts: registry.list().map((e) => ({
+        agents: registry.list().map((e) => ({
           id: e.id,
           name: e.name,
           emoji: e.emoji,
@@ -219,11 +219,11 @@ export function apply(ctx) {
     },
   }))
 
-  // expert_squad：按预置小队模板把目标拆给多专家（v0.3）
+  // agent_squad：按预置小队模板把目标拆给多Agent（v0.3）
   toolDisposers.push(ctx.tools.register({
-    name: 'expert_squad',
+    name: 'agent_squad',
     description:
-      'Dispatch one goal to a preset expert squad (a template of multiple expert dispatches with dependencies — e.g. dev-pipeline runs requirement analysis then code review; debug-squad fans out log tracing, SQL analysis, and code review in parallel). Each step dispatches to its expert as a continuable subagent; steps with dependencies wait for earlier steps to finish, and their results feed the dependents. Returns per-step child ids immediately; outcomes arrive as subagent notices. Use for multi-angle or pipeline goals; prefer expert_dispatch for single-domain tasks.',
+      'Dispatch one goal to a preset agent squad (a template of multiple agent dispatches with dependencies — e.g. dev-pipeline runs requirement analysis then code review; debug-squad fans out log tracing, SQL analysis, and code review in parallel). Each step dispatches to its agent as a continuable subagent; steps with dependencies wait for earlier steps to finish, and their results feed the dependents. Returns per-step child ids immediately; outcomes arrive as subagent notices. Use for multi-angle or pipeline goals; prefer agent_dispatch for single-domain tasks.',
     parameters: {
       type: 'object',
       properties: {
@@ -233,7 +233,7 @@ export function apply(ctx) {
         },
         goal: {
           type: 'string',
-          description: 'The complete, self-contained goal. It is routed to every step template, so include all context the experts need.',
+          description: 'The complete, self-contained goal. It is routed to every step template, so include all context the agents need.',
         },
       },
       required: ['squad_id', 'goal'],
@@ -253,13 +253,13 @@ export function apply(ctx) {
               properties: {
                 step: { type: 'number' },
                 phase: { type: 'string' },
-                expertId: { type: 'string' },
-                expertName: { type: 'string' },
+                agentId: { type: 'string' },
+                agentName: { type: 'string' },
                 childId: { type: 'string' },
                 dependsOn: { type: 'array', items: { type: 'number' } },
                 skipped: { type: 'boolean' },
               },
-              required: ['step', 'phase', 'expertId', 'expertName', 'childId', 'dependsOn', 'skipped'],
+              required: ['step', 'phase', 'agentId', 'agentName', 'childId', 'dependsOn', 'skipped'],
             },
           },
         },
@@ -272,7 +272,7 @@ export function apply(ctx) {
             value.steps
               .map(
                 (s) =>
-                  `  ${s.skipped ? '⏭️' : '✅'} 步骤${s.step + 1} [${s.phase}] ${s.expertName}${s.childId ? ` · 子代理 ${s.childId}` : ' · 已停用跳过'}${s.dependsOn.length ? `（等步骤 ${s.dependsOn.map((d) => d + 1).join(',')}）` : ''}`,
+                  `  ${s.skipped ? '⏭️' : '✅'} 步骤${s.step + 1} [${s.phase}] ${s.agentName}${s.childId ? ` · 子代理 ${s.childId}` : ' · 已停用跳过'}${s.dependsOn.length ? `（等步骤 ${s.dependsOn.map((d) => d + 1).join(',')}）` : ''}`,
               )
               .join('\n') +
             '\n各步结果将以子代理通知回到本会话。',
@@ -283,14 +283,14 @@ export function apply(ctx) {
     async execute(args, exec) {
       await Promise.all([ready, squadsReady])
       const parent = exec.agent
-      if (!parent) throw new Error('expert_squad 需要调用方 agent（exec.agent 为空）')
+      if (!parent) throw new Error('agent_squad 需要调用方 agent（exec.agent 为空）')
       const squadId = args.squad_id
       const squad = squadId ? squadById().get(squadId) : undefined
       if (!squad) throw new Error(`小队不存在: ${JSON.stringify(args)}。可用: ${squadRegistry.list().map((s) => s.id).join(', ')}`)
       // v0.8.2：停用的小队拒绝执行
       if (squad.enabled === false) throw new Error(`小队「${squad.name}」已停用，可在 Agent 调度面板的小队页重新启用`)
 
-      // 拓扑分层展开；跳过已停用专家所在步骤（其依赖者按"无结果"继续）
+      // 拓扑分层展开；跳过已停用Agent所在步骤（其依赖者按"无结果"继续）
       const layers = topoLayers(squad.steps)
       const results = []
       const stepResults = new Array(squad.steps.length).fill(null)
@@ -304,7 +304,7 @@ export function apply(ctx) {
         squadName: squad.name,
         squadEmoji: squad.emoji ?? '',
         goal: String(args.goal ?? '').slice(0, 300),
-        steps: squad.steps.map((st, i) => ({ idx: i, phase: st.phase || st.expertId, expertId: st.expertId, dependsOn: st.dependsOn ?? [] })),
+        steps: squad.steps.map((st, i) => ({ idx: i, phase: st.phase || st.agentId, agentId: st.agentId, dependsOn: st.dependsOn ?? [] })),
         parentSessionId: parent?.session?.id ?? null,
       })
       const stepStatus = new Array(squad.steps.length).fill('waiting')
@@ -313,14 +313,14 @@ export function apply(ctx) {
         await Promise.all(
           layer.map(async (idx) => {
             const step = squad.steps[idx]
-            const expert = registry.get(step.expertId)
-            if (!expert || expert.enabled === false) {
+            const agent = registry.get(step.agentId)
+            if (!agent || agent.enabled === false) {
               stepStatus[idx] = 'skipped'
               results.push({
                 step: idx,
                 phase: step.phase,
-                expertId: step.expertId,
-                expertName: expert?.name ?? step.expertId,
+                agentId: step.agentId,
+                agentName: agent?.name ?? step.agentId,
                 childId: '',
                 dependsOn: step.dependsOn ?? [],
                 skipped: true,
@@ -328,15 +328,15 @@ export function apply(ctx) {
               return
             }
             const task = renderInstruction(step.instruction, args.goal, stepResults) +
-              '\n\n【执行终点声明】本任务是 squad 编排中的一个执行步骤，你（专家子代理）在本轮内独立完成并输出结构化结论即可。严禁再调用 expert_dispatch / expert_squad / expert_followup 等任何委派或组队工具，严禁把本任务继续往下派发。直接完成本步任务并回报。'
+              '\n\n【执行终点声明】本任务是 squad 编排中的一个执行步骤，你（Agent 子代理）在本轮内独立完成并输出结构化结论即可。严禁再调用 agent_dispatch / agent_squad / agent_followup 等任何委派或组队工具，严禁把本任务继续往下派发。直接完成本步任务并回报。'
             try {
               // v0.9.36：waitResult=true——dispatch 等到本步子代理真正结束并取回结果文本，
               // stepResults 填真实结论（{prev:N} 用），不再填「已委派」占位；依赖链因此是结果级串行
-              // v0.9.40：dedicatedChild=true——小队步骤强制新建专属子代理，不复用同专家旧 child。
-              // 根因：并发步骤同专家（如 S2/S6 都是 code-reviewer）会走续聊撞同一 child——
+              // v0.9.40：dedicatedChild=true——小队步骤强制新建专属子代理，不复用同Agent旧 child。
+              // 根因：并发步骤同Agent（如 S2/S6 都是 code-reviewer）会走续聊撞同一 child——
               // followup 把第二个任务强塞给正忙的第一个、且 #waitFor 注册孤儿等待器永久挂起 →
               // 主代理卡死、面板只显示先注册的 3 卡。每步独占新 child，依赖/并发语义才成立。
-              const r = await dispatcher.dispatch(parent, step.expertId, task, { viaSquad: squad.id, squadRunId, stepIndex: idx, totalSteps: squad.steps.length, waitResult: true, dedicatedChild: true })
+              const r = await dispatcher.dispatch(parent, step.agentId, task, { viaSquad: squad.id, squadRunId, stepIndex: idx, totalSteps: squad.steps.length, waitResult: true, dedicatedChild: true })
               stepStatus[idx] = 'done'
               // v0.9.38：r.output 已归一化为字符串（onChildEnd #normOutput）；String() 兜底防意外形态
               const out = String(r.output || '').trim()
@@ -346,8 +346,8 @@ export function apply(ctx) {
               results.push({
                 step: idx,
                 phase: step.phase,
-                expertId: step.expertId,
-                expertName: r.expertName,
+                agentId: step.agentId,
+                agentName: r.agentName,
                 childId: r.childId,
                 dependsOn: step.dependsOn ?? [],
                 skipped: false,
@@ -359,8 +359,8 @@ export function apply(ctx) {
               results.push({
                 step: idx,
                 phase: step.phase,
-                expertId: step.expertId,
-                expertName: expert.name,
+                agentId: step.agentId,
+                agentName: agent.name,
                 childId: '',
                 dependsOn: step.dependsOn ?? [],
                 skipped: true,
@@ -386,11 +386,11 @@ export function apply(ctx) {
     },
   }))
 
-  // expert_import_skill：把 ~/.dsh/skills 下的 skill 一键注册为专家（v0.4）
+  // agent_import_skill：把 ~/.dsh/skills 下的 skill 一键注册为Agent（v0.4）
   toolDisposers.push(ctx.tools.register({
-    name: 'expert_import_skill',
+    name: 'agent_import_skill',
     description:
-      'Import a DSH skill (~/.dsh/skills/<name>/SKILL.md) as an expert agent: its body becomes the expert system prompt, its description becomes the trigger domain. Call with no skillDir to list importable skills first. Imported experts overwrite an existing expert with the same id.',
+      'Import a DSH skill (~/.dsh/skills/<name>/SKILL.md) as an agent agent: its body becomes the agent system prompt, its description becomes the trigger domain. Call with no skillDir to list importable skills first. Imported agents overwrite an existing agent with the same id.',
     parameters: {
       type: 'object',
       properties: {
@@ -415,7 +415,7 @@ export function apply(ctx) {
               required: ['dir', 'description'],
             },
           },
-          expert: {
+          agent: {
             type: 'object',
             additionalProperties: false,
             properties: { id: { type: 'string' }, name: { type: 'string' }, warnings: { type: 'array', items: { type: 'string' } } },
@@ -431,7 +431,7 @@ export function apply(ctx) {
             value.action === 'list'
               ? '可导入的 skills（用 skillDir 参数导入）：\n' +
                 (value.skills || []).map((s) => `  ${s.dir} — ${s.description}`).join('\n')
-              : `已导入 skill 为 Agent: ${value.expert.name}（${value.expert.id}）${value.expert.warnings.length ? '\n警告: ' + value.expert.warnings.join('; ') : ''}`,
+              : `已导入 skill 为 Agent: ${value.agent.name}（${value.agent.id}）${value.agent.warnings.length ? '\n警告: ' + value.agent.warnings.join('; ') : ''}`,
         },
       ],
     },
@@ -442,31 +442,31 @@ export function apply(ctx) {
       if (!args.skillDir) {
         return { action: 'list', skills: listSkills(skillsRoot).map((s) => ({ dir: s.name, description: s.description })) }
       }
-      const { expert, warnings } = skillToExpert(skillsRoot, args.skillDir)
-      await registry.upsert(expert)
-      return { action: 'import', expert: { id: expert.id, name: expert.name, warnings } }
+      const { agent, warnings } = skillToAgent(skillsRoot, args.skillDir)
+      await registry.upsert(agent)
+      return { action: 'import', agent: { id: agent.id, name: agent.name, warnings } }
     },
   }))
 
   // ── 路由表 prompt section ──
-  // 固定策略文案；专家实时目录靠 expert_list 工具获取（免重启：experts.json 改完下一轮即生效）。
+  // 固定策略文案；Agent实时目录靠 agent_list 工具获取（免重启：agents.json 改完下一轮即生效）。
   const disposeRoutesSection = ctx.systemPrompt.section({
     name: 'dsh-agent-dispatch:policy',
     order: 116.5,
     text: [
       'Agent 委派策略（dsh-agent-dispatch）：',
-      '1. 任务命中某 Agent 领域（需求分析/代码审查/线上排查/SQL 分析等，以 expert_list 返回的 triggers 为准）时，优先用 expert_dispatch 委派，而不是自己在主对话里做。',
+      '1. 任务命中某 Agent 领域（需求分析/代码审查/线上排查/SQL 分析等，以 agent_list 返回的 triggers 为准）时，优先用 agent_dispatch 委派，而不是自己在主对话里做。',
       '2. 委派任务必须是自包含的：Agent 看不到本会话，把所需上下文（路径/代码/日志/约束）全部写进 task。',
-      '3. 对同一 Agent 的后续追问用 expert_followup（带 childId），上下文延续。',
+      '3. 对同一 Agent 的后续追问用 agent_followup（带 childId），上下文延续。',
       '4. 简单问题（一句话能答、无需工具链）不必委派，直接回答——委派本身有开销。',
-      '5. 不确定哪个 Agent 合适时先 expert_list。',
-      '6. 多角度或流水线目标（既要分析又要审查、多路排查同一问题）用 expert_squad：dev-pipeline=需求→审查串行；debug-squad=日志/数据/代码三路并行；review-squad=业务/数据双路。单领域任务不要用组队。',
-      '7. 复杂动态编排（组队模板不匹配、需要按中间结果决定下一步）时，用宿主 workflow 工具编排 expert_dispatch。',
-      '8. 用户消息以「$<id> 」前缀开头时（如 "$sql-analyst 查下 orders 慢查询"），这是用户显式指定：把后续文本作为 task 直接 expert_dispatch 给该 id 的 Agent（组队 id 用 expert_squad），不要追问、不要改派。$ 前缀来自输入框 / 菜单选 Agent 的插入（或用户手打），是用户的明确意图。',
+      '5. 不确定哪个 Agent 合适时先 agent_list。',
+      '6. 多角度或流水线目标（既要分析又要审查、多路排查同一问题）用 agent_squad：dev-pipeline=需求→审查串行；debug-squad=日志/数据/代码三路并行；review-squad=业务/数据双路。单领域任务不要用组队。',
+      '7. 复杂动态编排（组队模板不匹配、需要按中间结果决定下一步）时，用宿主 workflow 工具编排 agent_dispatch。',
+      '8. 用户消息以「$<id> 」前缀开头时（如 "$sql-analyst 查下 orders 慢查询"），这是用户显式指定：把后续文本作为 task 直接 agent_dispatch 给该 id 的 Agent（组队 id 用 agent_squad），不要追问、不要改派。$ 前缀来自输入框 / 菜单选 Agent 的插入（或用户手打），是用户的明确意图。',
     ].join('\n'),
   })
 
-  // ── /expert-api REST 面（v0.2 Settings UI 数据通道）──
+  // ── /agent-api REST 面（v0.2 Settings UI 数据通道）──
   // 与 capability-manager 的 /capabilities-api 同模式：webServer 可能晚于本
   // 插件激活，延迟重试注册；webServer/httpServer 双键探测兼容。
   const send = (res, code, data) => {
@@ -625,11 +625,11 @@ export function apply(ctx) {
     }
     const squadMap = squadById() // v0.9.16：最近委派按小队维度聚合需要小队名
     return merged.filter(Boolean).map((row) => {
-      // v0.9.15：头像/名称按 expertId 回填注册表实时值（与 Agent 调度页同源）——
-      // 日志行里专家改名/改 emoji 后，悬浮球「最近委派」与历史页不再显示旧名或丢 emoji 落首字
-      const expert = registry.get(row.expertId)
-      const next = expert
-        ? { ...row, emoji: expert.emoji || row.emoji || '', expertName: expert.name || row.expertName }
+      // v0.9.15：头像/名称按 agentId 回填注册表实时值（与 Agent 调度页同源）——
+      // 日志行里Agent改名/改 emoji 后，悬浮球「最近委派」与历史页不再显示旧名或丢 emoji 落首字
+      const agent = registry.get(row.agentId)
+      const next = agent
+        ? { ...row, emoji: agent.emoji || row.emoji || '', agentName: agent.name || row.agentName }
         : row
       // v0.9.16：小队触发的行回填小队名（改名后同步，前端聚合卡展示用）
       if (next.viaSquad) {
@@ -646,19 +646,19 @@ export function apply(ctx) {
       const pathname = decodeURIComponent((req.url || '/').split('?')[0])
       const query = new URL(req.url || '/', 'http://x').searchParams
       await Promise.all([ready, squadsReady])
-      if (req.method === 'GET' && pathname === '/expert-api') {
+      if (req.method === 'GET' && pathname === '/agent-api') {
         return send(res, 200, {
           ok: true,
           dataDir: tildify(dataDir),
-          experts: registry.list(),
+          agents: registry.list(),
           models: await readModelOptions(),
           defaultModel: readDefaultModel(),
         })
       }
-      if (req.method === 'GET' && pathname === '/expert-api/dispatches') {
+      if (req.method === 'GET' && pathname === '/agent-api/dispatches') {
         return send(res, 200, { ok: true, dispatches: mergeDispatchHistory(readDispatches(query.get('limit')), activeChildIds()) })
       }
-      if (req.method === 'GET' && pathname === '/expert-api/squads') {
+      if (req.method === 'GET' && pathname === '/agent-api/squads') {
         return send(res, 200, { ok: true, squads: squadRegistry.list() })
       }
       if (req.method === 'POST') {
@@ -667,32 +667,32 @@ export function apply(ctx) {
         const body = await readBody(req)
         let out
         switch (pathname) {
-          case '/expert-api/squad/upsert':
+          case '/agent-api/squad/upsert':
             out = { squad: await squadRegistry.upsert(body.squad) }
             break
-          case '/expert-api/squad/remove':
+          case '/agent-api/squad/remove':
             out = { removed: await squadRegistry.remove(body.id) }
             break
-          case '/expert-api/squad/toggle':
+          case '/agent-api/squad/toggle':
             out = { updated: await squadRegistry.setEnabled(body.id, body.enabled) }
             break
-          case '/expert-api/upsert':
-            await registry.upsert(body.expert)
+          case '/agent-api/upsert':
+            await registry.upsert(body.agent)
             out = {}
             break
-          case '/expert-api/remove':
+          case '/agent-api/remove':
             out = { removed: await registry.remove(body.id) }
             break
-          case '/expert-api/toggle':
+          case '/agent-api/toggle':
             out = { updated: await registry.setEnabled(body.id, body.enabled) }
             break
-          case '/expert-api/import-skill': {
-            const { expert, warnings } = skillToExpert(defaultSkillsRoot(), body.skillDir)
-            await registry.upsert(expert)
-            out = { expert: { id: expert.id, name: expert.name }, warnings }
+          case '/agent-api/import-skill': {
+            const { agent, warnings } = skillToAgent(defaultSkillsRoot(), body.skillDir)
+            await registry.upsert(agent)
+            out = { agent: { id: agent.id, name: agent.name }, warnings }
             break
           }
-          case '/expert-api/history/remove': {
+          case '/agent-api/history/remove': {
             // v0.8.5：删除一条委派历史——按 dispatch 行的 ts 定位，
             // 同 childId 的 result 行一并删除（续聊复用 child 时只删最近未匹配的对应结局）
             // v0.9.30 修：JSONL 的 ts 是 ISO 字符串（new Date().toISOString()），
@@ -743,7 +743,7 @@ export function apply(ctx) {
             out = { removed }
             break
           }
-          case '/expert-api/history/remove-run': {
+          case '/agent-api/history/remove-run': {
             // v0.9.17：删除整次小队运行——两条 squad-run 行 + 全部带该 squadRunId 的 dispatch 行 + 对应 result 行
             const id = body.squadRunId
             if (!id || typeof id !== 'string') return send(res, 400, { ok: false, error: '缺少 squadRunId' })
@@ -781,13 +781,13 @@ export function apply(ctx) {
             out = { removed }
             break
           }
-          case '/expert-api/cancel': {
+          case '/agent-api/cancel': {
             // v0.7.1：中止运行中的子 agent（宿主 interrupt，user-authority）
             // v0.9.40：activeChildren 改 childId 主 key——优先按 body.childId 精确定位，
-            // 兼容旧 client 传 expertId（走 byExpert 二级索引取该专家最新活跃 child）
+            // 兼容旧 client 传 agentId（走 byAgent 二级索引取该Agent最新活跃 child）
             const entry = body.childId
               ? dispatcher.activeChildren.get(body.childId)
-              : dispatcher.activeChildren.get(dispatcher.byExpert.get(body.expertId))
+              : dispatcher.activeChildren.get(dispatcher.byAgent.get(body.agentId))
             if (!entry || !entry.childId) return send(res, 404, { ok: false, error: '该 Agent 没有运行中的子代理' })
             if (typeof ctx.subagents.interrupt !== 'function') return send(res, 501, { ok: false, error: '宿主不支持 interrupt' })
             try {
@@ -803,20 +803,20 @@ export function apply(ctx) {
         }
         return send(res, 200, Object.assign({ ok: true }, out))
       }
-      if (req.method === 'GET' && pathname === '/expert-api/active') {
+      if (req.method === 'GET' && pathname === '/agent-api/active') {
         // 活动面板数据源：内存活跃子代理映射 + 最近结果流（活动页单独消费）
         // v0.9.32：childId 归一化（防对象形态炸 sessions.open）+ 透出 viaSquad/squadRunId（运行中按小队聚合）
-        // v0.9.40：activeChildren 改 childId 主 key（同专家并发步骤并存，不再互相覆盖）
+        // v0.9.40：activeChildren 改 childId 主 key（同Agent并发步骤并存，不再互相覆盖）
         const active = [...dispatcher.activeChildren.entries()].map(([childIdKey, entry]) => {
-          const expertId = entry?.expertId
-          const expert = registry.get(expertId)
+          const agentId = entry?.agentId
+          const agent = registry.get(agentId)
           const rawChild = entry?.childId ?? childIdKey
           const viaSquad = entry?.viaSquad ?? null
           const squad = viaSquad ? squadById().get(viaSquad) : null // v0.9.32：运行中按小队聚合展示需要小队名
           return {
-            expertId,
-            expertName: expert?.name ?? expertId,
-            emoji: expert?.emoji ?? '',
+            agentId,
+            agentName: agent?.name ?? agentId,
+            emoji: agent?.emoji ?? '',
             childId: typeof rawChild === 'string' ? rawChild : (rawChild && typeof rawChild === 'object' ? (rawChild.id ?? rawChild.childId ?? rawChild.runId ?? null) : null),
             taskLabel: entry?.taskLabel ?? '',
             startedAt: entry?.startedAt ?? null,
@@ -829,63 +829,63 @@ export function apply(ctx) {
         })
         return send(res, 200, { ok: true, active, recent: mergeDispatchHistory(readDispatches(20), new Set(active.map((a) => a.childId).filter(Boolean))) })
       }
-      if (req.method === 'GET' && pathname === '/expert-api/suggest') {
+      if (req.method === 'GET' && pathname === '/agent-api/suggest') {
         // $ 触发菜单候选：Agent + Agent 组队，前缀/子串匹配
         const q = String(query.get('q') || '').trim().toLowerCase()
-        const experts = registry.list().filter((e) => e.enabled !== false)
+        const agents = registry.list().filter((e) => e.enabled !== false)
         const squads = squadRegistry.list()
         const triggersOf = (e) => String(e.triggers || '').split(/[;；,，]/).map((s) => s.trim()).filter(Boolean)
         const stepsText = (steps) => {
           const layers = topoLayers(steps)
-          return layers.map((l) => l.map((i) => steps[i].phase || steps[i].expertId).join('｜')).join(' → ')
+          return layers.map((l) => l.map((i) => steps[i].phase || steps[i].agentId).join('｜')).join(' → ')
         }
         const match = (item, fields) => !q || fields.some((f) => String(f || '').toLowerCase().includes(q))
-        const agentHits = experts
+        const agentHits = agents
           .filter((e) => match(e, [e.id, e.name, ...triggersOf(e)]))
           .map((e) => ({ kind: 'agent', id: e.id, name: e.name, emoji: e.emoji, desc: triggersOf(e).slice(0, 3).join(';'), model: (e.routes && e.routes[0] && e.routes[0].model) || '' }))
         const squadHits = squads
           .filter((s) => s.enabled !== false) // v0.8.2：停用小队的 $ 菜单不再出现
-          .filter((s) => match(s, [s.id, s.name, ...s.steps.map((st) => st.expertId)]))
+          .filter((s) => match(s, [s.id, s.name, ...s.steps.map((st) => st.agentId)]))
           .map((s) => ({ kind: 'squad', id: s.id, name: s.name, emoji: s.emoji, desc: stepsText(s.steps) }))
         res.end(JSON.stringify({ ok: true, agents: agentHits, squads: squadHits }))
         return
       }
-      if (req.method === 'GET' && pathname === '/expert-api/overview') {
+      if (req.method === 'GET' && pathname === '/agent-api/overview') {
         // 总览页聚合：Agent/组队规模、成功率、活跃、最近 8 条
-        const experts = registry.list()
+        const agents = registry.list()
         const squads = squadRegistry.list()
         const recent = mergeDispatchHistory(readDispatches(50), activeChildIds())
-        // v0.9.40：childId 主 key（同专家并发并存）
+        // v0.9.40：childId 主 key（同Agent并发并存）
         const active = [...dispatcher.activeChildren.entries()].map(([childIdKey, entry]) => {
           const rawChild = entry?.childId ?? childIdKey
-          return { expertId: entry?.expertId, childId: typeof rawChild === 'string' ? rawChild : (rawChild && typeof rawChild === 'object' ? (rawChild.id ?? rawChild.childId ?? rawChild.runId ?? null) : null) }
+          return { agentId: entry?.agentId, childId: typeof rawChild === 'string' ? rawChild : (rawChild && typeof rawChild === 'object' ? (rawChild.id ?? rawChild.childId ?? rawChild.runId ?? null) : null) }
         })
         // 成功率只统计结局已知的行（孤儿结局丢失，派遣行的 ok 只代表派遣成败，不计入）
         const settled = recent.filter((d) => !d.orphan)
         const okCount = settled.filter((d) => d.ok).length
-        const byExpert = {}
+        const byAgent = {}
         for (const d of settled) {
-          const key = d.expertId || 'unknown'
-          byExpert[key] = byExpert[key] || { expertId: d.expertId, expertName: d.expertName, emoji: d.emoji, total: 0, ok: 0, fail: 0 }
-          byExpert[key].total += 1
-          if (d.ok) byExpert[key].ok += 1
-          else byExpert[key].fail += 1
+          const key = d.agentId || 'unknown'
+          byAgent[key] = byAgent[key] || { agentId: d.agentId, agentName: d.agentName, emoji: d.emoji, total: 0, ok: 0, fail: 0 }
+          byAgent[key].total += 1
+          if (d.ok) byAgent[key].ok += 1
+          else byAgent[key].fail += 1
         }
         const stats = {
-          agentTotal: experts.length,
-          agentEnabled: experts.filter((e) => e.enabled !== false).length,
+          agentTotal: agents.length,
+          agentEnabled: agents.filter((e) => e.enabled !== false).length,
           squadTotal: squads.length,
           dispatchTotal: settled.length,
           okCount,
           failCount: settled.length - okCount,
           activeCount: active.length,
-          byExpert: Object.values(byExpert).sort((a, b) => b.total - a.total),
+          byAgent: Object.values(byAgent).sort((a, b) => b.total - a.total),
           last24h: recent.filter((d) => Date.now() - new Date(d.ts).getTime() < 864e5).length,
         }
         res.end(JSON.stringify({ ok: true, stats, recent: recent.slice(0, 8) }))
         return
       }
-      if (req.method === 'GET' && pathname === '/expert-api/skills') {
+      if (req.method === 'GET' && pathname === '/agent-api/skills') {
         return send(res, 200, { ok: true, skills: listSkills(defaultSkillsRoot()) })
       }
       send(res, 405, { ok: false, error: 'method not allowed' })
@@ -900,7 +900,7 @@ export function apply(ctx) {
     const ws = ctx.get('webServer') || ctx.get('httpServer')
     if (!ws || typeof ws.register !== 'function') return // 未就绪，等下一轮
     try {
-      const routeDispose = ws.register({ kind: 'prefix', path: '/expert-api', handler: restHandler })
+      const routeDispose = ws.register({ kind: 'prefix', path: '/agent-api', handler: restHandler })
       restStopped = true
       clearInterval(restTimer)
       ctx.effect(() => () => {
