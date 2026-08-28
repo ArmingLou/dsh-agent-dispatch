@@ -10,16 +10,21 @@
 
 ## 截图速览
 
-| 入口 | 视图 |
-| --- | --- |
-| 主面板「总览」子页（运行中 + 成功率 + Agent 排行 + 最近完成） | 见仓库 `docs/screenshots/overview.png` |
-| 主面板「Agent」子页（4 个内置 + 用户扩展，卡片网格） | 见仓库 `docs/screenshots/agents.png` |
-| 主面板「小队」子页（执行流图 + 步骤依赖拓扑） | 见仓库 `docs/screenshots/squads.png` |
-| 主面板「历史」子页（Agent/小队分段，任务详情展开） | 见仓库 `docs/screenshots/history.png` |
-| 悬浮活动球（拖动 + 弹窗 + 活跃呼吸光效） | 见仓库 `docs/screenshots/fab.png` |
-| 悬浮球弹窗「最近完成」分区 | 见仓库 `docs/screenshots/fab-popup.png` |
+### 主面板（宿主右 tab「Agent 调度」）
 
-> 你可以自行克隆本仓库跑出真实截图，本 README 内嵌图位留给后续 issue 补充。
+| 总览 | Agent | 小队 | 历史 |
+| --- | --- | --- | --- |
+| <img src="docs/screenshots/01-overview.png" width="360" alt="总览"> | <img src="docs/screenshots/02-agents.png" width="360" alt="Agent 列表"> | <img src="docs/screenshots/03-squads.png" width="360" alt="小队"> | <img src="docs/screenshots/04-history.png" width="360" alt="历史"> |
+
+### 悬浮活动球
+
+| 空闲 | 运行中（呼吸光效） | 完成（彩光） |
+| --- | --- | --- |
+| <img src="docs/screenshots/06-fab-idle.png" width="200" alt="空闲"> | <img src="docs/screenshots/09-fab-live.png" width="200" alt="运行中"> | <img src="docs/screenshots/11-fab-done.png" width="200" alt="完成光效"> |
+
+| 弹窗（运行中 / 最近完成 / Agent / 小队） | 弹窗「最近完成 1」 | 悬浮球设置 |
+| --- | --- | --- |
+| <img src="docs/screenshots/07-fab-popup.png" width="300" alt="弹窗"> | <img src="docs/screenshots/10-fab-popup-done.png" width="300" alt="最近完成"> | <img src="docs/screenshots/08-fab-settings.png" width="300" alt="设置"> |
 
 ## 5 个模型工具
 

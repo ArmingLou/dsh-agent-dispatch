@@ -10,16 +10,21 @@ The main panel is mounted to the host's native right tab **Agent 调度**, with 
 
 ## Quick screenshot index
 
-| Entry | View |
-| --- | --- |
-| Main panel → **总览** (Overview) | `docs/screenshots/overview.png` |
-| Main panel → **Agent** | `docs/screenshots/agents.png` |
-| Main panel → **小队** (Squads) | `docs/screenshots/squads.png` |
-| Main panel → **历史** (History) | `docs/screenshots/history.png` |
-| Floating action ball | `docs/screenshots/fab.png` |
-| FAB popup (Recently completed) | `docs/screenshots/fab-popup.png` |
+### Main panel (host right tab "Agent 调度")
 
-> Clone the repo and capture real screenshots yourself; the image slots are placeholders for community PRs.
+| Overview | Agent | Squads | History |
+| --- | --- | --- | --- |
+| <img src="docs/screenshots/01-overview.png" width="360" alt="Overview"> | <img src="docs/screenshots/02-agents.png" width="360" alt="Agents"> | <img src="docs/screenshots/03-squads.png" width="360" alt="Squads"> | <img src="docs/screenshots/04-history.png" width="360" alt="History"> |
+
+### Floating action ball
+
+| Idle | Running (breathing glow) | Done (color glow) |
+| --- | --- | --- |
+| <img src="docs/screenshots/06-fab-idle.png" width="200" alt="Idle"> | <img src="docs/screenshots/09-fab-live.png" width="200" alt="Running"> | <img src="docs/screenshots/11-fab-done.png" width="200" alt="Done"> |
+
+| Popup (running / recent / agents / squads) | Popup "Recently completed 1" | FAB settings |
+| --- | --- | --- |
+| <img src="docs/screenshots/07-fab-popup.png" width="300" alt="Popup"> | <img src="docs/screenshots/10-fab-popup-done.png" width="300" alt="Recent"> | <img src="docs/screenshots/08-fab-settings.png" width="300" alt="Settings"> |
 
 ## 5 model tools
 
