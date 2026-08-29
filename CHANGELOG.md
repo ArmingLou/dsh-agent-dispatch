@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.2 (2026-08-29)
+
+修复：FAB「最近完成」小队卡完成数回退——checkpoint 分段执行下同 squadRunId 产生多条 end 行，旧逻辑后到的（更旧段）覆盖最新段，导致 design 完成后仍显示 1/5。
+
+- 根因：`agent_squad_continue` 每次续跑都写一条 `phase:'end'` 的 squad-run 行（stepStatus 是累计快照），FAB 聚合时 `runEndById.set` 无脑覆盖，最新在前遍历时先 set 最新、后被更旧段覆盖。
+- 修复：`runEndById` 首次 set 才保留（`if (!has) set`），`lastRecent` 最新在前 → 首次即最新最全的 stepStatus。历史页不受影响（其完成数走 dispatch 活体结局，不依赖 end 快照）。
+- 路由表第 6 条补停等动作：产出文档展示完整路径/链接、有待确认问题逐条列出请用户作答，回答前不得续跑。
+
 ## 1.3.1 (2026-08-29)
 
 新增：小队 checkpoint 停等的免重启配置能力（GUI 开关 + 工具）。

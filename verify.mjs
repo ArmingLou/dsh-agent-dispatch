@@ -321,6 +321,8 @@ if (!host.includes('checkpoint: st.checkpoint === true')) throw new Error('v1.3.
 if (!c.includes('产出后停等用户确认（checkpoint）')) throw new Error('v1.3.1: SquadForm 应有 checkpoint 停等开关 UI')
 if (!c.includes('checkpoint: !!st.checkpoint')) throw new Error('v1.3.1: SquadForm save 应透传 checkpoint')
 if (!c.includes('checkpoint: !!s.checkpoint')) throw new Error('v1.3.1: SquadForm 初始态应读入 checkpoint')
+// v1.3.2：FAB 最近完成——checkpoint 分段执行同 squadRunId 多条 end 行，取最新（首次）一条，防完成数回退
+if (!c.includes('if (!runEndById.has(d.squadRunId)) runEndById.set(d.squadRunId, d)')) throw new Error('v1.3.2: runEndById 应保留首次（最新）end 行，防分段覆盖导致完成数回退')
 // v0.9.21：历史页列头行 + 执行流图例 + 整面板毛玻璃（与悬浮球统一）
 if (!c.includes('ad-hist-colhead')) throw new Error('v0.9.21: 历史列表应有列头行（ad-hist-colhead）')
 if (!c.includes('c-status') || !c.includes('c-task')) throw new Error('v0.9.21: 列头应有列宽对齐类')
