@@ -448,6 +448,71 @@ export function apply(ctx) {
     },
   }))
 
+  // agent_upsert：新增/更新单个 Agent（与 GUI 编辑保存同一条 registry.upsert 逻辑，立即生效免重启）。
+  // v1.2.0：暴露给主 agent，改 Agent（含 systemPrompt）无需重启 Desktop、无需点 GUI。
+  toolDisposers.push(ctx.tools.register({
+    name: 'agent_upsert',
+    description:
+      'Create or update a single agent agent in the dsh-agent-dispatch registry. This is the same write path as the GUI edit-and-save (registry.upsert: in-memory + atomic disk write), so changes take effect immediately without restarting DSH. Use this to fix or adjust an agent\'s persona/systemPrompt, triggers, name, or model routes. The agent keeps its position if it already exists, otherwise it is appended.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        id: { type: 'string', description: 'Agent id (kebab-case, lowercase letters/digits, hyphen-separated segments).' },
+        name: { type: 'string', description: 'Display name (non-empty).' },
+        systemPrompt: { type: 'string', description: 'The full agent persona / system prompt (non-empty).' },
+        emoji: { type: 'string', description: 'Optional single emoji shown in lists.' },
+        triggers: { type: 'string', description: 'Optional trigger-domain description used by agent_list routing.' },
+        routes: {
+          type: 'array',
+          description: 'Optional model routes; each item {provider, model, effort?}.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              provider: { type: 'string' },
+              model: { type: 'string' },
+              effort: { type: 'string' },
+            },
+            required: ['provider', 'model'],
+          },
+        },
+        enabled: { type: 'boolean', description: 'Optional enabled flag (default true).' },
+      },
+      required: ['id', 'name', 'systemPrompt'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          id: { type: 'string' },
+          name: { type: 'string' },
+        },
+        required: ['ok', 'id', 'name'],
+      },
+      render: (_args, value) => [
+        { type: 'text', text: `已保存 Agent: ${value.name}（${value.id}）` },
+      ],
+    },
+    isConcurrencySafe: () => true,
+    async execute(args) {
+      await ready
+      const agent = {
+        id: args.id,
+        name: args.name,
+        systemPrompt: args.systemPrompt,
+        emoji: args.emoji,
+        triggers: args.triggers,
+        routes: args.routes || [],
+        enabled: args.enabled !== false,
+      }
+      const normalized = await registry.upsert(agent)
+      return { ok: true, id: normalized.id, name: normalized.name }
+    },
+  }))
+
   // ── 路由表 prompt section ──
   // 固定策略文案；Agent实时目录靠 agent_list 工具获取（免重启：agents.json 改完下一轮即生效）。
   const disposeRoutesSection = ctx.systemPrompt.section({

@@ -1,7 +1,7 @@
 {
   "name": "@kiligzzz/dsh-agent-dispatch",
-  "version": "1.1.2",
-  "description": "User-defined agents with automatic routing for DeepSeek Harness: fixed-persona continuable subagents, per-agent model routes with failover, dispatch/followup/list/squad/import tools, and a routing prompt section. No built-in agents — create your own via the panel or import from skills. Dual-face dsh plugin (host + browser half), no DSH source changes.",
+  "version": "1.2.0",
+  "description": "User-defined agents with automatic routing for DeepSeek Harness: fixed-persona continuable subagents, per-agent model routes with failover, dispatch/followup/list/squad/import/upsert tools, and a routing prompt section. No built-in agents — create your own via the panel, import from skills, or upsert programmatically without restart. Dual-face dsh plugin (host + browser half), no DSH source changes.",
   "keywords": [
     "dsh",
     "dsh-plugin",

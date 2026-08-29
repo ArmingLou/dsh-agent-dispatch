@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0 (2026-08-29)
+
+新增：`agent_upsert` 工具——主 agent 可直接新增/更新单个 Agent，免重启生效。
+
+- 根因：此前改 Agent（含 systemPrompt）只有两条路——GUI 编辑保存（浏览器同源 REST）或手改 `agents.json` 文件（需重启才读盘）。命令行直连 `/agent-api/upsert` 被宿主 webserver 403 拦截，主 agent 无法走 GUI 同款逻辑。
+- 修复：把 GUI 编辑保存同款的 `registry.upsert()`（内存 + 原子写盘，立即生效）暴露成 `agent_upsert` 工具，主 agent 直接调用即可改 Agent 注册表，无需重启、无需点 GUI、无需绕 skill 导入。
+- 递归护栏同步：`startContinuable` 的 `toolFilter.deny` 清单追加 `agent_upsert`，阻断子代理用该工具自我改 persona 逃逸（子代理看不到改注册表能力）。
+- 版本断言：`verify.mjs` 工具白名单与 deny 清单断言同步更新。
+
 ## 1.1.2 (2026-08-29)
 
 修复：递归护栏——dispatch 的 `startContinuable` 加 `toolFilter.deny` 物理阻断子代理再委派。

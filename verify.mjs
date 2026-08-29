@@ -57,7 +57,7 @@ const ctx = {
 }
 mod.apply(ctx)
 await new Promise(r => setTimeout(r, 300))
-for (const t of ['agent_dispatch', 'agent_followup', 'agent_list', 'agent_squad', 'agent_import_skill']) {
+for (const t of ['agent_dispatch', 'agent_followup', 'agent_list', 'agent_squad', 'agent_import_skill', 'agent_upsert']) {
       // 小队注册表：内置 3 队可加载
   if (!tools.includes(t)) errors.push(`apply 未注册工具 ${t}`)
 }
@@ -104,7 +104,8 @@ if (!host.includes('next.squadName = sq?.name')) throw new Error('v0.9.16: merge
 // v0.9.35：label 在Agent名后拼 squadMark（S{n}/{total}）——断言 squadMark 构造与拼接逻辑存在
 const dispatchSrc = readFileSync(path.join(root, 'lib/dispatch.js'), 'utf8')
 // v1.1.2：递归护栏——startContinuable 必须 deny 全部 5 个委派工具，物理阻断子代理再派下级
-if (!dispatchSrc.includes("toolFilter: { deny: ['agent_dispatch', 'agent_followup', 'agent_list', 'agent_squad', 'agent_import_skill'] }")) throw new Error('v1.1.2: startContinuable 必须 toolFilter.deny 全部 5 个委派工具')
+// v1.2.0：deny 清单追加 agent_upsert，防子代理通过新工具改注册表逃逸
+if (!dispatchSrc.includes("toolFilter: { deny: ['agent_dispatch', 'agent_followup', 'agent_list', 'agent_squad', 'agent_import_skill', 'agent_upsert'] }")) throw new Error('v1.2.0: startContinuable 必须 toolFilter.deny 全部 6 个委派工具（含 agent_upsert）')
 if (!dispatchSrc.includes("const squadMark = viaSquad && totalSteps != null && stepIndex != null")) throw new Error('v0.9.35: dispatch 应构造 squadMark（S{n}/{total}）')
 if (!dispatchSrc.includes('`${agent.name}${squadMark} · ${taskLabel}`')) throw new Error('v0.9.35: startContinuable label 应带Agent名 + squadMark 前缀')
 if (!dispatchSrc.includes('totalSteps = null')) throw new Error('v0.9.35: dispatch 应接收 totalSteps 参数')
