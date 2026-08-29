@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.3 (2026-08-30)
+
+修复：DSH 0.1.2 兼容——client 半挂载失败（面板/返回按钮/悬浮球/Agent 菜单全消失，host 半工具正常）。
+
+- 根因：0.1.2 将 `slots` 服务改为 hardDependency 形态后，`ctx.get("slots")` 在插件 fiber 的加载时序下返回 `undefined`，`apply()` 开头 `if (!slots) return` 静默退出整个 client 半。
+- 修复：`lib/client.js` 改用官方标准访问 `ctx.slots`（与官方插件一致），其余 `ctx.get("sessions")`/`ctx.get("inputTriggers")` 为可选服务访问，契约兼容，保持不动。
+- 影响：仅 client 半（浏览器 UI），host 半无改动；升级 dsh 0.1.2+ 后需重启 Desktop 生效。
+
 ## 1.3.2 (2026-08-29)
 
 修复：FAB「最近完成」小队卡完成数回退——checkpoint 分段执行下同 squadRunId 产生多条 end 行，旧逻辑后到的（更旧段）覆盖最新段，导致 design 完成后仍显示 1/5。
