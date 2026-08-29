@@ -650,6 +650,78 @@ export function apply(ctx) {
     },
   }))
 
+  // agent_squad_upsert：新增/更新单个小队（与 GUI 小队编辑保存同一条 squadRegistry.upsert 逻辑，立即生效免重启）。
+  // v1.3.0：暴露给主 agent 免重启改小队（含 checkpoint 字段）；GUI 表单同步加 checkpoint 开关后两条路径等价。
+  toolDisposers.push(ctx.tools.register({
+    name: 'agent_squad_upsert',
+    description:
+      'Create or update a single agent squad in the dsh-agent-dispatch squad registry. This is the same write path as the GUI squad edit-and-save (squadRegistry.upsert: in-memory + atomic disk write), so changes take effect immediately without restarting DSH. Use this to fix or adjust a squad\'s steps — including the checkpoint flag on each step (checkpoint:true = pause after that step completes, wait for user confirmation, resume via agent_squad_continue).',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        id: { type: 'string', description: 'Squad id (kebab-case, lowercase letters/digits, hyphen-separated segments).' },
+        name: { type: 'string', description: 'Display name (non-empty).' },
+        description: { type: 'string', description: 'Optional one-line description.' },
+        emoji: { type: 'string', description: 'Optional single emoji shown in lists.' },
+        steps: {
+          type: 'array',
+          description: 'Squad steps. Each step: {agentId, phase, dependsOn:[stepIdx], instruction, checkpoint?}. checkpoint:true pauses after the step completes (agent_squad returns paused:true).',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              agentId: { type: 'string' },
+              phase: { type: 'string' },
+              dependsOn: { type: 'array', items: { type: 'number' } },
+              instruction: { type: 'string' },
+              checkpoint: { type: 'boolean' },
+            },
+            required: ['agentId', 'phase', 'dependsOn', 'instruction'],
+          },
+        },
+        enabled: { type: 'boolean', description: 'Optional enabled flag (default true).' },
+      },
+      required: ['id', 'name', 'steps'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          id: { type: 'string' },
+          name: { type: 'string' },
+          steps: { type: 'array', items: { type: 'object', additionalProperties: true } },
+        },
+        required: ['ok', 'id', 'name'],
+      },
+      render: (_args, value) => [
+        { type: 'text', text: `已保存小队: ${value.name}（${value.id}，${value.steps?.length ?? 0} 步）` },
+      ],
+    },
+    isConcurrencySafe: () => true,
+    async execute(args) {
+      await squadsReady
+      const squad = {
+        id: args.id,
+        name: args.name,
+        description: args.description,
+        emoji: args.emoji,
+        steps: (args.steps || []).map((st) => ({
+          agentId: st.agentId,
+          phase: st.phase,
+          dependsOn: [...(st.dependsOn || [])],
+          instruction: st.instruction,
+          checkpoint: st.checkpoint === true,
+        })),
+        enabled: args.enabled !== false,
+      }
+      const normalized = await squadRegistry.upsert(squad)
+      return { ok: true, id: normalized.id, name: normalized.name, steps: normalized.steps }
+    },
+  }))
+
   // ── 路由表 prompt section ──
   // 固定策略文案；Agent实时目录靠 agent_list 工具获取（免重启：agents.json 改完下一轮即生效）。
   const disposeRoutesSection = ctx.systemPrompt.section({
@@ -665,6 +737,7 @@ export function apply(ctx) {
       '6. 多角度或流水线目标（既要分析又要审查、多路排查同一问题）用 agent_squad：dev-pipeline=需求→审查串行；debug-squad=日志/数据/代码三路并行；review-squad=业务/数据双路。单领域任务不要用组队。带 checkpoint 的小队（如 kiligz-workflow）会在 checkpoint 步骤后返回 paused:true，必须停下等用户确认，用户反馈经 agent_squad_continue（squadRunId + note）续跑，禁止未确认就自动续跑。',
       '7. 复杂动态编排（组队模板不匹配、需要按中间结果决定下一步）时，用宿主 workflow 工具编排 agent_dispatch。',
       '8. 用户消息以「$<id> 」前缀开头时（如 "$sql-analyst 查下 orders 慢查询"），这是用户显式指定：把后续文本作为 task 直接 agent_dispatch 给该 id 的 Agent（组队 id 用 agent_squad），不要追问、不要改派。$ 前缀来自输入框 / 菜单选 Agent 的插入（或用户手打），是用户的明确意图。',
+      '9. 修改 Agent 用 agent_upsert、修改小队（含各步骤 checkpoint 停等开关）用 agent_squad_upsert，均免重启立即生效。',
     ].join('\n'),
   })
 

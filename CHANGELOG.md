@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.1 (2026-08-29)
+
+新增：小队 checkpoint 停等的免重启配置能力（GUI 开关 + 工具）。
+
+- `lib/client.js`：小队编辑表单（SquadForm）每步新增「产出后停等用户确认（checkpoint）」勾选开关，初始态读入、save 透传 `checkpoint` 字段。
+- `index.js`：新增 `agent_squad_upsert` 工具——主 agent 免重启改小队（含各步骤 checkpoint），与 GUI 小队编辑保存同一条 `squadRegistry.upsert` 路径（内存 + 原子写盘立即生效）。
+- `lib/dispatch.js`：递归护栏 `toolFilter.deny` 追加 `agent_squad_upsert`（共 8 个委派工具），阻断子代理改小队注册表逃逸。
+- systemPrompt 路由表新增第 9 条：改 Agent 用 `agent_upsert`、改小队用 `agent_squad_upsert`，均免重启。
+- `verify.mjs`：工具白名单、deny 清单、GUI 开关与工具断言同步更新（8 工具）。
+
 ## 1.3.0 (2026-08-29)
 
 新增：小队结果级停等（checkpoint）——agent_squad 支持在指定步骤产出后暂停，等用户确认再续跑。

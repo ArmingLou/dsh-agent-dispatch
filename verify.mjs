@@ -57,7 +57,7 @@ const ctx = {
 }
 mod.apply(ctx)
 await new Promise(r => setTimeout(r, 300))
-for (const t of ['agent_dispatch', 'agent_followup', 'agent_list', 'agent_squad', 'agent_squad_continue', 'agent_import_skill', 'agent_upsert']) {
+for (const t of ['agent_dispatch', 'agent_followup', 'agent_list', 'agent_squad', 'agent_squad_continue', 'agent_squad_upsert', 'agent_import_skill', 'agent_upsert']) {
       // 小队注册表：内置 3 队可加载
   if (!tools.includes(t)) errors.push(`apply 未注册工具 ${t}`)
 }
@@ -105,7 +105,7 @@ if (!host.includes('next.squadName = sq?.name')) throw new Error('v0.9.16: merge
 const dispatchSrc = readFileSync(path.join(root, 'lib/dispatch.js'), 'utf8')
 // v1.1.2：递归护栏——startContinuable 必须 deny 全部 5 个委派工具，物理阻断子代理再派下级
 // v1.2.0：deny 清单追加 agent_upsert，防子代理通过新工具改注册表逃逸
-if (!dispatchSrc.includes("toolFilter: { deny: ['agent_dispatch', 'agent_followup', 'agent_list', 'agent_squad', 'agent_squad_continue', 'agent_import_skill', 'agent_upsert'] }")) throw new Error('v1.3.0: startContinuable 必须 toolFilter.deny 全部 7 个委派工具（含 agent_squad_continue）')
+if (!dispatchSrc.includes("toolFilter: { deny: ['agent_dispatch', 'agent_followup', 'agent_list', 'agent_squad', 'agent_squad_continue', 'agent_squad_upsert', 'agent_import_skill', 'agent_upsert'] }")) throw new Error('v1.3.1: startContinuable 必须 toolFilter.deny 全部 8 个委派工具（含 agent_squad_upsert）')
 if (!dispatchSrc.includes("const squadMark = viaSquad && totalSteps != null && stepIndex != null")) throw new Error('v0.9.35: dispatch 应构造 squadMark（S{n}/{total}）')
 if (!dispatchSrc.includes('`${agent.name}${squadMark} · ${taskLabel}`')) throw new Error('v0.9.35: startContinuable label 应带Agent名 + squadMark 前缀')
 if (!dispatchSrc.includes('totalSteps = null')) throw new Error('v0.9.35: dispatch 应接收 totalSteps 参数')
@@ -315,6 +315,12 @@ if (!host.includes('const squadSessions = new Map()')) throw new Error('v1.3.0: 
 if (!host.includes('hitCheckpoint')) throw new Error('v1.3.0: runSquadSteps 应检测 checkpoint 停等（hitCheckpoint）')
 if (!host.includes('paused: true')) throw new Error('v1.3.0: 停等应返回 paused:true')
 if (!host.includes('agent_squad_continue')) throw new Error('v1.3.0: 路由表/工具描述应引导 agent_squad_continue 续跑')
+// v1.3.1：GUI 小队表单 checkpoint 开关 + agent_squad_upsert 工具（免重启改小队）
+if (!host.includes("name: 'agent_squad_upsert'")) throw new Error('v1.3.1: 应注册 agent_squad_upsert 工具')
+if (!host.includes('checkpoint: st.checkpoint === true')) throw new Error('v1.3.1: agent_squad_upsert 应透传 checkpoint')
+if (!c.includes('产出后停等用户确认（checkpoint）')) throw new Error('v1.3.1: SquadForm 应有 checkpoint 停等开关 UI')
+if (!c.includes('checkpoint: !!st.checkpoint')) throw new Error('v1.3.1: SquadForm save 应透传 checkpoint')
+if (!c.includes('checkpoint: !!s.checkpoint')) throw new Error('v1.3.1: SquadForm 初始态应读入 checkpoint')
 // v0.9.21：历史页列头行 + 执行流图例 + 整面板毛玻璃（与悬浮球统一）
 if (!c.includes('ad-hist-colhead')) throw new Error('v0.9.21: 历史列表应有列头行（ad-hist-colhead）')
 if (!c.includes('c-status') || !c.includes('c-task')) throw new Error('v0.9.21: 列头应有列宽对齐类')
