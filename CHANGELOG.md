@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.4 (2026-08-31)
+
+修复：DSH 0.1.2 客户端硬依赖声明缺失——web boot `Failed to load plugins`，桌面壳只剩恢复按钮。
+
+- 根因：0.1.2 起客户端服务必须在 bundle 内声明 inject（`exports.inject`，服务名列表），package.json 的 `dsh.client.inject`（模块依赖）不能替代。dispatch 的 `lib/client.js` 用 `ctx.slots`（hardDependency）却从未声明 `exports.inject`，loader 抛 `cannot get property "slots" without inject`。
+- 修复：`lib/client.js` 的 `module.exports` 加 `inject: ["slots", "locale"]`；`package.json` 的 `dsh.client.inject` 补 `@deepseek-ai/dsh-client-store` + `@deepseek-ai/dsh-client-locale`。
+- 影响：仅 client 半（浏览器 UI）；升级 dsh 0.1.2+ 后必须用本版本，需重启 Desktop 生效。
+
 ## 1.3.3 (2026-08-30)
 
 修复：DSH 0.1.2 兼容——client 半挂载失败（面板/返回按钮/悬浮球/Agent 菜单全消失，host 半工具正常）。
