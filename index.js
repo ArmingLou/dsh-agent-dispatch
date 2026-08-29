@@ -219,11 +219,95 @@ export function apply(ctx) {
     },
   }))
 
+  // ── v1.3.0：小队结果级停等（checkpoint）──
+  // 中间态：agent_squad 首段执行到第一个 checkpoint 步就 return paused=true，
+  // agent_squad_continue 凭 squadRunId 读回续跑。进程内内存态，重启失效
+  // （断点恢复靠各 Agent 写 .kiligz-state.json 兜底，跨重启可续）。
+  const squadSessions = new Map()
+
+  // 共享执行核心：从 fromStepIdx 起按拓扑分层继续执行。每跑完一层，
+  // 若该层存在 checkpoint=true 且成功完成的步骤 → 暂停返回 paused=true；
+  // 否则进入下一层，直到全部跑完返回 paused=false。
+  const runSquadSteps = async (parent, squad, goal, state, fromStepIdx) => {
+    const layers = topoLayers(squad.steps)
+    const results = []
+    const stepResults = state.stepResults
+    const squadRunId = state.squadRunId
+    const stepStatus = state.stepStatus
+    let paused = false
+    let nextStepIdx = fromStepIdx
+
+    for (const layer of layers) {
+      // 分段续跑：本层全部步骤都已完成（< fromStepIdx）则跳过
+      if (layer.every((idx) => idx < fromStepIdx)) continue
+      for (const idx of layer) stepStatus[idx] = 'running'
+      await Promise.all(
+        layer.map(async (idx) => {
+          const step = squad.steps[idx]
+          const agent = registry.get(step.agentId)
+          if (!agent || agent.enabled === false) {
+            stepStatus[idx] = 'skipped'
+            results.push({
+              step: idx,
+              phase: step.phase,
+              agentId: step.agentId,
+              agentName: agent?.name ?? step.agentId,
+              childId: '',
+              dependsOn: step.dependsOn ?? [],
+              skipped: true,
+            })
+            return
+          }
+          const task = renderInstruction(step.instruction, goal, stepResults) +
+            '\n\n【执行终点声明】本任务是 squad 编排中的一个执行步骤，你（Agent 子代理）在本轮内独立完成并输出结构化结论即可。严禁再调用 agent_dispatch / agent_squad / agent_followup 等任何委派或组队工具，严禁把本任务继续往下派发。直接完成本步任务并回报。'
+          try {
+            // waitResult=true——dispatch 等到本步子代理真正结束并取回结果文本，
+            // stepResults 填真实结论（{prev:N} 用），依赖链是结果级串行
+            // dedicatedChild=true——小队步骤强制新建专属子代理，不复用同Agent旧 child。
+            const r = await dispatcher.dispatch(parent, step.agentId, task, { viaSquad: squad.id, squadRunId, stepIndex: idx, totalSteps: squad.steps.length, waitResult: true, dedicatedChild: true })
+            stepStatus[idx] = 'done'
+            const out = String(r.output || '').trim()
+            stepResults[idx] = out
+              ? `（步骤 ${idx + 1} 结论）\n${out}`
+              : `（步骤 ${idx + 1} 完成，子代理无文本输出）`
+            results.push({
+              step: idx,
+              phase: step.phase,
+              agentId: step.agentId,
+              agentName: r.agentName,
+              childId: r.childId,
+              dependsOn: step.dependsOn ?? [],
+              skipped: false,
+            })
+          } catch (err) {
+            // 单步失败不炸整个小队：标记跳过，依赖者收到无结果占位
+            stepStatus[idx] = 'failed'
+            stepResults[idx] = `（本步委派失败: ${err.message}）`
+            results.push({
+              step: idx,
+              phase: step.phase,
+              agentId: step.agentId,
+              agentName: agent.name,
+              childId: '',
+              dependsOn: step.dependsOn ?? [],
+              skipped: true,
+            })
+          }
+        }),
+      )
+      nextStepIdx = Math.max(...layer) + 1
+      // checkpoint 停等：本层有 checkpoint=true 且成功完成的步骤 → 停下等用户确认
+      const hitCheckpoint = layer.some((idx) => squad.steps[idx].checkpoint === true && stepStatus[idx] === 'done')
+      if (hitCheckpoint) { paused = true; break }
+    }
+    return { paused, squadRunId, results, stepResults, stepStatus, nextStepIdx }
+  }
+
   // agent_squad：按预置小队模板把目标拆给多Agent（v0.3）
   toolDisposers.push(ctx.tools.register({
     name: 'agent_squad',
     description:
-      'Dispatch one goal to a preset agent squad (a template of multiple agent dispatches with dependencies — e.g. dev-pipeline runs requirement analysis then code review; debug-squad fans out log tracing, SQL analysis, and code review in parallel). Each step dispatches to its agent as a continuable subagent; steps with dependencies wait for earlier steps to finish, and their results feed the dependents. Returns per-step child ids immediately; outcomes arrive as subagent notices. Use for multi-angle or pipeline goals; prefer agent_dispatch for single-domain tasks.',
+      'Dispatch one goal to a preset agent squad (a template of multiple agent dispatches with dependencies — e.g. dev-pipeline runs requirement analysis then code review; debug-squad fans out log tracing, SQL analysis, and code review in parallel). Each step dispatches to its agent as a continuable subagent; steps with dependencies wait for earlier steps to finish, and their results feed the dependents. A step marked checkpoint:true pauses execution after it completes, returning paused:true with a squadRunId — call agent_squad_continue with that id (optionally with a note of user feedback) to resume. Use for multi-angle or pipeline goals; prefer agent_dispatch for single-domain tasks.',
     parameters: {
       type: 'object',
       properties: {
@@ -245,6 +329,9 @@ export function apply(ctx) {
         properties: {
           squadId: { type: 'string' },
           squadName: { type: 'string' },
+          squadRunId: { type: 'string' },
+          paused: { type: 'boolean' },
+          nextStepIdx: { type: 'number' },
           steps: {
             type: 'array',
             items: {
@@ -263,19 +350,21 @@ export function apply(ctx) {
             },
           },
         },
-        required: ['squadId', 'squadName', 'steps'],
+        required: ['squadId', 'squadName', 'squadRunId', 'paused', 'nextStepIdx', 'steps'],
       },
       render: (_args, value) => [
         {
           type: 'text',
-          text: `小队 ${value.squadName} 已展开（${value.steps.length} 步）：\n` +
+          text: `小队 ${value.squadName} ${value.paused ? '已暂停待确认' : '已执行完成'}（本段 ${value.steps.length} 步）：\n` +
             value.steps
               .map(
                 (s) =>
                   `  ${s.skipped ? '⏭️' : '✅'} 步骤${s.step + 1} [${s.phase}] ${s.agentName}${s.childId ? ` · 子代理 ${s.childId}` : ' · 已停用跳过'}${s.dependsOn.length ? `（等步骤 ${s.dependsOn.map((d) => d + 1).join(',')}）` : ''}`,
               )
               .join('\n') +
-            '\n各步结果将以子代理通知回到本会话。',
+            (value.paused
+              ? `\n已到 checkpoint 停等点。用户确认后，调用 agent_squad_continue（squadRunId=${value.squadRunId}）继续。`
+              : '\n各步结果将以子代理通知回到本会话。'),
         },
       ],
     },
@@ -287,14 +376,10 @@ export function apply(ctx) {
       const squadId = args.squad_id
       const squad = squadId ? squadById().get(squadId) : undefined
       if (!squad) throw new Error(`小队不存在: ${JSON.stringify(args)}。可用: ${squadRegistry.list().map((s) => s.id).join(', ')}`)
-      // v0.8.2：停用的小队拒绝执行
+      // 停用的小队拒绝执行
       if (squad.enabled === false) throw new Error(`小队「${squad.name}」已停用，可在 Agent 调度面板的小队页重新启用`)
 
-      // 拓扑分层展开；跳过已停用Agent所在步骤（其依赖者按"无结果"继续）
-      const layers = topoLayers(squad.steps)
-      const results = []
-      const stepResults = new Array(squad.steps.length).fill(null)
-      // v0.9.17：小队运行日志——拓扑快照（历史页执行流图数据源）
+      // 小队运行日志——拓扑快照（历史页执行流图数据源）
       const squadRunId = 'run-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7)
       dispatcher.logSquadRun({
         kind: 'squad-run',
@@ -307,82 +392,134 @@ export function apply(ctx) {
         steps: squad.steps.map((st, i) => ({ idx: i, phase: st.phase || st.agentId, agentId: st.agentId, dependsOn: st.dependsOn ?? [] })),
         parentSessionId: parent?.session?.id ?? null,
       })
-      const stepStatus = new Array(squad.steps.length).fill('waiting')
-      for (const layer of layers) {
-        for (const idx of layer) stepStatus[idx] = 'running'
-        await Promise.all(
-          layer.map(async (idx) => {
-            const step = squad.steps[idx]
-            const agent = registry.get(step.agentId)
-            if (!agent || agent.enabled === false) {
-              stepStatus[idx] = 'skipped'
-              results.push({
-                step: idx,
-                phase: step.phase,
-                agentId: step.agentId,
-                agentName: agent?.name ?? step.agentId,
-                childId: '',
-                dependsOn: step.dependsOn ?? [],
-                skipped: true,
-              })
-              return
-            }
-            const task = renderInstruction(step.instruction, args.goal, stepResults) +
-              '\n\n【执行终点声明】本任务是 squad 编排中的一个执行步骤，你（Agent 子代理）在本轮内独立完成并输出结构化结论即可。严禁再调用 agent_dispatch / agent_squad / agent_followup 等任何委派或组队工具，严禁把本任务继续往下派发。直接完成本步任务并回报。'
-            try {
-              // v0.9.36：waitResult=true——dispatch 等到本步子代理真正结束并取回结果文本，
-              // stepResults 填真实结论（{prev:N} 用），不再填「已委派」占位；依赖链因此是结果级串行
-              // v0.9.40：dedicatedChild=true——小队步骤强制新建专属子代理，不复用同Agent旧 child。
-              // 根因：并发步骤同Agent（如 S2/S6 都是 code-reviewer）会走续聊撞同一 child——
-              // followup 把第二个任务强塞给正忙的第一个、且 #waitFor 注册孤儿等待器永久挂起 →
-              // 主代理卡死、面板只显示先注册的 3 卡。每步独占新 child，依赖/并发语义才成立。
-              const r = await dispatcher.dispatch(parent, step.agentId, task, { viaSquad: squad.id, squadRunId, stepIndex: idx, totalSteps: squad.steps.length, waitResult: true, dedicatedChild: true })
-              stepStatus[idx] = 'done'
-              // v0.9.38：r.output 已归一化为字符串（onChildEnd #normOutput）；String() 兜底防意外形态
-              const out = String(r.output || '').trim()
-              stepResults[idx] = out
-                ? `（步骤 ${idx + 1} 结论）\n${out}`
-                : `（步骤 ${idx + 1} 完成，子代理无文本输出）`
-              results.push({
-                step: idx,
-                phase: step.phase,
-                agentId: step.agentId,
-                agentName: r.agentName,
-                childId: r.childId,
-                dependsOn: step.dependsOn ?? [],
-                skipped: false,
-              })
-            } catch (err) {
-              // 单步失败不炸整个小队：标记跳过，依赖者收到无结果占位
-              stepStatus[idx] = 'failed'
-              stepResults[idx] = `（本步委派失败: ${err.message}）`
-              results.push({
-                step: idx,
-                phase: step.phase,
-                agentId: step.agentId,
-                agentName: agent.name,
-                childId: '',
-                dependsOn: step.dependsOn ?? [],
-                skipped: true,
-              })
-            }
-          }),
-        )
+      const state = {
+        squadRunId,
+        stepResults: new Array(squad.steps.length).fill(null),
+        stepStatus: new Array(squad.steps.length).fill('waiting'),
+        nextStepIdx: 0,
       }
+      const { paused, results, stepResults, stepStatus, nextStepIdx } = await runSquadSteps(parent, squad, args.goal, state, 0)
       results.sort((a, b) => a.step - b.step)
-      // v0.9.17：运行终态行——各步骤最终状态（历史页执行流图着色数据源）
-      // 注意：dispatch 是立即返回的（子 agent 异步），'done'=委派成功，真实成败看 result 行
-      // v0.9.34：补 ok+ended 让前端「最近完成」TTL+ok+ended 过滤直接通过（不再依赖前端 map 补字段）
       dispatcher.logSquadRun({
         kind: 'squad-run',
         phase: 'end',
         squadRunId,
         squadId: squad.id,
         stepStatus,
+        paused,
         ok: true,
         ended: true,
       })
-      return { squadId: squad.id, squadName: squad.name, steps: results }
+      if (paused) {
+        squadSessions.set(squadRunId, { squad, goal: args.goal, stepResults, stepStatus, nextStepIdx })
+        return { squadId: squad.id, squadName: squad.name, squadRunId, paused: true, nextStepIdx, steps: results }
+      }
+      squadSessions.delete(squadRunId)
+      return { squadId: squad.id, squadName: squad.name, squadRunId, paused: false, nextStepIdx, steps: results }
+    },
+  }))
+
+  // agent_squad_continue：从 checkpoint 停等点续跑小队（v1.3.0）
+  toolDisposers.push(ctx.tools.register({
+    name: 'agent_squad_continue',
+    description:
+      'Resume a paused agent_squad run from its checkpoint. Required: the squadRunId returned by the previous agent_squad / agent_squad_continue call that reported paused:true. Optional note: user feedback on the just-completed stage, appended to the goal so every remaining step sees it. Runs until the next checkpoint step or until all steps complete; returns paused:true again (with the same squadRunId) if it hit another checkpoint, otherwise paused:false.',
+    parameters: {
+      type: 'object',
+      properties: {
+        squadRunId: {
+          type: 'string',
+          description: 'The squadRunId returned by the paused agent_squad / agent_squad_continue call.',
+        },
+        note: {
+          type: 'string',
+          description: 'Optional user feedback / correction on the previous stage, passed to all remaining steps.',
+        },
+      },
+      required: ['squadRunId'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          squadId: { type: 'string' },
+          squadName: { type: 'string' },
+          squadRunId: { type: 'string' },
+          paused: { type: 'boolean' },
+          nextStepIdx: { type: 'number' },
+          steps: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                step: { type: 'number' },
+                phase: { type: 'string' },
+                agentId: { type: 'string' },
+                agentName: { type: 'string' },
+                childId: { type: 'string' },
+                dependsOn: { type: 'array', items: { type: 'number' } },
+                skipped: { type: 'boolean' },
+              },
+              required: ['step', 'phase', 'agentId', 'agentName', 'childId', 'dependsOn', 'skipped'],
+            },
+          },
+        },
+        required: ['squadId', 'squadName', 'squadRunId', 'paused', 'nextStepIdx', 'steps'],
+      },
+      render: (_args, value) => [
+        {
+          type: 'text',
+          text: `小队 ${value.squadName} 续跑${value.paused ? '后再次暂停待确认' : '完成'}（本段 ${value.steps.length} 步）：\n` +
+            value.steps
+              .map(
+                (s) =>
+                  `  ${s.skipped ? '⏭️' : '✅'} 步骤${s.step + 1} [${s.phase}] ${s.agentName}${s.childId ? ` · 子代理 ${s.childId}` : ' · 已停用跳过'}${s.dependsOn.length ? `（等步骤 ${s.dependsOn.map((d) => d + 1).join(',')}）` : ''}`,
+              )
+              .join('\n') +
+            (value.paused
+              ? `\n又到 checkpoint 停等点。用户确认后继续调用 agent_squad_continue（squadRunId=${value.squadRunId}）。`
+              : '\n小队全部步骤执行完成。'),
+        },
+      ],
+    },
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      await Promise.all([ready, squadsReady])
+      const parent = exec.agent
+      if (!parent) throw new Error('agent_squad_continue 需要调用方 agent（exec.agent 为空）')
+      const session = squadSessions.get(args.squadRunId)
+      if (!session) throw new Error(`小队运行 ${args.squadRunId} 不存在或已结束（进程重启后中间态失效，可用 .kiligz-state.json 断点恢复重新走流程）`)
+      const squad = session.squad
+      // 用户反馈（note）拼进 goal，让所有后续步骤可见
+      const goal = args.note
+        ? `${session.goal}\n\n【用户对上一阶段反馈】\n${args.note}`
+        : session.goal
+      const state = {
+        squadRunId: args.squadRunId,
+        stepResults: session.stepResults,
+        stepStatus: session.stepStatus || new Array(squad.steps.length).fill('waiting'),
+        nextStepIdx: session.nextStepIdx,
+      }
+      const { paused, results, stepResults, stepStatus, nextStepIdx } = await runSquadSteps(parent, squad, goal, state, session.nextStepIdx)
+      results.sort((a, b) => a.step - b.step)
+      dispatcher.logSquadRun({
+        kind: 'squad-run',
+        phase: 'end',
+        squadRunId: args.squadRunId,
+        squadId: squad.id,
+        stepStatus,
+        paused,
+        ok: true,
+        ended: true,
+      })
+      if (paused) {
+        squadSessions.set(args.squadRunId, { squad, goal, stepResults, stepStatus, nextStepIdx })
+        return { squadId: squad.id, squadName: squad.name, squadRunId: args.squadRunId, paused: true, nextStepIdx, steps: results }
+      }
+      squadSessions.delete(args.squadRunId)
+      return { squadId: squad.id, squadName: squad.name, squadRunId: args.squadRunId, paused: false, nextStepIdx, steps: results }
     },
   }))
 
@@ -525,7 +662,7 @@ export function apply(ctx) {
       '3. 对同一 Agent 的后续追问用 agent_followup（带 childId），上下文延续。',
       '4. 简单问题（一句话能答、无需工具链）不必委派，直接回答——委派本身有开销。',
       '5. 不确定哪个 Agent 合适时先 agent_list。',
-      '6. 多角度或流水线目标（既要分析又要审查、多路排查同一问题）用 agent_squad：dev-pipeline=需求→审查串行；debug-squad=日志/数据/代码三路并行；review-squad=业务/数据双路。单领域任务不要用组队。',
+      '6. 多角度或流水线目标（既要分析又要审查、多路排查同一问题）用 agent_squad：dev-pipeline=需求→审查串行；debug-squad=日志/数据/代码三路并行；review-squad=业务/数据双路。单领域任务不要用组队。带 checkpoint 的小队（如 kiligz-workflow）会在 checkpoint 步骤后返回 paused:true，必须停下等用户确认，用户反馈经 agent_squad_continue（squadRunId + note）续跑，禁止未确认就自动续跑。',
       '7. 复杂动态编排（组队模板不匹配、需要按中间结果决定下一步）时，用宿主 workflow 工具编排 agent_dispatch。',
       '8. 用户消息以「$<id> 」前缀开头时（如 "$sql-analyst 查下 orders 慢查询"），这是用户显式指定：把后续文本作为 task 直接 agent_dispatch 给该 id 的 Agent（组队 id 用 agent_squad），不要追问、不要改派。$ 前缀来自输入框 / 菜单选 Agent 的插入（或用户手打），是用户的明确意图。',
     ].join('\n'),

@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.3.0 (2026-08-29)
+
+新增：小队结果级停等（checkpoint）——agent_squad 支持在指定步骤产出后暂停，等用户确认再续跑。
+
+- 背景：kiligz-workflow 这类开发流程要求「每阶段产出后停等用户确认」，而旧 agent_squad 是单次工具调用内跑完全部步骤，无法中途停下问用户。
+- `lib/squad-registry.js`：squad 步骤新增 `checkpoint` 布尔字段（默认 false），validate/upsert/list 透传并校验。
+- `index.js`：
+  - 抽 `runSquadSteps` 共享执行核心，按拓扑分层执行；每层跑完若含 `checkpoint:true` 且成功完成的步骤 → 停下返回 `paused:true`，否则继续下一层。
+  - `agent_squad` 输出增加 `squadRunId` / `paused` / `nextStepIdx`；停等时把中间态存入进程内 `squadSessions`。
+  - 新增 `agent_squad_continue` 工具：凭 `squadRunId` 续跑，可选 `note`（用户对上一阶段的反馈，拼入 goal 供后续步骤可见）。
+  - systemPrompt 路由表第 6 条补 checkpoint 停等引导：带 checkpoint 的小队必须停下等用户确认，禁止未确认自动续跑。
+- `lib/dispatch.js`：递归护栏 `toolFilter.deny` 追加 `agent_squad_continue`（共 7 个委派工具），阻断子代理续跑小队递归。
+- `verify.mjs`：工具白名单、deny 清单、checkpoint 透传与续跑断言同步更新。
+- 中间态为进程内内存，Desktop 重启失效；跨重启断点恢复靠各阶段 Agent 写 `.kiligz-state.json` 兜底。
+
 ## 1.2.0 (2026-08-29)
 
 新增：`agent_upsert` 工具——主 agent 可直接新增/更新单个 Agent，免重启生效。
