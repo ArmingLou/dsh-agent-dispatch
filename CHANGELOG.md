@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.2 (2026-08-29)
+
+修复：递归护栏——dispatch 的 `startContinuable` 加 `toolFilter.deny` 物理阻断子代理再委派。
+
+- 根因：`maxDepth` 只是委派深度记账，不是"禁止派下级"；子代理继承主会话工具面（含 `agent_dispatch`/`agent_squad`），遇到未闭环状态会自行续派新子代理，造成"关了又开、递归开子代理"。
+- 修复：每个被派出的 agent 子代理 `toolFilter.deny` 全部 5 个委派工具（`agent_dispatch`/`agent_followup`/`agent_list`/`agent_squad`/`agent_import_skill`），从工具注册表层物理斩断递归，非 prompt 软约束。
+- 小队不受影响：squad 由主 agent 调 `agent_squad` → host 解析模板逐 step dispatch，step agent 只需业务工具。
+
 ## 1.1.1 (2026-08-28)
 
 工程维护（无功能变更）：
