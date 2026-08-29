@@ -46,7 +46,10 @@
     },
     "client": {
       "platform": "web",
-      "inject": []
+      "inject": [
+        "@deepseek-ai/dsh-client-store",
+        "@deepseek-ai/dsh-client-locale"
+      ]
     }
   },
   "peerDependencies": {
