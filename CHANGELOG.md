@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.4.0 (2026-08-31)
+
+新增：ACP / subagent provider 路由支持——Agent 的 `routes` 现在可以直接指向宿主已注册的 subagent provider（如 product-subagents 插件注册的 deveco ACP 服务、claude-code / codex 桥），任务经 ACP relay 模式执行，不再要求 routes 必须是 LLM 模型路由。
+
+- 背景：此前 `routes[].provider` 一律塞进 `agentOptions`（LLM 模型路由）。当 provider 是 ACP 服务（如 `deveco`）时，LLM 路由表里不存在该 provider，子代理激活报 `NO_ADAPTER: no adapter registered for provider "deveco"`，Agent 完全不可用。
+- 修复：`lib/dispatch.js` 路由解析时先查 `ctx.subagents.getProvider(route.provider)`——命中即 subagent provider，走 ACP relay 模式：
+  - `spec.provider` 直接传 `route.provider`（由 product-subagents 等插件建立 ACP 桥接与绑定）；
+  - persona 拼接 `agent.systemPrompt` + 「ACP 执行模式」转发指示（任务经 `product_submit` 原样转发给 ACP 代理，结果如实转达）；
+  - `toolFilter` 改为 `{ allow: ['product_submit'] }` 白名单（与 product-subagents 的 relay 管道一致），物理阻断 ACP 模式下使用其他工具；
+  - 不传 `agentOptions`（ACP 服务自带模型配置）。
+  - 未命中（普通 LLM provider，如 deepseek-official）时行为与 1.3.4 完全一致（spawn + agentOptions + deny 护栏）。
+- 决策日志：ACP 模式 `provider` 记录 `route.provider`、`model` 记 null，便于区分执行通道。
+- 用法：`"routes": [{ "provider": "deveco", "model": "default" }]`（model 字段保留仅作兼容，ACP 模式忽略）。
+- 影响：需重启 DSH 生效；验证脚本 `verify.mjs` 同步更新。
+
 ## 1.3.4 (2026-08-31)
 
 修复：DSH 0.1.2 客户端硬依赖声明缺失——web boot `Failed to load plugins`，桌面壳只剩恢复按钮。

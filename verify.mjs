@@ -106,6 +106,10 @@ const dispatchSrc = readFileSync(path.join(root, 'lib/dispatch.js'), 'utf8')
 // v1.1.2：递归护栏——startContinuable 必须 deny 全部 5 个委派工具，物理阻断子代理再派下级
 // v1.2.0：deny 清单追加 agent_upsert，防子代理通过新工具改注册表逃逸
 if (!dispatchSrc.includes("toolFilter: { deny: ['agent_dispatch', 'agent_followup', 'agent_list', 'agent_squad', 'agent_squad_continue', 'agent_squad_upsert', 'agent_import_skill', 'agent_upsert'] }")) throw new Error('v1.3.1: startContinuable 必须 toolFilter.deny 全部 8 个委派工具（含 agent_squad_upsert）')
+// v1.4.0：ACP/subagent provider 路由——getProvider 命中即走 relay 模式（allow 白名单）
+if (!dispatchSrc.includes('const subProvider = route ? this.ctx.subagents?.getProvider?.(route.provider) : undefined')) throw new Error('v1.4.0: dispatch 应检测 subagent provider（getProvider 命中）')
+if (!dispatchSrc.includes("provider: acpMode ? route.provider : 'spawn'")) throw new Error('v1.4.0: ACP 模式 spec.provider 应直接传 route.provider')
+if (!dispatchSrc.includes("toolFilter: { allow: ['product_submit'] }")) throw new Error('v1.4.0: ACP 模式 toolFilter 应 allow 白名单 product_submit')
 if (!dispatchSrc.includes("const squadMark = viaSquad && totalSteps != null && stepIndex != null")) throw new Error('v0.9.35: dispatch 应构造 squadMark（S{n}/{total}）')
 if (!dispatchSrc.includes('`${agent.name}${squadMark} · ${taskLabel}`')) throw new Error('v0.9.35: startContinuable label 应带Agent名 + squadMark 前缀')
 if (!dispatchSrc.includes('totalSteps = null')) throw new Error('v0.9.35: dispatch 应接收 totalSteps 参数')
