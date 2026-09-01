@@ -40,6 +40,33 @@ export function apply(ctx) {
   const registry = new AgentRegistry(dataDir)
   const dispatcher = new Dispatcher({ ctx, registry, dataDir })
 
+  // v1.4.1 执行级递归护栏：harness 把 report/subagent 等工具注册进【子代理自身 scope】，
+  // 而 toolFilter 的 allow/deny 只过滤"继承面"，刻意豁免子代理 own-layer 的工具
+  // （view() 里 "must not strip the machinery it answers through"）。因此仅靠 deny 名单
+  // 去不掉 subagent/subagent_fork/report。这里用 tools.guard 在【执行时】拒绝子代理调用任何
+  // "再起新代理 / 管理委派树"的工具；保留 product_submit（ACP 中继转发任务）与 report（子代理回传结果）。
+  // 注：registerContinuableSetup 对宿主所有可续聊子代理生效，实现"子代理一律不得再委派"。
+  const noDelegateTools = new Set([
+    'agent_dispatch', 'agent_followup', 'agent_list', 'agent_squad', 'agent_squad_continue',
+    'agent_squad_upsert', 'agent_upsert', 'agent_import_skill',
+    'subagent', 'subagent_fork', 'subagent_progress', 'list_agents', 'interrupt_agent', 'send_message',
+    'product_delegate', 'product_wait', 'product_roles',
+    'workflow', 'ralph', 'create_goal', 'get_goal', 'update_goal',
+  ])
+  ctx.subagents.registerContinuableSetup((childCtx) => {
+    try {
+      return childCtx.tools.guard((exec) => {
+        if (noDelegateTools.has(exec.name)) {
+          return `[dsh-agent-dispatch] 子代理禁止再向下委派/另起代理：${exec.name} 已禁用，必须自己完成任务；超出能力时明确说明卡在哪，并向上（父级）汇报。`
+        }
+        return undefined
+      })
+    } catch (err) {
+      // 个别 scope 无 tools 服务等异常不阻断子代理启动
+      return undefined
+    }
+  })
+
   // v0.7.1：订阅宿主 'subagent/end' 生命周期事件 → 子 agent 终结即移出活跃映射 + 补记真实结果。
   // 修复根因：此前 activeChildren 只增不减，活动面板永远"运行中"、FAB 完成检测永不触发。
   // 事件契约：info = { runId, provider, id: childId, stopReason?, lastAssistantMessage? }（dsh-subagent）
@@ -729,6 +756,7 @@ export function apply(ctx) {
     order: 116.5,
     text: [
       'Agent 委派策略（dsh-agent-dispatch）：',
+      '［适用范围］本策略仅对具备委派工具的编排层（主代理 / 父级）生效。若你作为子代理收到本段，请直接忽略其中的委派建议：必须由你自己独立完成被指派的任务，禁止再向下委派或另起任何子代理（含 agent_dispatch / agent_squad / subagent / subagent_fork / workflow / product_delegate 等）；超出能力时明确说明卡在哪、需要什么，并向上（父级）汇报，绝不自行委派或硬闯。',
       '1. 任务命中某 Agent 领域（需求分析/代码审查/线上排查/SQL 分析等，以 agent_list 返回的 triggers 为准）时，优先用 agent_dispatch 委派，而不是自己在主对话里做。',
       '2. 委派任务必须是自包含的：Agent 看不到本会话，把所需上下文（路径/代码/日志/约束）全部写进 task。',
       '3. 对同一 Agent 的后续追问用 agent_followup（带 childId），上下文延续。',

@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.4.2 (2026-08-31)
+
+加固：堵住"子代理自身 scope 工具绕过 toolFilter"的漏洞——harness 把 `report`/`subagent` 等工具注册进子代理 own-layer，`tools.restrict` 的 allow/deny 只过滤"继承面"、刻意豁免 own-layer 工具，故仅靠 deny 名单去不掉 `subagent`/`subagent_fork`。
+
+- 修改（`index.js`）：`ctx.subagents.registerContinuableSetup` 里注册 `childCtx.tools.guard`，在【执行时】拒绝子代理调用任何"再起新代理 / 管理委派树"的工具：`agent_dispatch`/`agent_squad`/`agent_upsert`/`agent_import_skill` 系 + `subagent`/`subagent_fork`/`subagent_progress`/`list_agents`/`interrupt_agent`/`send_message`/`product_delegate`/`product_wait`/`product_roles`/`workflow`/`ralph`/`create_goal`/`get_goal`/`update_goal`。
+- 保留 `product_submit`（ACP 中继转发任务）与 `report`（子代理回传结果）不被误伤。
+- 影响：对宿主所有可续聊子代理生效（"子代理一律不得再委派"）；需重启 DSH 生效。
+
+## 1.4.1 (2026-08-31)
+
+加固：低成本子代理禁止再向下委派，必须自己完成被指派的任务（防止把任务再派回付费模型，如 architect / deepseek-official）。
+
+- 背景：此前仅对子代理 deny 本插件的委派工具（`agent_dispatch` / `agent_squad` 等），子代理仍可用宿主通用工具（`subagent` / `subagent_fork` / `workflow` / `product_delegate` 等）另起第三层代理，可能被再次路由到付费模型，造成成本泄漏；且全局注入的「Agent 委派策略」路由段也会诱导子代理去委派。
+- 修改一（`lib/dispatch.js` 创建子代理的 `toolFilter.deny`）：把通用子代理工具一并纳入 deny——`subagent` / `subagent_fork` / `subagent_progress` / `list_agents` / `interrupt_agent` / `send_message` / `product_delegate` / `product_submit` / `product_wait` / `product_roles` / `workflow` / `ralph` / `create_goal` / `get_goal` / `update_goal`。
+- 修改二（`lib/dispatch.js` `dispatch()` 入口）：新增硬护栏——当调用方本身是子代理（`parentAgent.options.subagentDepth >= 1`）时直接抛错拒绝委派，与 deny 名单构成双保险，即使 deny 被绕过也物理阻断第三层及更深层委派。
+- 修改三（`index.js` 「Agent 委派策略」路由段）：追加「适用范围」说明——该策略仅对具备委派工具的编排层生效；若子代理收到本段，须忽略委派建议、自完成任务、禁止再起新代理。
+- 影响：需重启 DSH 生效。
+
 ## 1.4.0 (2026-08-31)
 
 新增：ACP / subagent provider 路由支持——Agent 的 `routes` 现在可以直接指向宿主已注册的 subagent provider（如 product-subagents 插件注册的 deveco ACP 服务、claude-code / codex 桥），任务经 ACP relay 模式执行，不再要求 routes 必须是 LLM 模型路由。
