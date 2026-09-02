@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.5.2 (2026-09-02)
+
+**不复用子代理的回收机制补强**：智能复用决策判"新开"之后，旧子代理的回收路径显式化 + 提供显式关闭工具。
+
+### 回收机制（回答"不再复用的子代理如何回收"）
+
+- **进程内 spawn 子代理**（默认 provider，绝大多数委派）：无 OS 进程。宿主在每轮 settled 后自动释放驻留 Activation（子代理降为 `ready`，内存/注册表槽位自动回收）；插件另有 `idleReleaseMs`（默认 10 分钟）定时 `drainContinuableChildren` 安全网。仅持久会话 JSONL 留在磁盘（宿主无删除 API）。
+- **ACP 子代理**（deveco 等，经 product-subagents）：后台进程归 `dsh-plugin-product-subagents` 管理——**每轮 `subagent/end` 即启动 `idleTimeoutMs`（profile 配置 600000ms=10 分钟）倒计时** → `bridge.dispose` 对 ACP 进程 SIGTERM + 删绑定；复用（续聊→`product_submit`）`cancelDispose` 取消定时器；进程死后远端会话 id 由 `~/.dsh/product-subagents-registry.json` + 会话日志 `PRODUCT_SESSION:` marker 双保险保留，后续续聊新起进程 + `session/load` 重连原远端会话，连续性不丢。
+- **智能决策与回收的关系**：`auto` 判"独立新任务"新开子代理时，旧线程仍留在复用池（LRU≤3）供其自身续聊——若一直不复用，其驻留/进程照常按上述机制回收；池超限淘汰 = 确定不再复用。
+
+### 新增
+
+- **`agent_close` 工具**（v1.5.2）：主模型确认某条线程"不再继续"时显式关闭——`childId` 关指定子代理 / `agentId` 关该 Agent 当前会话全部闲置子代理。关闭 = 立即移除复用资格（池条目 + 释放定时器）+ 非运行中立即 `drainContinuableChildren` 释放驻留；运行中的不打断任务（结束即自然回收）。ACP 后台进程仍由 product-subagents `idleTimeoutMs` 收尾（关闭时其最后一轮已启动倒计时）。
+- **淘汰即回收**：`#evictPool` 淘汰 LRU 超限 child 时（确定不再复用）立即 fire-and-forget drain 驻留（原仅清定时器）。
+- 统一释放路径 `#drainChild(parentSessionId, childId)`（idle 释放 / 淘汰 / 显式关闭三处共用，幂等）。
+- 决策日志新增 `kind:'close'` 行（childId/agentId/closing=drained|running）。
+- `agent_close` 纳入递归护栏（子代理不可用）与 DENY_CANDIDATES；路由策略 prompt 新增第 10 条指导。
+
+### 其他
+
+- `verify.mjs`：工具数 8→9；新增 v1.5.2 断言（agent_close 注册/透传、closeChild、#drainChild、淘汰 drain）。
+- 端到端验证（临时 DSH_HOME + mock LLM）：orders 线程复用 → 部署文档线程新开 → 继续命中部署线程 → `agent_close(agentId)` 双线程关闭（idle 的 drained、运行中的 running 不打断）→ 关闭后再"继续部署文档"**新开不再复用** → 小队专属 child，全链路通过；释放日志 2 次。
+
 ## 1.5.1 (2026-09-02)
 
 **同角色子代理复用升级为智能决策**：不再无差别复用——按"新任务 vs 上一任务的渐进延续"决定复用对应旧子代理还是新开。

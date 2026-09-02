@@ -70,6 +70,12 @@ Since v1.5.1, `agent_dispatch` decides reuse vs spawn **per task** (default `reu
 
 The pool is a per-(session, agent) LRU of the 3 most recent children, so continuations of different task threads each hit their own subagent.
 
+**How subagents that are no longer reused get recycled**:
+
+- **In-process spawn children** (default): no OS process — the host releases the resident activation automatically after each settled turn (the child becomes `ready`); the plugin adds an `idleReleaseMs` (default 10 min) safety-net release; only the durable session file stays on disk (the host has no deletion API).
+- **ACP children** (deveco etc.): the background process is owned by `dsh-plugin-product-subagents` — every turn end starts an `idleTimeoutMs` (default 10 min) countdown; if unused by then, the ACP process is SIGTERMed; reuse cancels the countdown; after process death the remote session can be reconnected via the durable registry / log marker, so continuity survives recycling.
+- **Explicit close**: when a thread is confirmed done, the main agent can call `agent_close` (`childId` for one subagent, `agentId` for all idle subagents of that agent) — reuse eligibility is dropped immediately and resident resources are released; a running subagent is not interrupted (it is recycled naturally when its task settles). ACP processes are still reaped by the idle timer; never kill them manually.
+
 - **Idle recycling**: after a child finishes a turn, if it stays unused for `idleReleaseMs` (default 10 min) its resident resources are released (`drainContinuableChildren`); the durable session is kept, so the next reuse cold-resumes with context intact.
 - **Exploration roles**: set the agent's `reusePolicy` to `fresh` (GUI "子代理复用策略") to spawn an independent child per dispatch — each exploration starts clean.
 - Squad steps (`agent_squad`) always use dedicated children (concurrency-safe, unaffected by the reuse policy).

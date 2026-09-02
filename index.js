@@ -59,7 +59,7 @@ export function apply(ctx, config = {}) {
   // 与 dispatch() 入口 callerDepth 硬检查 + startContinuable toolFilter.deny 三保险。
   const noDelegateTools = new Set([
     'agent_dispatch', 'agent_followup', 'agent_list', 'agent_squad', 'agent_squad_continue',
-    'agent_squad_upsert', 'agent_upsert', 'agent_import_skill',
+    'agent_squad_upsert', 'agent_upsert', 'agent_import_skill', 'agent_close',
     'subagent', 'subagent_fork', 'subagent_progress', 'list_agents', 'interrupt_agent',
     'product_delegate', 'product_wait', 'product_roles', 'product_agents',
     'workflow', 'ralph', 'create_goal', 'get_goal', 'update_goal',
@@ -216,6 +216,67 @@ export function apply(ctx, config = {}) {
       const parent = exec.agent
       if (!parent) throw new Error('agent_followup 需要调用方 agent（exec.agent 为空）')
       return dispatcher.followup(parent, args.childId, args.message)
+    },
+  }))
+
+  // agent_close：显式关闭子代理线程（v1.5.2）——确认某条线程不再继续时调用：
+  // 立即停止复用（移除复用池条目）+ 释放驻留资源；ACP 后台进程由
+  // product-subagents 的 idleTimeoutMs 定时器收尾（无需手动处理）。
+  toolDisposers.push(ctx.tools.register({
+    name: 'agent_close',
+    description:
+      'Close one or more subagent threads so they are never reused again and their resident resources are recycled promptly. Call this when you are sure a thread is done (work accepted, exploration concluded, feature verified) and no further follow-up will target it. Pass childId (a durable child id returned by agent_dispatch) to close one subagent, or agentId to close all idle subagents of that agent in this session. Running subagents are not interrupted — they lose reuse eligibility and are recycled when their current task settles. ACP-backed subagents (deveco etc.) keep their background process until the product-subagents idle timeout (idleTimeoutMs, default 10 min) recycles it; this call releases the in-process relay immediately.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        childId: {
+          type: 'string',
+          description: 'The durable child id to close (must belong to this session, from the reuse pool or active children).',
+        },
+        agentId: {
+          type: 'string',
+          description: 'Close all idle subagents of this agent in the current session (pool entries). Mutually exclusive with childId.',
+        },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          closed: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                childId: { type: 'string' },
+                agentId: { type: 'string' },
+                closing: { type: 'string' },
+              },
+              required: ['childId', 'agentId', 'closing'],
+            },
+          },
+        },
+        required: ['closed'],
+      },
+      render: (_args, value) => [
+        {
+          type: 'text',
+          text: `已关闭 ${value.closed.length} 个子代理线程：\n` +
+            value.closed
+              .map((c) => `  ${c.childId}（${c.agentId}）· ${c.closing === 'running' ? '任务运行中：停止复用，结束即回收' : '已释放驻留资源'}`)
+              .join('\n'),
+        },
+      ],
+    },
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      await ready
+      const parent = exec.agent
+      if (!parent) throw new Error('agent_close 需要调用方 agent（exec.agent 为空）')
+      return dispatcher.closeChild(parent, { childId: args.childId, agentId: args.agentId })
     },
   }))
 
@@ -802,6 +863,7 @@ export function apply(ctx, config = {}) {
       '7. 复杂动态编排（组队模板不匹配、需要按中间结果决定下一步）时，用宿主 workflow 工具编排 agent_dispatch。',
       '8. 用户消息以「$<id> 」前缀开头时（如 "$sql-analyst 查下 orders 慢查询"），这是用户显式指定：把后续文本作为 task 直接 agent_dispatch 给该 id 的 Agent（组队 id 用 agent_squad），不要追问、不要改派。$ 前缀来自输入框 / 菜单选 Agent 的插入（或用户手打），是用户的明确意图。',
       '9. 修改 Agent（含 reusePolicy 复用策略）用 agent_upsert、修改小队（含各步骤 checkpoint 停等开关）用 agent_squad_upsert，均免重启立即生效。',
+      '10. 某 Agent 的任务线程确认不再继续时（如探索结论已收、功能已验收、用户表示不用了），调用 agent_close（childId 或 agentId）关闭该线程：立即停止复用并释放驻留资源，避免资源挂账。ACP 子代理（deveco 等）的后台进程由 product-subagents 的空闲回收（idleTimeoutMs，默认 10 分钟）自动收尾，无需也不应手动杀进程。',
     ].join('\n'),
   })
 
