@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.5.1 (2026-09-02)
+
+**同角色子代理复用升级为智能决策**：不再无差别复用——按"新任务 vs 上一任务的渐进延续"决定复用对应旧子代理还是新开。
+
+### 智能复用（v1.5.1 核心）
+
+- **`agent_dispatch` 新增 `reuse` 参数**（`'auto'` 默认 / `'reuse'` / `'fresh'`）：
+  - `auto`（默认）：延续性启发式决策——新任务含续写标记词（继续/接着/追加/补充/在此基础上/接下来/再/continue/follow-up/as before…）或与某子代理的最近任务共享显著词汇（文件路径/文件名、ASCII 标识符、CJK 双字词）→ 复用匹配度最高的该子代理（`send_message` 续聊，上下文延续）；否则视为**独立新任务 → 新开子代理**（避免旧上下文污染与 token 膨胀）。
+  - `reuse`：强制复用最近同角色 child（模型明确知道是同一线程续聊时用）。
+  - `fresh`：强制新开（模型明确知道是独立新任务时用）。
+  - Agent 级 `reusePolicy` 是 auto 的兜底：`fresh` 策略（探索型）在 auto 下永远新开。
+- **复用池升级为多线程 LRU**：`(父会话, Agent)` 下保留最近 `POOL_CAP=3` 个 child（各带最近 2 条原始任务文本作比对语料）——不同任务线程的续聊各自命中正确的子代理，不互串；超上限按最近使用淘汰。
+- **决策日志新增 `reuseReason`**：`explicit`（调用方强制）/ `continuation`（标记词+重叠）/ `continuation-marker`（仅标记词，按最近使用兜底）/ `continuation-overlap`（仅重叠）/ `fresh-task`（auto 判定独立新任务）/ `policy-fresh`（探索型策略）/ `dedicated`（小队专属）。
+- 启发式细节：比对用**原始任务**而非包装文本（任务/输出要求样板会污染词法判定，首版即踩坑）；续写标记词对单字词（再/然后/还有）与"继续+无具体指向"做了阈值与最近使用兜底，避免误判。
+
+### 其他
+
+- `verify.mjs`：新增 v1.5.1 断言（reuse 参数 schema、continuationScore、CONTINUATION_MARKERS、significantTokens、POOL_CAP、lastTasks、#evictPool、reuseReason）。
+- 端到端验证（临时 DSH_HOME + mock LLM）：orders 线程两次委派复用同一 child（答复2 上下文延续）→ 探索型 fresh 新开 → **独立新任务（部署文档）自动新开** → "继续完善部署文档"**命中部署线程而非 orders 线程** → 小队专属 child 全链路通过；空闲释放日志 2 次。
+
 ## 1.5.0 (2026-09-02)
 
 **DSH 0.1.2-alpha.4（最新版）兼容性修复 + 同角色子代理复用 + 空闲回收。**

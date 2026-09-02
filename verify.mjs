@@ -129,11 +129,23 @@ if (!dispatchSrc.includes('reusePolicy === \'fresh\' ? \'fresh\' : \'reuse\'')) 
 if (!dispatchSrc.includes('drainContinuableChildren(parent, [pooled.childId])')) throw new Error('v1.5.0: 空闲回收应调用 ctx.subagents.drainContinuableChildren 释放驻留（drainChildren 未暴露）')
 if (!dispatchSrc.includes('#scheduleReleaseFor(childId)')) throw new Error('v1.5.0: onChildEnd 应排空闲释放定时器')
 if (!dispatchSrc.includes('purgeParent(parentSessionId)')) throw new Error('v1.5.0: 缺父会话清理 purgeParent')
+// v1.5.1：智能复用——延续性启发式 + 调用方 reuse 参数 + 多线程 LRU 池
+if (!dispatchSrc.includes('const callReuse = reuse === \'reuse\' || reuse === \'fresh\' ? reuse : \'auto\'')) throw new Error('v1.5.1: dispatch 应解析调用方 reuse 参数（auto/reuse/fresh）')
+if (!dispatchSrc.includes('continuationScore(task, c.lastTasks)')) throw new Error('v1.5.1: auto 模式应走延续性启发式 continuationScore（比对原始任务，防样板污染）')
+if (!dispatchSrc.includes('const CONTINUATION_MARKERS = [')) throw new Error('v1.5.1: 缺续写标记词表 CONTINUATION_MARKERS')
+if (!dispatchSrc.includes('function significantTokens(text)')) throw new Error('v1.5.1: 缺显著词汇提取 significantTokens（路径/标识符/CJK 双字词）')
+if (!dispatchSrc.includes('const POOL_CAP = 3')) throw new Error('v1.5.1: 复用池应有多线程 LRU 上限 POOL_CAP=3')
+if (!dispatchSrc.includes('lastTasks')) throw new Error('v1.5.1: 池条目应记录最近任务文本 lastTasks（延续性比对语料）')
+if (!dispatchSrc.includes('#evictPool(reuseKey, entry.key)')) throw new Error('v1.5.1: 新开 child 入池应触发 LRU 淘汰 #evictPool')
+if (!dispatchSrc.includes('reuseReason')) throw new Error('v1.5.1: 决策日志应记录 reuseReason（explicit/continuation-marker/continuation-overlap/fresh-task）')
 // v1.5.0：host 全局递归护栏（registerContinuableSetup 已删除）
 if (!host.includes('ctx.tools.guard((exec) =>')) throw new Error('v1.5.0: host 应注册全局 tools.guard 递归护栏（registerContinuableSetup 已删除）')
 if (!host.includes("subagentDepth ?? 0")) throw new Error('v1.5.0: tools.guard 应按 exec.agent.options.subagentDepth 判断')
 if (host.includes('registerContinuableSetup(')) throw new Error('v1.5.0: registerContinuableSetup 调用应已删除（宿主已移除该 API）')
 if (!host.includes("ctx.on('session/disposed'")) throw new Error('v1.5.0: host 应订阅 session/disposed 清理复用池')
+// v1.5.1：agent_dispatch 工具应暴露 reuse 参数并透传给 dispatcher
+if (!host.includes("enum: ['auto', 'reuse', 'fresh']")) throw new Error('v1.5.1: agent_dispatch 参数 schema 应含 reuse 枚举 auto/reuse/fresh')
+if (!host.includes("{ reuse: args.reuse }")) throw new Error('v1.5.1: agent_dispatch 应透传 reuse 参数给 dispatch')
 // v1.4.0：ACP/subagent provider 路由——getProvider 命中即走 relay 模式（allow 白名单）
 if (!dispatchSrc.includes('const subProvider = route ? this.ctx.subagents?.getProvider?.(route.provider) : undefined')) throw new Error('v1.4.0: dispatch 应检测 subagent provider（getProvider 命中）')
 if (!dispatchSrc.includes("provider: acpMode ? route.provider : 'spawn'")) throw new Error('v1.4.0: ACP 模式 spec.provider 应直接传 route.provider')

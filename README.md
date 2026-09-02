@@ -60,12 +60,18 @@
 
 用户消息以 `$<id> ` 开头（如 `$log-tracer 查下 orders 慢查询`），主 agent 把后续文本作为 task 直接 `agent_dispatch` 给该 id 的 Agent（小队 id 用 `agent_squad`），不追问不改派。
 
-### 4. 追问与续聊（同角色子代理复用）
+### 4. 追问与续聊（同角色子代理智能复用）
 
-同一 Agent 的后续任务默认**复用同一个子代理**（v1.5.0）：`agent_dispatch` 会自动找到该 Agent 的空闲子代理，用 `send_message` 把新任务作为后续消息发过去——子代理保留完整对话上下文，渐进式任务（编程、审查、多轮排查）不重复冷启动。也可以手动 `agent_followup(childId, message)` 追问。
+同一 Agent 的后续任务由 `agent_dispatch` **智能决定**复用还是新开（v1.5.1，默认 `reuse:"auto"`）：
+
+- **渐进延续**（续写标记词：继续/接着/追加/补充/在此基础上/continue/follow-up…，或涉及相同文件/术语）→ 复用对应子代理（`send_message` 续聊，上下文延续，不重复冷启动）；
+- **独立新任务**（新领域、新文件、无延续关系）→ **自动新开子代理**，避免旧上下文污染与 token 膨胀；
+- 你明确知道是续聊时传 `reuse:"reuse"` 强制复用最近同角色 child，明确是新任务时传 `reuse:"fresh"` 强制新开；也可以手动 `agent_followup(childId, message)` 指定子代理追问。
+
+复用池为多线程 LRU（每 Agent 保留最近 3 个 child），不同任务线程的续聊各自命中正确的子代理，不互串。
 
 - **空闲回收**：子代理完成一轮后，空闲超过 `idleReleaseMs`（默认 10 分钟）会自动释放其驻留资源（`drainContinuableChildren`，内存/注册表槽位回收）；持久会话保留，下次复用自动冷恢复，上下文不丢。
-- **探索型角色**：把 Agent 的 `reusePolicy` 设为 `fresh`（GUI 表单「子代理复用策略」），则每次委派都独立新开子代理——适合探索/调研类任务，避免旧探索上下文污染新任务。
+- **探索型角色**：把 Agent 的 `reusePolicy` 设为 `fresh`（GUI 表单「子代理复用策略」），则 auto 模式下每次委派都独立新开子代理——适合探索/调研类任务，避免旧探索上下文污染新任务。
 - 小队步骤（`agent_squad`）始终使用专属子代理（并发安全，不受复用策略影响）。
 
 ### 5. 多角度 / 流水线（小队）
@@ -192,7 +198,7 @@ $DSH_HOME/data/dsh-agent-dispatch/
 
 - `routes`：模型优先级表，首个失败自动换下一个；留空继承主会话当前模型。
 - `effort`：`minimal/low/medium/high/xhigh/max`（xhigh/max 底层钳到 high）。
-- `reusePolicy`（v1.5.0）：`reuse`（默认）= 同会话内复用同一子代理（`send_message` 续聊，上下文延续）；`fresh` = 每次委派独立新开子代理（适合探索型角色）。省略/缺省按 `reuse`。
+- `reusePolicy`（v1.5.0；v1.5.1 起 `reuse` 为智能复用）：`reuse`（默认）= auto 智能判断——延续上一任务（续写词/相同文件术语）时复用同一子代理，独立新任务自动新开（`agent_dispatch` 可用 `reuse:"reuse"/"fresh"` 显式覆盖）；`fresh` = 每次委派独立新开子代理（适合探索型角色）。省略/缺省按 `reuse`。
 - 改动保存即生效，**免重启**（下一轮对话即生效）。
 
 ### 小队（`squads.json`）

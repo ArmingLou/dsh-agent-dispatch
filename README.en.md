@@ -60,9 +60,15 @@ The plugin starts empty. Define your agents:
 
 When a message starts with `$<id> ` (e.g. `$log-tracer check the slow orders query`), the lead agent dispatches the rest as the task via `agent_dispatch` (or `agent_squad` for a squad id), no questions, no rerouting.
 
-### 4. Follow-up and continuation (same-role subagent reuse)
+### 4. Follow-up and continuation (smart same-role subagent reuse)
 
-Since v1.5.0, dispatching to the same agent again **reuses the same subagent by default**: `agent_dispatch` finds the agent's idle child and sends the new task to it via `send_message` — the child keeps its full conversation context, so progressive work (coding, review, multi-round debugging) does not cold-start repeatedly. You can also call `agent_followup(childId, message)` manually.
+Since v1.5.1, `agent_dispatch` decides reuse vs spawn **per task** (default `reuse:"auto"`):
+
+- **Progressive continuation** (continuation wording like 继续/接着/追加/continue/follow-up, or shared files/terms) → reuses the matching subagent via `send_message` with full context;
+- **Independent new task** (new domain, new files, no continuation signal) → **spawns a fresh subagent**, avoiding context pollution and token growth;
+- Explicit control: `reuse:"reuse"` forces reuse of the most recent same-role child, `reuse:"fresh"` forces a new one; `agent_followup(childId, message)` still targets a specific child.
+
+The pool is a per-(session, agent) LRU of the 3 most recent children, so continuations of different task threads each hit their own subagent.
 
 - **Idle recycling**: after a child finishes a turn, if it stays unused for `idleReleaseMs` (default 10 min) its resident resources are released (`drainContinuableChildren`); the durable session is kept, so the next reuse cold-resumes with context intact.
 - **Exploration roles**: set the agent's `reusePolicy` to `fresh` (GUI "子代理复用策略") to spawn an independent child per dispatch — each exploration starts clean.
@@ -188,7 +194,7 @@ $DSH_HOME/data/dsh-agent-dispatch/
 
 - `routes`: model priority table; the first failure auto-fails over to the next; empty inherits the session's current model.
 - `effort`: `minimal/low/medium/high/xhigh/max` (xhigh/max clamped to high).
-- `reusePolicy` (v1.5.0): `reuse` (default) = one continuable child per (parent session, agent), follow-up tasks are sent via `send_message` with full context; `fresh` = spawn a new child on every dispatch (for exploration-style roles). Omitted values default to `reuse`.
+- `reusePolicy` (v1.5.0; v1.5.1: `reuse` = smart): `reuse` (default) = auto — reuse the same subagent when the task continues previous work (continuation wording / shared files & terms), spawn a fresh one for independent tasks (override per call with `agent_dispatch` `reuse:"reuse"/"fresh"`); `fresh` = spawn a new child on every dispatch (for exploration-style roles). Omitted values default to `reuse`.
 - Changes take effect immediately — **no restart** (effective next turn).
 
 ### Squads (`squads.json`)
