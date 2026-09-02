@@ -13,3 +13,4 @@ data/
 .agents/
 .squads/
 *.bak-before-*
+*.tgz
