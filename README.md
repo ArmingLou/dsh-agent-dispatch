@@ -66,6 +66,7 @@
 
 - **渐进延续**（续写标记词：继续/接着/追加/补充/在此基础上/continue/follow-up…，或涉及相同文件/术语）→ 复用对应子代理（`send_message` 续聊，上下文延续，不重复冷启动）；
 - **独立新任务**（新领域、新文件、无延续关系）→ **自动新开子代理**，避免旧上下文污染与 token 膨胀；
+- **指定线程续聊**（v1.5.3）：要复用的不是最近一个子代理、而是隔开的旧线程时——先 `agent_children` 查到该线程的 `childId`（附最近任务标签与 running/idle/ready 状态），再 `agent_dispatch(agentId, task, childId=...)` 定向续聊。**续聊只认 session id**：子代理进程/驻留是新是旧、是否已被空闲回收，都不影响续聊（持久会话冷恢复自动）。跨会话不可续（宿主强制相邻关系）。
 - 你明确知道是续聊时传 `reuse:"reuse"` 强制复用最近同角色 child，明确是新任务时传 `reuse:"fresh"` 强制新开；也可以手动 `agent_followup(childId, message)` 指定子代理追问。
 
 复用池为多线程 LRU（每 Agent 保留最近 3 个 child），不同任务线程的续聊各自命中正确的子代理，不互串。

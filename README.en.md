@@ -66,6 +66,7 @@ Since v1.5.1, `agent_dispatch` decides reuse vs spawn **per task** (default `reu
 
 - **Progressive continuation** (continuation wording like 继续/接着/追加/continue/follow-up, or shared files/terms) → reuses the matching subagent via `send_message` with full context;
 - **Independent new task** (new domain, new files, no continuation signal) → **spawns a fresh subagent**, avoiding context pollution and token growth;
+- **Targeted continuation** (v1.5.3): when the subagent to reuse is NOT the most recent one (a separated older thread) — call `agent_children` to find its `childId` (with recent task labels and running/idle/ready status), then `agent_dispatch(agentId, task, childId=...)`. **Continuation is keyed by the durable session id only**: whether the subagent's process/activation is live, idle, or already recycled does not matter (cold resume from the persisted session is automatic). Cross-session continuation is not possible (the host enforces parent adjacency).
 - Explicit control: `reuse:"reuse"` forces reuse of the most recent same-role child, `reuse:"fresh"` forces a new one; `agent_followup(childId, message)` still targets a specific child.
 
 The pool is a per-(session, agent) LRU of the 3 most recent children, so continuations of different task threads each hit their own subagent.

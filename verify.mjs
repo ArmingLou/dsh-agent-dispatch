@@ -62,7 +62,7 @@ const ctx = {
 }
 mod.apply(ctx)
 await new Promise(r => setTimeout(r, 300))
-for (const t of ['agent_dispatch', 'agent_followup', 'agent_close', 'agent_list', 'agent_squad', 'agent_squad_continue', 'agent_squad_upsert', 'agent_import_skill', 'agent_upsert']) {
+for (const t of ['agent_dispatch', 'agent_followup', 'agent_close', 'agent_children', 'agent_list', 'agent_squad', 'agent_squad_continue', 'agent_squad_upsert', 'agent_import_skill', 'agent_upsert']) {
       // 小队注册表：内置 3 队可加载
   if (!tools.includes(t)) errors.push(`apply 未注册工具 ${t}`)
 }
@@ -145,13 +145,21 @@ if (host.includes('registerContinuableSetup(')) throw new Error('v1.5.0: registe
 if (!host.includes("ctx.on('session/disposed'")) throw new Error('v1.5.0: host 应订阅 session/disposed 清理复用池')
 // v1.5.1：agent_dispatch 工具应暴露 reuse 参数并透传给 dispatcher
 if (!host.includes("enum: ['auto', 'reuse', 'fresh']")) throw new Error('v1.5.1: agent_dispatch 参数 schema 应含 reuse 枚举 auto/reuse/fresh')
-if (!host.includes("{ reuse: args.reuse }")) throw new Error('v1.5.1: agent_dispatch 应透传 reuse 参数给 dispatch')
+if (!host.includes('{ reuse: args.reuse, childId: args.childId }')) throw new Error('v1.5.1/v1.5.3: agent_dispatch 应透传 reuse 与 childId 给 dispatch')
 // v1.5.2：agent_close 显式关闭线程工具 + 淘汰即回收
 if (!host.includes("name: 'agent_close'")) throw new Error('v1.5.2: host 应注册 agent_close 工具')
 if (!host.includes("dispatcher.closeChild(parent, { childId: args.childId, agentId: args.agentId })")) throw new Error('v1.5.2: agent_close 应透传 childId/agentId 给 closeChild')
 if (!dispatchSrc.includes('async closeChild(parentAgent, { childId, agentId }')) throw new Error('v1.5.2: dispatcher 缺 closeChild 显式关闭方法')
 if (!dispatchSrc.includes('async #drainChild(parentSessionId, childId)')) throw new Error('v1.5.2: 缺 #drainChild 统一释放方法（idle 释放/淘汰/显式关闭共用）')
 if (!dispatchSrc.includes("if (!this.activeChildren.has(e.childId)) {\n        // v1.5.2：确定不再复用 → 立即释放驻留（fire-and-forget，失败不阻断淘汰）")) throw new Error('v1.5.2: #evictPool 淘汰时应主动 drain 被淘汰 child')
+// v1.5.3：定向续聊（agent_dispatch childId）+ 线程列表（agent_children）
+if (!dispatchSrc.includes('childId = null')) throw new Error('v1.5.3: dispatch 应接收 childId 参数')
+if (!dispatchSrc.includes("if (!dedicatedChild && childId) {")) throw new Error('v1.5.3: dispatch 应有 childId 定向续聊分支（最高优先级）')
+if (!dispatchSrc.includes("reuseReason: 'explicit-child'")) throw new Error('v1.5.3: 定向续聊决策日志应记 explicit-child')
+if (!dispatchSrc.includes('async listChildren(parentAgent, { agentId }')) throw new Error('v1.5.3: dispatcher 缺 listChildren 线程列表方法（agent_children 数据源）')
+if (!host.includes("name: 'agent_children'")) throw new Error('v1.5.3: host 应注册 agent_children 工具')
+if (!host.includes('{ reuse: args.reuse, childId: args.childId }')) throw new Error('v1.5.3: agent_dispatch 应透传 childId 给 dispatch')
+if (!host.includes("'agent_dispatch', 'agent_followup', 'agent_list', 'agent_squad', 'agent_squad_continue',\n    'agent_squad_upsert', 'agent_upsert', 'agent_import_skill', 'agent_close', 'agent_children',")) throw new Error('v1.5.3: noDelegateTools 应含 agent_children（子代理不可管理线程树）')
 // v1.4.0：ACP/subagent provider 路由——getProvider 命中即走 relay 模式（allow 白名单）
 if (!dispatchSrc.includes('const subProvider = route ? this.ctx.subagents?.getProvider?.(route.provider) : undefined')) throw new Error('v1.4.0: dispatch 应检测 subagent provider（getProvider 命中）')
 if (!dispatchSrc.includes("provider: acpMode ? route.provider : 'spawn'")) throw new Error('v1.4.0: ACP 模式 spec.provider 应直接传 route.provider')

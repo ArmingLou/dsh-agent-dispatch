@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.5.3 (2026-09-02)
+
+**按 session id 定向续聊 + 线程列表**——续聊只认 session id，进程/驻留是否新启动无关（冷恢复自动），支持续聊"隔开的"旧线程（不是最近一个）。
+
+### 新增
+
+- **`agent_dispatch` 新增 `childId` 参数**（最高优先级，覆盖 `reuse`）：显式指定子代理 session id 定向续聊——`sendMessage` 直投该 session（宿主校验本会话相邻关系），驻留/ready/进程已回收都能续（按持久会话冷恢复）。典型场景：要复用的不是最近一个子代理，而是隔开的旧线程（A → B → 续 A）。失败**抛错不静默降级**（跨会话不可续会明确报错，提示用 `agent_children` 查线程或去掉 childId 走 auto）。续聊后自动补记/更新复用池条目，后续 auto 也能命中。
+- **`agent_children` 工具**：列出当前会话的子代理线程——`childId`（可作 `agent_dispatch` 的 childId）、`agentId`、最近任务标签（线程识别用）、状态（`running` 执行中 / `idle` 驻留空闲 / `ready` 仅持久会话可冷恢复）。可选 `agentId` 过滤；状态经宿主 `listChildren` 细化，不可用时按活跃映射派生。
+- 决策日志：定向续聊记 `reuseReason: 'explicit-child'`。
+- 递归护栏：`agent_children` 纳入 DENY_CANDIDATES / OWN_TOOL_NAMES / noDelegateTools（子代理不可管理线程树）。
+
+### 验证（端到端，临时 DSH_HOME + mock LLM）
+
+- 场景：orders 线程 A → 部署文档线程 B（B 成为最近）→ `agent_dispatch(childId=A, "再查支付状态")` → **命中 A（explicit-child）而非最近线程 B**，A 答复"第 2 轮"（上下文延续）→ `agent_children` 正常 → 小队专属 child 全链路通过。
+
 ## 1.5.2 (2026-09-02)
 
 **不复用子代理的回收机制补强**：智能复用决策判"新开"之后，旧子代理的回收路径显式化 + 提供显式关闭工具。

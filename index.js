@@ -59,7 +59,7 @@ export function apply(ctx, config = {}) {
   // 与 dispatch() 入口 callerDepth 硬检查 + startContinuable toolFilter.deny 三保险。
   const noDelegateTools = new Set([
     'agent_dispatch', 'agent_followup', 'agent_list', 'agent_squad', 'agent_squad_continue',
-    'agent_squad_upsert', 'agent_upsert', 'agent_import_skill', 'agent_close',
+    'agent_squad_upsert', 'agent_upsert', 'agent_import_skill', 'agent_close', 'agent_children',
     'subagent', 'subagent_fork', 'subagent_progress', 'list_agents', 'interrupt_agent',
     'product_delegate', 'product_wait', 'product_roles', 'product_agents',
     'workflow', 'ralph', 'create_goal', 'get_goal', 'update_goal',
@@ -159,7 +159,12 @@ export function apply(ctx, config = {}) {
           type: 'string',
           enum: ['auto', 'reuse', 'fresh'],
           description:
-            "Subagent reuse mode (v1.5.1). 'auto' (default): reuse the same-role idle subagent when this task continues the previous one (continuation wording or shared files/terms), spawn a new one for independent tasks. 'reuse': force reuse of the most recent same-role child — use when you know this continues the same thread even if the wording does not show it. 'fresh': force a brand-new child — use for a clearly independent new task. The agent's reusePolicy ('reuse'/'fresh') is the fallback for 'auto'.",
+            "Subagent reuse mode (v1.5.1). 'auto' (default): reuse the same-role idle subagent when this task continues the previous one (continuation wording or shared files/terms), spawn a new one for independent tasks. 'reuse': force reuse of the most recent same-role child — use when you know this continues the same thread even if the wording does not show it. 'fresh': force a brand-new child — use for a clearly independent new task. The agent's reusePolicy ('reuse'/'fresh') is the fallback for 'auto'. Ignored when childId is given.",
+        },
+        childId: {
+          type: 'string',
+          description:
+            "Targeted continuation (v1.5.3): a durable subagent session id to continue explicitly — highest priority, overrides reuse. Use when the subagent to reuse is NOT the most recent one (a separated older thread). send_message continues it directly; cold resume is automatic, so it works whether the subagent's process/activation is live, idle, or already recycled (session-based continuity, not process-based). The subagent must be a direct child of this session (host enforces adjacency). Ids come from previous agent_dispatch results, agent_children, or the host list_agents tool. Fails loudly instead of silently falling back.",
         },
         run_in_background: {
           type: 'boolean',
@@ -183,7 +188,65 @@ export function apply(ctx, config = {}) {
       await ready
       const parent = exec.agent
       if (!parent) throw new Error('agent_dispatch 需要调用方 agent（exec.agent 为空）')
-      return dispatcher.dispatch(parent, args.agentId, args.task, { reuse: args.reuse })
+      return dispatcher.dispatch(parent, args.agentId, args.task, { reuse: args.reuse, childId: args.childId })
+    },
+  }))
+
+  // agent_children：列出本会话的子代理线程（v1.5.3）——childId + 最近任务 + 状态，
+  // 供主模型挑选"隔开的旧线程"做定向续聊（agent_dispatch(childId=...)）。
+  toolDisposers.push(ctx.tools.register({
+    name: 'agent_children',
+    description:
+      'List the subagent threads of the current session: each entry has childId (usable as agent_dispatch childId for targeted continuation), agentId, the recent task labels, and status (running = working now, idle = resident and free, ready = session persisted, cold-resume on reuse). Call this when you need to continue a specific older thread whose subagent is not the most recent one, or when you lost track of the child ids.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        agentId: {
+          type: 'string',
+          description: 'Optional filter: only show threads of this agent.',
+        },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          children: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                childId: { type: 'string' },
+                agentId: { type: 'string' },
+                taskLabels: { type: 'array', items: { type: 'string' } },
+                status: { type: 'string' },
+              },
+              required: ['childId', 'agentId', 'taskLabels', 'status'],
+            },
+          },
+        },
+        required: ['children'],
+      },
+      render: (_args, value) => [
+        {
+          type: 'text',
+          text: value.children.length
+            ? value.children
+                .map((c) => `  ${c.childId} · ${c.agentId} [${c.status}] · ${(c.taskLabels || []).join(' → ')}`)
+                .join('\n')
+            : '当前会话没有可续聊的子代理线程',
+        },
+      ],
+    },
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      await ready
+      const parent = exec.agent
+      if (!parent) throw new Error('agent_children 需要调用方 agent（exec.agent 为空）')
+      return dispatcher.listChildren(parent, { agentId: args.agentId })
     },
   }))
 
@@ -856,7 +919,7 @@ export function apply(ctx, config = {}) {
       '［适用范围］本策略仅对具备委派工具的编排层（主代理 / 父级）生效。若你作为子代理收到本段，请直接忽略其中的委派建议：必须由你自己独立完成被指派的任务，禁止再向下委派或另起任何子代理（含 agent_dispatch / agent_squad / subagent / subagent_fork / workflow / product_delegate 等）；超出能力时明确说明卡在哪、需要什么，并向上（父级）汇报，绝不自行委派或硬闯。',
       '1. 任务命中某 Agent 领域（需求分析/代码审查/线上排查/SQL 分析等，以 agent_list 返回的 triggers 为准）时，优先用 agent_dispatch 委派，而不是自己在主对话里做。',
       '2. 委派任务必须是自包含的：Agent 看不到本会话，把所需上下文（路径/代码/日志/约束）全部写进 task。',
-      '3. 对同一 Agent 的后续任务，agent_dispatch 会智能决定复用还是新开（v1.5.1）：新任务延续上一任务（含"继续/接着/追加/在此基础上"等续写词，或涉及相同文件/术语）→ 自动复用对应子代理（send_message 续聊，上下文延续）；独立新任务 → 自动新开子代理，避免旧上下文污染。你明确知道是续聊时可用 reuse:"reuse" 强制复用、是独立新任务时用 reuse:"fresh" 强制新开（默认 auto 智能判断）。reusePolicy=fresh 的探索型 Agent 在 auto 下永远新开。复用池中的子代理空闲 10 分钟后自动回收驻留资源（持久会话保留，下次复用冷恢复，上下文不丢）。',
+      '3. 对同一 Agent 的后续任务，agent_dispatch 会智能决定复用还是新开（v1.5.1）：新任务延续上一任务（含"继续/接着/追加/在此基础上"等续写词，或涉及相同文件/术语）→ 自动复用对应子代理（send_message 续聊，上下文延续）；独立新任务 → 自动新开子代理，避免旧上下文污染。你明确知道是续聊时可用 reuse:"reuse" 强制复用、是独立新任务时用 reuse:"fresh" 强制新开（默认 auto 智能判断）；**要复用的不是最近一个子代理而是隔开的旧线程时，先用 agent_children 查到该线程的 childId，再 agent_dispatch(childId=...) 定向续聊**（续聊按持久会话进行，子代理进程是否新启动无关；跨会话不可续，宿主强制相邻关系）。reusePolicy=fresh 的探索型 Agent 在 auto 下永远新开。复用池中的子代理空闲 10 分钟后自动回收驻留资源（持久会话保留，下次复用冷恢复，上下文不丢）。',
       '4. 简单问题（一句话能答、无需工具链）不必委派，直接回答——委派本身有开销。',
       '5. 不确定哪个 Agent 合适时先 agent_list。',
       '6. 多角度或流水线目标（既要分析又要审查、多路排查同一问题）用 agent_squad：dev-pipeline=需求→审查串行；debug-squad=日志/数据/代码三路并行；review-squad=业务/数据双路。单领域任务不要用组队。带 checkpoint 的小队（如 kiligz-workflow）会在 checkpoint 步骤后返回 paused:true，必须停下等用户确认，用户反馈经 agent_squad_continue（squadRunId + note）续跑，禁止未确认就自动续跑。停等时：①若阶段有产出文档（prd.md/飞书技术方案链接等），把完整路径/链接展示给用户；②若阶段有「待确认问题清单」，逐条列出请用户作答，用户回答前不得续跑。',
