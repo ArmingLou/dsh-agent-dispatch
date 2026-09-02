@@ -60,9 +60,13 @@ The plugin starts empty. Define your agents:
 
 When a message starts with `$<id> ` (e.g. `$log-tracer check the slow orders query`), the lead agent dispatches the rest as the task via `agent_dispatch` (or `agent_squad` for a squad id), no questions, no rerouting.
 
-### 4. Follow-up and continuation
+### 4. Follow-up and continuation (same-role subagent reuse)
 
-Dispatching to the same agent again reuses its old child via `agent_followup` (context continues) instead of creating a new one. You can also call `agent_followup(childId, message)` manually.
+Since v1.5.0, dispatching to the same agent again **reuses the same subagent by default**: `agent_dispatch` finds the agent's idle child and sends the new task to it via `send_message` — the child keeps its full conversation context, so progressive work (coding, review, multi-round debugging) does not cold-start repeatedly. You can also call `agent_followup(childId, message)` manually.
+
+- **Idle recycling**: after a child finishes a turn, if it stays unused for `idleReleaseMs` (default 10 min) its resident resources are released (`drainContinuableChildren`); the durable session is kept, so the next reuse cold-resumes with context intact.
+- **Exploration roles**: set the agent's `reusePolicy` to `fresh` (GUI "子代理复用策略") to spawn an independent child per dispatch — each exploration starts clean.
+- Squad steps (`agent_squad`) always use dedicated children (concurrency-safe, unaffected by the reuse policy).
 
 ### 5. Multi-angle / pipeline (squads)
 
@@ -184,6 +188,7 @@ $DSH_HOME/data/dsh-agent-dispatch/
 
 - `routes`: model priority table; the first failure auto-fails over to the next; empty inherits the session's current model.
 - `effort`: `minimal/low/medium/high/xhigh/max` (xhigh/max clamped to high).
+- `reusePolicy` (v1.5.0): `reuse` (default) = one continuable child per (parent session, agent), follow-up tasks are sent via `send_message` with full context; `fresh` = spawn a new child on every dispatch (for exploration-style roles). Omitted values default to `reuse`.
 - Changes take effect immediately — **no restart** (effective next turn).
 
 ### Squads (`squads.json`)

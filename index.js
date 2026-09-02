@@ -4,15 +4,18 @@
 //
 // 职责：
 //   - Agent 注册表（$DSH_HOME/data/dsh-agent-dispatch/agents.json，改完即生效）
-//   - 五个模型工具：agent_dispatch / agent_followup / agent_list /
-//     agent_squad / agent_import_skill
+//   - 八个模型工具：agent_dispatch / agent_followup / agent_list /
+//     agent_squad / agent_squad_continue / agent_squad_upsert /
+//     agent_import_skill / agent_upsert
 //   - systemPrompt 路由表 section（引导主 agent 按任务领域自动委派）
 //   - /agent-api REST 面（v1.0：主面板 + 总览页 + 悬浮球全数据通道）
 //
 // 委派走 ctx.subagents.startContinuable（宿主原生可续聊子代理），
-// persona 注入Agent系统提示词，agentOptions 按Agent routes 做模型路由
-// 与失败互备。零 @deepseek-ai/dsh-tools 依赖（规避官方双实例 bug
-// #1697/#783），工具注册用 ctx.tools.register 裸对象最小形状。
+// v1.5.0 起：同角色子代理复用池（sendMessage 续聊/冷恢复）+ 空闲回收
+// （drainContinuableChildren 释放驻留），persona 注入Agent系统提示词，
+// agentOptions 按Agent routes 做模型路由与失败互备。
+// 零 @deepseek-ai/dsh-tools 依赖（规避官方双实例 bug #1697/#783），
+// 工具注册用 ctx.tools.register 裸对象最小形状。
 //
 // 以 profile bundle 行挂载（cordis.patch.yml + dsh.bundle.patch）。
 // 浏览器半（lib/client.js）注册主面板到宿主 conversation.view 槽，
@@ -30,42 +33,49 @@ import { listSkills, skillToAgent, defaultSkillsRoot } from './lib/skill-import.
 
 export const name = '@kiligzzz/dsh-agent-dispatch'
 
-export const inject = ['tools', 'subagents', 'systemPrompt']
+export const inject = ['tools', 'subagents', 'systemPrompt', 'agents']
 
-export function apply(ctx) {
+export function apply(ctx, config = {}) {
   const dshHome = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
   const dataDir = path.join(dshHome, 'data', 'dsh-agent-dispatch')
 
   // ── 注册表与派遣器 ──
   const registry = new AgentRegistry(dataDir)
-  const dispatcher = new Dispatcher({ ctx, registry, dataDir })
+  // v1.5.0：空闲回收时长——config.idleReleaseMs > 环境变量 DSH_AGENT_DISPATCH_IDLE_RELEASE_MS > 默认 10 分钟；
+  // 0 关闭自动释放（子代理驻留到父会话结束）。
+  const cfgIdle = Number(config.idleReleaseMs) > 0 ? Number(config.idleReleaseMs) : 0
+  const envIdle = Number(process.env.DSH_AGENT_DISPATCH_IDLE_RELEASE_MS) > 0 ? Number(process.env.DSH_AGENT_DISPATCH_IDLE_RELEASE_MS) : 0
+  const idleReleaseMs = cfgIdle || envIdle || undefined
+  const dispatcher = new Dispatcher({ ctx, registry, dataDir, ...(idleReleaseMs ? { idleReleaseMs } : {}) })
 
-  // v1.4.1 执行级递归护栏：harness 把 report/subagent 等工具注册进【子代理自身 scope】，
-  // 而 toolFilter 的 allow/deny 只过滤"继承面"，刻意豁免子代理 own-layer 的工具
-  // （view() 里 "must not strip the machinery it answers through"）。因此仅靠 deny 名单
-  // 去不掉 subagent/subagent_fork/report。这里用 tools.guard 在【执行时】拒绝子代理调用任何
-  // "再起新代理 / 管理委派树"的工具；保留 product_submit（ACP 中继转发任务）与 report（子代理回传结果）。
-  // 注：registerContinuableSetup 对宿主所有可续聊子代理生效，实现"子代理一律不得再委派"。
+  // v1.4.1 执行级递归护栏（v1.5.0 重构）：宿主已删除 registerContinuableSetup，
+  // 改为【全局 tools.guard】——按调用方 subagentDepth>=1 在【执行时】拒绝子代理调用
+  // 任何"再起新代理 / 管理委派树"的工具。全局守卫天然覆盖所有插件层工具
+  //（含未在本插件 deny 名单里的跨插件工具如 product_delegate）：
+  //   - 主代理（depth 0）：放行；
+  //   - 子代理（depth>=1）：委派工具执行期拒绝。
+  // 豁免项：send_message（子代理→父级回传结果，替代旧 report；宿主服务强制相邻
+  // 关系，子代理只能发给直接父级）、product_submit（ACP 中继转发任务）。
+  // 与 dispatch() 入口 callerDepth 硬检查 + startContinuable toolFilter.deny 三保险。
   const noDelegateTools = new Set([
     'agent_dispatch', 'agent_followup', 'agent_list', 'agent_squad', 'agent_squad_continue',
     'agent_squad_upsert', 'agent_upsert', 'agent_import_skill',
-    'subagent', 'subagent_fork', 'subagent_progress', 'list_agents', 'interrupt_agent', 'send_message',
-    'product_delegate', 'product_wait', 'product_roles',
+    'subagent', 'subagent_fork', 'subagent_progress', 'list_agents', 'interrupt_agent',
+    'product_delegate', 'product_wait', 'product_roles', 'product_agents',
     'workflow', 'ralph', 'create_goal', 'get_goal', 'update_goal',
   ])
-  ctx.subagents.registerContinuableSetup((childCtx) => {
-    try {
-      return childCtx.tools.guard((exec) => {
-        if (noDelegateTools.has(exec.name)) {
-          return `[dsh-agent-dispatch] 子代理禁止再向下委派/另起代理：${exec.name} 已禁用，必须自己完成任务；超出能力时明确说明卡在哪，并向上（父级）汇报。`
-        }
-        return undefined
-      })
-    } catch (err) {
-      // 个别 scope 无 tools 服务等异常不阻断子代理启动
+  try {
+    ctx.tools.guard((exec) => {
+      const depth = exec?.agent?.options?.subagentDepth ?? 0
+      if (depth >= 1 && noDelegateTools.has(exec.name)) {
+        return `[dsh-agent-dispatch] 子代理（深度 ${depth}）禁止再向下委派/另起代理：${exec.name} 已禁用，必须自己完成任务；超出能力时明确说明卡在哪，并向上（父级）汇报。`
+      }
       return undefined
-    }
-  })
+    })
+  } catch (err) {
+    // 个别环境无 tools.guard 等异常不阻断插件挂载（dispatch 入口硬检查兜底）
+    console.error('[dsh-agent-dispatch] tools.guard 注册失败:', err.message)
+  }
 
   // v0.7.1：订阅宿主 'subagent/end' 生命周期事件 → 子 agent 终结即移出活跃映射 + 补记真实结果。
   // 修复根因：此前 activeChildren 只增不减，活动面板永远"运行中"、FAB 完成检测永不触发。
@@ -81,6 +91,18 @@ export function apply(ctx) {
   } catch (err) {
     // 事件名不可用时降级：生命周期修复失效但不影响其余功能（startedAt 修正仍生效）
     console.error('[dsh-agent-dispatch] subagent/end 订阅失败:', err.message)
+  }
+
+  // v1.5.0：父会话结束 → 清理该会话的复用池条目（host 已递归回收其 lineage，
+  // 这里只清插件侧状态，防内存驻留 + 防孤儿池条目被误复用）。
+  let disposeSessionListener = () => {}
+  try {
+    disposeSessionListener = ctx.on('session/disposed', (session) => {
+      const sid = session?.id ?? (typeof session === 'string' ? session : null)
+      if (sid) dispatcher.purgeParent(sid)
+    })
+  } catch (err) {
+    console.error('[dsh-agent-dispatch] session/disposed 订阅失败:', err.message)
   }
   const ready = registry.init().catch((error) => {
     console.error('[dsh-agent-dispatch] Agent 注册表初始化失败:', error)
@@ -195,7 +217,7 @@ export function apply(ctx) {
   toolDisposers.push(ctx.tools.register({
     name: 'agent_list',
     description:
-      'List the configured agent agents with their ids, names, trigger domains, and model routes. Call this before agent_dispatch when unsure which agent fits, or when the user asks what agents exist.',
+      'List the configured agent agents with their ids, names, trigger domains, model routes, and reuse policy. Call this before agent_dispatch when unsure which agent fits, or when the user asks what agents exist.',
     parameters: { type: 'object', properties: {}, required: [] },
     output: {
       schema: {
@@ -213,6 +235,7 @@ export function apply(ctx) {
                 emoji: { type: 'string' },
                 triggers: { type: 'string' },
                 enabled: { type: 'boolean' },
+                reusePolicy: { type: 'string' },
                 routes: { type: 'array', items: { type: 'string' } },
               },
               required: ['id', 'name', 'emoji', 'triggers', 'enabled'],
@@ -225,7 +248,7 @@ export function apply(ctx) {
         {
           type: 'text',
           text: value.agents
-            .map((e) => `${e.emoji ?? ''}${e.name}（${e.id}）· 适用: ${e.triggers}${e.enabled ? '' : ' · 已停用'}${e.routes?.length ? ' · 模型: ' + e.routes.join(' → ') : ''}`)
+            .map((e) => `${e.emoji ?? ''}${e.name}（${e.id}）· 适用: ${e.triggers}${e.enabled ? '' : ' · 已停用'}${e.reusePolicy === 'fresh' ? ' · 每次新开' : ' · 复用同角色'}${e.routes?.length ? ' · 模型: ' + e.routes.join(' → ') : ''}`)
             .join('\n'),
         },
       ],
@@ -240,6 +263,7 @@ export function apply(ctx) {
           emoji: e.emoji,
           triggers: e.triggers,
           enabled: e.enabled !== false,
+          reusePolicy: e.reusePolicy === 'fresh' ? 'fresh' : 'reuse',
           routes: (e.routes || []).map((r) => `${r.provider}/${r.model}`),
         })),
       }
@@ -614,10 +638,11 @@ export function apply(ctx) {
 
   // agent_upsert：新增/更新单个 Agent（与 GUI 编辑保存同一条 registry.upsert 逻辑，立即生效免重启）。
   // v1.2.0：暴露给主 agent，改 Agent（含 systemPrompt）无需重启 Desktop、无需点 GUI。
+  // v1.5.0：支持 reusePolicy（'reuse' 复用同角色子代理 / 'fresh' 每次新开）。
   toolDisposers.push(ctx.tools.register({
     name: 'agent_upsert',
     description:
-      'Create or update a single agent agent in the dsh-agent-dispatch registry. This is the same write path as the GUI edit-and-save (registry.upsert: in-memory + atomic disk write), so changes take effect immediately without restarting DSH. Use this to fix or adjust an agent\'s persona/systemPrompt, triggers, name, or model routes. The agent keeps its position if it already exists, otherwise it is appended.',
+      'Create or update a single agent agent in the dsh-agent-dispatch registry. This is the same write path as the GUI edit-and-save (registry.upsert: in-memory + atomic disk write), so changes take effect immediately without restarting DSH. Use this to fix or adjust an agent\'s persona/systemPrompt, triggers, name, model routes, or reuse policy. The agent keeps its position if it already exists, otherwise it is appended.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -627,6 +652,10 @@ export function apply(ctx) {
         systemPrompt: { type: 'string', description: 'The full agent persona / system prompt (non-empty).' },
         emoji: { type: 'string', description: 'Optional single emoji shown in lists.' },
         triggers: { type: 'string', description: 'Optional trigger-domain description used by agent_list routing.' },
+        reusePolicy: {
+          type: 'string',
+          description: "Optional reuse policy: 'reuse' (default) keeps ONE continuable child per parent session for this agent and steers follow-up tasks to it via send_message — context carries over; 'fresh' spawns a new child for every dispatch — use for exploration-style roles whose tasks are independent (each exploration starts clean).",
+        },
         routes: {
           type: 'array',
           description: 'Optional model routes; each item {provider, model, effort?}.',
@@ -669,6 +698,7 @@ export function apply(ctx) {
         systemPrompt: args.systemPrompt,
         emoji: args.emoji,
         triggers: args.triggers,
+        reusePolicy: args.reusePolicy === 'fresh' ? 'fresh' : 'reuse',
         routes: args.routes || [],
         enabled: args.enabled !== false,
       }
@@ -759,13 +789,13 @@ export function apply(ctx) {
       '［适用范围］本策略仅对具备委派工具的编排层（主代理 / 父级）生效。若你作为子代理收到本段，请直接忽略其中的委派建议：必须由你自己独立完成被指派的任务，禁止再向下委派或另起任何子代理（含 agent_dispatch / agent_squad / subagent / subagent_fork / workflow / product_delegate 等）；超出能力时明确说明卡在哪、需要什么，并向上（父级）汇报，绝不自行委派或硬闯。',
       '1. 任务命中某 Agent 领域（需求分析/代码审查/线上排查/SQL 分析等，以 agent_list 返回的 triggers 为准）时，优先用 agent_dispatch 委派，而不是自己在主对话里做。',
       '2. 委派任务必须是自包含的：Agent 看不到本会话，把所需上下文（路径/代码/日志/约束）全部写进 task。',
-      '3. 对同一 Agent 的后续追问用 agent_followup（带 childId），上下文延续。',
+      '3. 对同一 Agent 的后续任务默认复用同一子代理：agent_dispatch 会自动复用同角色空闲子代理（send_message 续聊，上下文延续，不重复新建）；reusePolicy=fresh 的探索型 Agent（agent_list 显示「每次新开」）除外，每次独立新开。复用池中的子代理空闲 10 分钟后自动回收驻留资源（持久会话保留，下次复用冷恢复，上下文不丢）。',
       '4. 简单问题（一句话能答、无需工具链）不必委派，直接回答——委派本身有开销。',
       '5. 不确定哪个 Agent 合适时先 agent_list。',
       '6. 多角度或流水线目标（既要分析又要审查、多路排查同一问题）用 agent_squad：dev-pipeline=需求→审查串行；debug-squad=日志/数据/代码三路并行；review-squad=业务/数据双路。单领域任务不要用组队。带 checkpoint 的小队（如 kiligz-workflow）会在 checkpoint 步骤后返回 paused:true，必须停下等用户确认，用户反馈经 agent_squad_continue（squadRunId + note）续跑，禁止未确认就自动续跑。停等时：①若阶段有产出文档（prd.md/飞书技术方案链接等），把完整路径/链接展示给用户；②若阶段有「待确认问题清单」，逐条列出请用户作答，用户回答前不得续跑。',
       '7. 复杂动态编排（组队模板不匹配、需要按中间结果决定下一步）时，用宿主 workflow 工具编排 agent_dispatch。',
       '8. 用户消息以「$<id> 」前缀开头时（如 "$sql-analyst 查下 orders 慢查询"），这是用户显式指定：把后续文本作为 task 直接 agent_dispatch 给该 id 的 Agent（组队 id 用 agent_squad），不要追问、不要改派。$ 前缀来自输入框 / 菜单选 Agent 的插入（或用户手打），是用户的明确意图。',
-      '9. 修改 Agent 用 agent_upsert、修改小队（含各步骤 checkpoint 停等开关）用 agent_squad_upsert，均免重启立即生效。',
+      '9. 修改 Agent（含 reusePolicy 复用策略）用 agent_upsert、修改小队（含各步骤 checkpoint 停等开关）用 agent_squad_upsert，均免重启立即生效。',
     ].join('\n'),
   })
 
@@ -1225,5 +1255,9 @@ export function apply(ctx) {
     clearInterval(restTimer)
     for (const dispose of toolDisposers) dispose?.()
     disposeRoutesSection?.()
+    disposeEndListener?.()
+    disposeSessionListener?.()
+    // v1.5.0：清空复用池定时器（驻留子代理的回收由宿主在插件 scope teardown 统一处理）
+    try { dispatcher.dispose() } catch { /* ignore */ }
   }
 }

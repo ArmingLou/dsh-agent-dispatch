@@ -48,7 +48,12 @@ if (mod.name !== PKG_NAME) errors.push(`模块导出 name 应为 ${PKG_NAME}，�
 if (!Array.isArray(mod.inject) || mod.inject.length === 0) errors.push('inject 数组缺失')
 const tools = [], sections = [], commands = []
 const ctx = {
-  tools: { register: d => { tools.push(d.name); return () => {} } },
+  tools: {
+    register: d => { tools.push(d.name); return () => {} },
+    // v1.5.0：apply 挂全局递归护栏（tools.guard）+ 动态 deny 名单读取（tools.view）
+    guard: () => () => {},
+    view: () => ({ knownNames: [] }),
+  },
   systemPrompt: { section: s => { sections.push(s.name); return () => {} } },
   commands: { register: d => { commands.push(d.name); return () => {} } },
   subagents: {},
@@ -103,9 +108,32 @@ if (!host.includes('mergeDispatchHistory')) throw new Error('v0.7.1: 缺真实�
 if (!host.includes('next.squadName = sq?.name')) throw new Error('v0.9.16: mergeDispatchHistory 应按 viaSquad 回填小队名')
 // v0.9.35：label 在Agent名后拼 squadMark（S{n}/{total}）——断言 squadMark 构造与拼接逻辑存在
 const dispatchSrc = readFileSync(path.join(root, 'lib/dispatch.js'), 'utf8')
-// v1.1.2：递归护栏——startContinuable 必须 deny 全部 5 个委派工具，物理阻断子代理再派下级
-// v1.2.0：deny 清单追加 agent_upsert，防子代理通过新工具改注册表逃逸
-if (!dispatchSrc.includes("toolFilter: { deny: ['agent_dispatch', 'agent_followup', 'agent_list', 'agent_squad', 'agent_squad_continue', 'agent_squad_upsert', 'agent_import_skill', 'agent_upsert'] }")) throw new Error('v1.3.1: startContinuable 必须 toolFilter.deny 全部 8 个委派工具（含 agent_squad_upsert）')
+// v1.1.2 起：递归护栏——deny 候选名单必须覆盖全部 8 个委派工具 + 通用委派工具
+// v1.5.0：名单改为 DENY_CANDIDATES 常量 + #safeDenyList 动态求交集（新宿主
+// tools.restrict 对未知工具名 loud throw，静态名单会炸掉子代理创建）；
+// 豁免 send_message（子代理→父级回传，替代旧 report）与 product_submit（ACP 中继）。
+const denyCands = readFileSync(path.join(root, 'lib/dispatch.js'), 'utf8')
+for (const n of ['agent_dispatch', 'agent_followup', 'agent_list', 'agent_squad', 'agent_squad_continue', 'agent_squad_upsert', 'agent_import_skill', 'agent_upsert', 'subagent', 'subagent_fork', 'workflow', 'product_delegate']) {
+  if (!dispatchSrc.includes("'" + n + "'")) throw new Error(`v1.5.0: DENY_CANDIDATES 必须包含 ${n}`)
+}
+if (!dispatchSrc.includes('send_message')) throw new Error('v1.5.0: 应保留 send_message（子代理→父级回传结果，替代旧 report）')
+if (!dispatchSrc.includes('#safeDenyList()')) throw new Error('v1.5.0: deny 名单必须走 #safeDenyList 动态求交集')
+if (!dispatchSrc.includes('this.ctx.tools?.view?.(undefined)')) throw new Error('v1.5.0: #safeDenyList 应读宿主全局 knownNames')
+// v1.5.0：宿主删除 ctx.subagents.followup——续聊必须走 sendMessage（signal 硬性字段）
+if (!dispatchSrc.includes('this.ctx.subagents.sendMessage(')) throw new Error('v1.5.0: followup 必须改走 ctx.subagents.sendMessage（旧 followup 已从宿主删除）')
+// v1.5.0：宿主 AgentOptions 字段为 reasoningEffort（旧 effort 已弃用）
+if (!dispatchSrc.includes('reasoningEffort: route.effort')) throw new Error('v1.5.0: agentOptions 必须映射 effort → reasoningEffort')
+// v1.5.0：同角色子代理复用池 + 空闲回收（drainChildren）
+if (!dispatchSrc.includes('this.childPool = new Map()')) throw new Error('v1.5.0: 缺同角色复用池 childPool')
+if (!dispatchSrc.includes('reusePolicy === \'fresh\' ? \'fresh\' : \'reuse\'')) throw new Error('v1.5.0: dispatch 应解析 Agent reusePolicy')
+if (!dispatchSrc.includes('drainContinuableChildren(parent, [pooled.childId])')) throw new Error('v1.5.0: 空闲回收应调用 ctx.subagents.drainContinuableChildren 释放驻留（drainChildren 未暴露）')
+if (!dispatchSrc.includes('#scheduleReleaseFor(childId)')) throw new Error('v1.5.0: onChildEnd 应排空闲释放定时器')
+if (!dispatchSrc.includes('purgeParent(parentSessionId)')) throw new Error('v1.5.0: 缺父会话清理 purgeParent')
+// v1.5.0：host 全局递归护栏（registerContinuableSetup 已删除）
+if (!host.includes('ctx.tools.guard((exec) =>')) throw new Error('v1.5.0: host 应注册全局 tools.guard 递归护栏（registerContinuableSetup 已删除）')
+if (!host.includes("subagentDepth ?? 0")) throw new Error('v1.5.0: tools.guard 应按 exec.agent.options.subagentDepth 判断')
+if (host.includes('registerContinuableSetup(')) throw new Error('v1.5.0: registerContinuableSetup 调用应已删除（宿主已移除该 API）')
+if (!host.includes("ctx.on('session/disposed'")) throw new Error('v1.5.0: host 应订阅 session/disposed 清理复用池')
 // v1.4.0：ACP/subagent provider 路由——getProvider 命中即走 relay 模式（allow 白名单）
 if (!dispatchSrc.includes('const subProvider = route ? this.ctx.subagents?.getProvider?.(route.provider) : undefined')) throw new Error('v1.4.0: dispatch 应检测 subagent provider（getProvider 命中）')
 if (!dispatchSrc.includes("provider: acpMode ? route.provider : 'spawn'")) throw new Error('v1.4.0: ACP 模式 spec.provider 应直接传 route.provider')

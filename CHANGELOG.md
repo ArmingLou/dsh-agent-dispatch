@@ -1,5 +1,56 @@
 # Changelog
 
+## 1.5.0 (2026-09-02)
+
+**DSH 0.1.2-alpha.4（最新版）兼容性修复 + 同角色子代理复用 + 空闲回收。**
+
+升级后插件无法挂载（`registerContinuableSetup` 已从宿主删除），本次同时解决三个问题：
+① 新宿主 API 兼容；② 同角色子代理优先复用（`send_message` 续聊，探索型角色除外）；
+③ 子代理长时间不回收（完成一轮后空闲自动释放驻留资源，持久会话保留可冷恢复）。
+
+### 兼容性修复（新宿主 API 迁移）
+
+- **`index.js`**：删除 `ctx.subagents.registerContinuableSetup`（宿主已移除该 API，挂载即抛错）——
+  递归护栏改为**全局 `tools.guard`**：按调用方 `exec.agent.options.subagentDepth >= 1` 在【执行时】拒绝子代理调用任何"再起新代理 / 管理委派树"的工具。
+  覆盖所有插件层工具（含未在 deny 名单的跨插件工具如 `product_delegate`）；豁免 `send_message`
+  （子代理→父级回传结果，替代已删除的 `report` 工具）与 `product_submit`（ACP 中继）。
+  与 `dispatch()` 入口 `callerDepth >= 1` 硬检查 + `startContinuable` 的 `toolFilter.deny` 三保险。
+- **`lib/dispatch.js`**：
+  - `followup()` 改走 **`ctx.subagents.sendMessage(sender, targetId, content, { signal })`**
+    （旧 `ctx.subagents.followup` 已删除；`signal` 为硬性字段）。驻留子代理 steer、已释放子代理自动冷恢复。
+  - `agentOptions.effort` → **`reasoningEffort`**（新宿主 AgentOptions 字段）。
+  - `toolFilter.deny` 名单改为 **`DENY_CANDIDATES` + `#safeDenyList()` 动态求交集**
+    （与 `ctx.tools.view(undefined).knownNames` ∪ 本插件自有工具名求交）——新宿主
+    `tools.restrict()` 对未知工具名 loud throw，旧静态名单会把未加载插件的工具名
+    （如 `product_delegate`）塞进 restrict 导致子代理创建失败。
+  - `interrupt` / `getProvider` / `subagent/end`（`{runId, provider, id, stopReason, lastAssistantMessage}`）契约不变。
+- **`lib/client.js`**：Agent 编辑表单新增「子代理复用策略」下拉（reuse/fresh）+ 卡片 fresh 角标。
+- **`lib/agents.js`**：注册表新增 `reusePolicy` 字段（`reuse`/`fresh`，默认 `reuse`），校验 + 规整 + 持久化。
+- **`agent_upsert` / `agent_list`**：支持/展示 `reusePolicy`。
+
+### 同角色子代理复用（v1.5.0 核心）
+
+- 复用池：`(父会话 id, agentId) → childId`。`reusePolicy='reuse'`（默认）时，同一父会话内同 Agent
+  的后续委派直接 `send_message` 复用同一子代理（上下文延续，不再重复新建冷启动）；
+  `reusePolicy='fresh'`（探索型角色）每次独立新开。小队步骤 `dedicatedChild=true` 保持专属子代理（并发安全）。
+- 决策日志新增 `reused: true/false` 字段，历史页可区分"复用续聊"与"新建"。
+
+### 子代理空闲回收（v1.5.0 核心）
+
+- 子代理完成一轮（`subagent/end`）后进入空闲状态：`idleReleaseMs`（默认 10 分钟；配置 `idleReleaseMs`
+  或环境变量 `DSH_AGENT_DISPATCH_IDLE_RELEASE_MS`，0 关闭）内未被复用 → 调用宿主
+  **`drainContinuableChildren(parent, [childId])`** 释放驻留 Activation（内存/注册表槽位回收）。
+  持久会话保留，下次复用自动冷恢复，上下文不丢——"复用 + 回收"共存。
+- 复用（send_message 成功）取消释放定时器；父会话 `session/disposed` / 插件卸载时清理池状态。
+- ACP 子代理（deveco 等）的进程回收仍由 `dsh-plugin-product-subagents` 的 `idleTimeoutMs` 负责，本插件不重复处理。
+
+### 其他
+
+- `verify.mjs`：apply 桩补 `tools.guard/view`；断言更新为新 API（sendMessage / reasoningEffort /
+  drainContinuableChildren / reusePolicy / 动态 deny / 全局 guard）。
+- 已用临时 DSH_HOME + mock LLM 端到端验证：挂载 → 委派 → 同角色复用（同一 childId、上下文延续）
+  → fresh 新开 → 子代理再委派被护栏拒绝 → 空闲释放 → 冷恢复复用 → 小队 waitResult 全链路通过。
+
 ## 1.4.2 (2026-08-31)
 
 加固：堵住"子代理自身 scope 工具绕过 toolFilter"的漏洞——harness 把 `report`/`subagent` 等工具注册进子代理 own-layer，`tools.restrict` 的 allow/deny 只过滤"继承面"、刻意豁免 own-layer 工具，故仅靠 deny 名单去不掉 `subagent`/`subagent_fork`。

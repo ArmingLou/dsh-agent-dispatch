@@ -60,9 +60,13 @@
 
 用户消息以 `$<id> ` 开头（如 `$log-tracer 查下 orders 慢查询`），主 agent 把后续文本作为 task 直接 `agent_dispatch` 给该 id 的 Agent（小队 id 用 `agent_squad`），不追问不改派。
 
-### 4. 追问与续聊
+### 4. 追问与续聊（同角色子代理复用）
 
-同一 Agent 再次委派会自动复用旧 child 走 `agent_followup`（上下文延续），不重复新建。也可以手动 `agent_followup(childId, message)` 追问。
+同一 Agent 的后续任务默认**复用同一个子代理**（v1.5.0）：`agent_dispatch` 会自动找到该 Agent 的空闲子代理，用 `send_message` 把新任务作为后续消息发过去——子代理保留完整对话上下文，渐进式任务（编程、审查、多轮排查）不重复冷启动。也可以手动 `agent_followup(childId, message)` 追问。
+
+- **空闲回收**：子代理完成一轮后，空闲超过 `idleReleaseMs`（默认 10 分钟）会自动释放其驻留资源（`drainContinuableChildren`，内存/注册表槽位回收）；持久会话保留，下次复用自动冷恢复，上下文不丢。
+- **探索型角色**：把 Agent 的 `reusePolicy` 设为 `fresh`（GUI 表单「子代理复用策略」），则每次委派都独立新开子代理——适合探索/调研类任务，避免旧探索上下文污染新任务。
+- 小队步骤（`agent_squad`）始终使用专属子代理（并发安全，不受复用策略影响）。
 
 ### 5. 多角度 / 流水线（小队）
 
@@ -132,6 +136,7 @@ sequenceDiagram
 - **写入**：`dispatch` 立即返回 childId；宿主 `subagent/end` 事件触发 `onChildEnd` 补真实结局（stopReason / lastAssistantMessage）。
 - **合并**：`mergeDispatchHistory` 按 childId 时间正序配对 `kind:'dispatch'` ↔ `kind:'result'` 行；不在活体活跃映射的未终结行收敛为 `orphan:true`（状态未知）。
 - **日志轮转**：`dispatches.jsonl` 上限 2000 行，超出自动重写保留尾部。
+- **复用与回收**（v1.5.0）：`reusePolicy='reuse'` 的 Agent 在 `(父会话, Agent)` 维度维护复用池——完成一轮的子代理留在池中，后续委派直接 `send_message`（驻留 steer / 已释放冷恢复）；空闲 `idleReleaseMs`（默认 10 分钟，可配置 `idleReleaseMs` 或环境变量 `DSH_AGENT_DISPATCH_IDLE_RELEASE_MS`）后调用宿主 `drainContinuableChildren` 释放驻留资源。父会话结束 / 插件卸载时清理池状态。
 
 ## 安装
 
@@ -178,6 +183,7 @@ $DSH_HOME/data/dsh-agent-dispatch/
         { "provider": "deepseek-official", "model": "deepseek-v4", "effort": "high" },
         { "provider": "kimi-coding", "model": "k3-256k", "effort": "high" }
       ],
+      "reusePolicy": "reuse",
       "enabled": true
     }
   ]
@@ -186,6 +192,7 @@ $DSH_HOME/data/dsh-agent-dispatch/
 
 - `routes`：模型优先级表，首个失败自动换下一个；留空继承主会话当前模型。
 - `effort`：`minimal/low/medium/high/xhigh/max`（xhigh/max 底层钳到 high）。
+- `reusePolicy`（v1.5.0）：`reuse`（默认）= 同会话内复用同一子代理（`send_message` 续聊，上下文延续）；`fresh` = 每次委派独立新开子代理（适合探索型角色）。省略/缺省按 `reuse`。
 - 改动保存即生效，**免重启**（下一轮对话即生效）。
 
 ### 小队（`squads.json`）
