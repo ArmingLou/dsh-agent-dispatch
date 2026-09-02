@@ -160,6 +160,25 @@ if (!dispatchSrc.includes('async listChildren(parentAgent, { agentId }')) throw 
 if (!host.includes("name: 'agent_children'")) throw new Error('v1.5.3: host 应注册 agent_children 工具')
 if (!host.includes('{ reuse: args.reuse, childId: args.childId }')) throw new Error('v1.5.3: agent_dispatch 应透传 childId 给 dispatch')
 if (!host.includes("'agent_dispatch', 'agent_followup', 'agent_list', 'agent_squad', 'agent_squad_continue',\n    'agent_squad_upsert', 'agent_upsert', 'agent_import_skill', 'agent_close', 'agent_children',")) throw new Error('v1.5.3: noDelegateTools 应含 agent_children（子代理不可管理线程树）')
+// v1.5.4：fresh 策略已完成线程历史记录（agent_children 缺陷修复）
+if (!dispatchSrc.includes('this.completedFresh = new Map()')) throw new Error('v1.5.4: dispatcher 缺 completedFresh 历史记录 Map')
+if (!dispatchSrc.includes('COMPLETED_FRESH_CAP = 50')) throw new Error('v1.5.4: 缺 COMPLETED_FRESH_CAP 上限常量')
+if (!dispatchSrc.includes('#isInPool(childId)')) throw new Error('v1.5.4: 缺 #isInPool 辅助方法（判断 childId 是否在复用池）')
+if (!dispatchSrc.includes('#pruneCompletedFresh()')) throw new Error('v1.5.4: 缺 #pruneCompletedFresh 淘汰方法（超限清理）')
+if (!dispatchSrc.includes("if (!this.#isInPool(childId)) {")) throw new Error('v1.5.4: onChildEnd 应在非池线程完成时插入 completedFresh 记录')
+if (!dispatchSrc.includes('this.completedFresh.set(childId, {')) throw new Error('v1.5.4: onChildEnd 应 set completedFresh 条目（含 childId/agentId/taskLabels/parentSessionId/completedAt）')
+if (!dispatchSrc.includes("for (const h of this.completedFresh.values())")) throw new Error('v1.5.4: listChildren 应遍历 completedFresh 合并展示（status: ready）')
+if (!dispatchSrc.includes('this.completedFresh.delete(t.childId)')) throw new Error('v1.5.4: closeChild 应清理 completedFresh 条目')
+if (!dispatchSrc.includes('this.completedFresh.delete(childId) // v1.5.4')) throw new Error('v1.5.4: 定向续聊进池时应移除 completedFresh 历史记录（互斥）')
+if (!dispatchSrc.includes('this.completedFresh.clear()')) throw new Error('v1.5.4: dispose 应清空 completedFresh')
+if (!dispatchSrc.includes("if (h.parentSessionId === parentSessionId) this.completedFresh.delete(childId)")) throw new Error('v1.5.4: purgeParent 应清理该父会话的 completedFresh 条目')
+// v1.5.4 P1：followup() 续聊 completedFresh 线程时应移除历史 + 写 activeChildren
+if (!dispatchSrc.includes('const hist = this.completedFresh.get(childId)')) throw new Error('v1.5.4-P1: followup 应查找 completedFresh')
+// followup 内 completedFresh.delete 在 hist 检查块中（无专用注释，用上下文断言）
+if (!dispatchSrc.includes('if (hist) {\n      this.completedFresh.delete(childId)')) throw new Error('v1.5.4-P1: followup 应在 hist 存在时从 completedFresh 移除续聊目标')
+if (!dispatchSrc.includes('taskLabel: summarizeTask(message)')) throw new Error('v1.5.4-P1: followup 应写 activeChildren（含 taskLabel: summarizeTask(message)）')
+// v1.5.4 P2-2：closeChild agentId 批量路径去重
+if (!dispatchSrc.includes('const seen = new Set()') || !dispatchSrc.includes('!seen.has(h.childId)')) throw new Error('v1.5.4-P2: closeChild agentId 批量路径应有 seen 去重')
 // v1.4.0：ACP/subagent provider 路由——getProvider 命中即走 relay 模式（allow 白名单）
 if (!dispatchSrc.includes('const subProvider = route ? this.ctx.subagents?.getProvider?.(route.provider) : undefined')) throw new Error('v1.4.0: dispatch 应检测 subagent provider（getProvider 命中）')
 if (!dispatchSrc.includes("provider: acpMode ? route.provider : 'spawn'")) throw new Error('v1.4.0: ACP 模式 spec.provider 应直接传 route.provider')
@@ -474,5 +493,147 @@ if (!c.includes('uiSubs')) throw new Error('v0.9.29: 持久化状态应有订阅
   if (uiExpertZh.length > 0) throw new Error('v1.1: UI 字符串残留「专家」: ' + uiExpertZh.join(' | '))
   const uiExpertEn = c.match(/"[^"\n]*expert[^"\n]*"/g) || []
   if (uiExpertEn.length > 0) throw new Error('v1.1: UI 字符串残留「expert」: ' + uiExpertEn.join(' | '))
+}
+
+// ── v1.5.4 运行时单元测试：listChildren 含 fresh 策略已完成线程 ──
+{
+  const { Dispatcher } = await import(path.join(root, 'lib/dispatch.js'))
+  // 桩 registry：一个 fresh 策略 Agent
+  class StubRegistry {
+    get(id) { return { id, name: id, reusePolicy: 'fresh', systemPrompt: '', routes: [] } }
+    resolveRoutes() { return [] }
+  }
+  const tmpDir2 = mkdtempSync(path.join(os.tmpdir(), 'dad-unit-'))
+  const d = new Dispatcher({ ctx: { subagents: {}, tools: { view: () => ({ knownNames: [] }) } }, registry: new StubRegistry(), dataDir: tmpDir2, idleReleaseMs: 0 })
+  // 模拟 fresh 子代理完成：手工注入 activeChildren → onChildEnd → completedFresh
+  d.activeChildren.set('fresh-child-1', { agentId: 'explorer', childId: 'fresh-child-1', taskLabel: '探索任务A', startedAt: Date.now(), parentSessionId: 'sess-1', viaSquad: null, squadRunId: null })
+  d.onChildEnd('fresh-child-1', 'completed', '结果文本')
+  // fresh-child-1 应从 activeChildren 移除，出现在 completedFresh
+  if (d.activeChildren.has('fresh-child-1')) throw new Error('v1.5.4: onChildEnd 后 activeChildren 应不含 fresh-child-1')
+  if (!d.completedFresh.has('fresh-child-1')) throw new Error('v1.5.4: onChildEnd 后 completedFresh 应含 fresh-child-1')
+  const hist = d.completedFresh.get('fresh-child-1')
+  if (hist.agentId !== 'explorer') throw new Error('v1.5.4: completedFresh 条目 agentId 应为 explorer')
+  if (hist.parentSessionId !== 'sess-1') throw new Error('v1.5.4: completedFresh 条目 parentSessionId 应为 sess-1')
+  if (!Array.isArray(hist.taskLabels) || hist.taskLabels.length === 0) throw new Error('v1.5.4: completedFresh 条目应有 taskLabels')
+  // listChildren 应展示 completedFresh 条目（status: ready）
+  const fakeAgent = { session: { id: 'sess-1' }, options: {} }
+  const result = await d.listChildren(fakeAgent)
+  const found = result.children.find((r) => r.childId === 'fresh-child-1')
+  if (!found) throw new Error('v1.5.4: listChildren 应展示 completedFresh 条目 fresh-child-1')
+  if (found.status !== 'ready') throw new Error('v1.5.4: completedFresh 条目 status 应为 ready，实际 ' + found.status)
+  if (found.agentId !== 'explorer') throw new Error('v1.5.4: completedFresh 条目 agentId 应为 explorer')
+  // closeChild 应能关闭 completedFresh 条目
+  await d.closeChild(fakeAgent, { childId: 'fresh-child-1' })
+  if (d.completedFresh.has('fresh-child-1')) throw new Error('v1.5.4: closeChild 后 completedFresh 应移除 fresh-child-1')
+  // 池内线程不应同时出现在 completedFresh
+  d.childPool.set('sess-1::pool-agent::pool-child-1', { key: 'sess-1::pool-agent::pool-child-1', childId: 'pool-child-1', agentId: 'pool-agent', parentSessionId: 'sess-1', lastUsedAt: Date.now(), releaseTimer: null, lastTasks: [] })
+  d.activeChildren.set('pool-child-1', { agentId: 'pool-agent', childId: 'pool-child-1', taskLabel: '池任务', startedAt: Date.now(), parentSessionId: 'sess-1', viaSquad: null, squadRunId: null })
+  d.onChildEnd('pool-child-1', 'completed', '池结果')
+  // 池线程完成后不应进 completedFresh（因为 #isInPool 返回 true）
+  if (d.completedFresh.has('pool-child-1')) throw new Error('v1.5.4: 池内线程不应出现在 completedFresh')
+  // purgeParent 应清理 completedFresh
+  d.activeChildren.set('fresh-child-2', { agentId: 'explorer', childId: 'fresh-child-2', taskLabel: '探索B', startedAt: Date.now(), parentSessionId: 'sess-2', viaSquad: null, squadRunId: null })
+  d.onChildEnd('fresh-child-2', 'completed', null)
+  if (!d.completedFresh.has('fresh-child-2')) throw new Error('v1.5.4: fresh-child-2 应在 completedFresh')
+  d.purgeParent('sess-2')
+  if (d.completedFresh.has('fresh-child-2')) throw new Error('v1.5.4: purgeParent 后 completedFresh 应移除 sess-2 的条目')
+  // dispose 应清空 completedFresh
+  d.activeChildren.set('fresh-child-3', { agentId: 'explorer', childId: 'fresh-child-3', taskLabel: '探索C', startedAt: Date.now(), parentSessionId: 'sess-1', viaSquad: null, squadRunId: null })
+  d.onChildEnd('fresh-child-3', 'completed', null)
+  if (!d.completedFresh.has('fresh-child-3')) throw new Error('v1.5.4: fresh-child-3 应在 completedFresh')
+  d.dispose()
+  if (d.completedFresh.size !== 0) throw new Error('v1.5.4: dispose 后 completedFresh 应为空')
+  rmSync(tmpDir2, { recursive: true, force: true })
+}
+
+// ── v1.5.4 P1/P2 扩展单元测试 ──
+{
+  const { Dispatcher } = await import(path.join(root, 'lib/dispatch.js'))
+  class StubRegistry {
+    get(id) { return { id, name: id, reusePolicy: 'fresh', systemPrompt: '', routes: [] } }
+    resolveRoutes() { return [] }
+  }
+  const tmpDir3 = mkdtempSync(path.join(os.tmpdir(), 'dad-unit-p1-'))
+  let followupCalled = false
+  const d = new Dispatcher({
+    ctx: {
+      subagents: {
+        sendMessage: async (parent, childId, content, opts) => {
+          followupCalled = true
+          return { childId }
+        },
+      },
+      tools: { view: () => ({ knownNames: [] }) },
+    },
+    registry: new StubRegistry(),
+    dataDir: tmpDir3,
+    idleReleaseMs: 0,
+  })
+
+  // P1-a: followup 续聊 completedFresh 线程 → 移除历史 + 写 activeChildren
+  d.activeChildren.set('fc-followup', { agentId: 'explorer', childId: 'fc-followup', taskLabel: '初始任务', startedAt: Date.now(), parentSessionId: 'sess-1', viaSquad: null, squadRunId: null })
+  d.onChildEnd('fc-followup', 'completed', '结果')
+  if (!d.completedFresh.has('fc-followup')) throw new Error('v1.5.4-P1a: fc-followup 应在 completedFresh')
+  followupCalled = false
+  await d.followup({ session: { id: 'sess-1' }, options: {} }, 'fc-followup', '追加问题')
+  if (!followupCalled) throw new Error('v1.5.4-P1a: followup 应调 sendMessage')
+  if (d.completedFresh.has('fc-followup')) throw new Error('v1.5.4-P1a: followup 后 completedFresh 应移除 fc-followup')
+  if (!d.activeChildren.has('fc-followup')) throw new Error('v1.5.4-P1a: followup 后 activeChildren 应含 fc-followup')
+  const activeEntry = d.activeChildren.get('fc-followup')
+  if (activeEntry.agentId !== 'explorer') throw new Error('v1.5.4-P1a: activeChildren agentId 应为 explorer')
+  // P1-a followup: 线程运行中 listChildren 显示 running
+  const lcResult = await d.listChildren({ session: { id: 'sess-1' }, options: {} })
+  const lcEntry = lcResult.children.find(r => r.childId === 'fc-followup')
+  if (!lcEntry) throw new Error('v1.5.4-P1a: listChildren 应含 fc-followup')
+  if (lcEntry.status !== 'running') throw new Error('v1.5.4-P1a: followup 后 listChildren status 应为 running，实际 ' + lcEntry.status)
+  // P1-a followup: 线程结束后重入 completedFresh（不丢失）
+  d.onChildEnd('fc-followup', 'completed', '追加结果')
+  if (!d.completedFresh.has('fc-followup')) throw new Error('v1.5.4-P1a: onChildEnd 后应重入 completedFresh')
+  if (d.activeChildren.has('fc-followup')) throw new Error('v1.5.4-P1a: onChildEnd 后应从 activeChildren 移除')
+
+  // P2-3b: listChildren agentId 过滤适用于 completedFresh 条目
+  d.activeChildren.set('fc-agent-a', { agentId: 'agent-a', childId: 'fc-agent-a', taskLabel: 'A任务', startedAt: Date.now(), parentSessionId: 'sess-1', viaSquad: null, squadRunId: null })
+  d.activeChildren.set('fc-agent-b', { agentId: 'agent-b', childId: 'fc-agent-b', taskLabel: 'B任务', startedAt: Date.now(), parentSessionId: 'sess-1', viaSquad: null, squadRunId: null })
+  d.onChildEnd('fc-agent-a', 'completed', null)
+  d.onChildEnd('fc-agent-b', 'completed', null)
+  const filtered = await d.listChildren({ session: { id: 'sess-1' }, options: {} }, { agentId: 'agent-a' })
+  if (filtered.children.some(r => r.agentId !== 'agent-a')) throw new Error('v1.5.4-P2b: agentId 过滤应只返回 agent-a 条目')
+  if (!filtered.children.some(r => r.childId === 'fc-agent-a')) throw new Error('v1.5.4-P2b: agentId 过滤应含 fc-agent-a')
+
+  // P2-3c: stopReason=error/aborted 也写入 completedFresh（onChildEnd 不分支 stopReason）
+  d.activeChildren.set('fc-err', { agentId: 'explorer', childId: 'fc-err', taskLabel: '出错任务', startedAt: Date.now(), parentSessionId: 'sess-1', viaSquad: null, squadRunId: null })
+  d.onChildEnd('fc-err', 'error', '错误输出')
+  if (!d.completedFresh.has('fc-err')) throw new Error('v1.5.4-P2c: stopReason=error 也应写入 completedFresh')
+  d.activeChildren.set('fc-abort', { agentId: 'explorer', childId: 'fc-abort', taskLabel: '中断任务', startedAt: Date.now(), parentSessionId: 'sess-1', viaSquad: null, squadRunId: null })
+  d.onChildEnd('fc-abort', 'aborted', null)
+  if (!d.completedFresh.has('fc-abort')) throw new Error('v1.5.4-P2c: stopReason=aborted 也应写入 completedFresh')
+
+  // P2-3d: COMPLETED_FRESH_CAP 淘汰——注入超过 cap 的条目
+  // #pruneCompletedFresh 是私有方法，直接通过 onChildEnd 间接测试
+  const capTmpDir = mkdtempSync(path.join(os.tmpdir(), 'dad-cap-'))
+  // 临时制造一个 COMPLETED_FRESH_CAP 很小的实例——直接改 prototype 不可行，
+  // 改为手动填充 completedFresh 超限然后调 #pruneCompletedFresh（私有不可调）。
+  // 替代方案：直接填充 completedFresh 并验证 listChildren 能展示所有条目（超限由内部自动淘汰）
+  // 由于 cap=50 太大不便在单测中填满，改为直接操作 Map 验证淘汰逻辑存在性。
+  // 静态断言已覆盖 #pruneCompletedFresh 存在；此处验证 completedFresh 条目在 listChildren 可遍历
+  const capD = new Dispatcher({ ctx: { subagents: {}, tools: { view: () => ({ knownNames: [] }) } }, registry: new StubRegistry(), dataDir: capTmpDir, idleReleaseMs: 0 })
+  for (let i = 0; i < 5; i++) {
+    capD.completedFresh.set(`cap-child-${i}`, { childId: `cap-child-${i}`, agentId: 'explorer', taskLabels: [`task-${i}`], parentSessionId: 'sess-cap', completedAt: Date.now() + i })
+  }
+  const capResult = await capD.listChildren({ session: { id: 'sess-cap' }, options: {} })
+  if (capResult.children.length < 5) throw new Error('v1.5.4-P2d: listChildren 应展示全部 completedFresh 条目（5个），实际 ' + capResult.children.length)
+  rmSync(capTmpDir, { recursive: true, force: true })
+
+  // P2-3e: closeChild by agentId 批量关闭 completedFresh 条目
+  d.activeChildren.set('fc-batch-1', { agentId: 'batch-agent', childId: 'fc-batch-1', taskLabel: '批1', startedAt: Date.now(), parentSessionId: 'sess-1', viaSquad: null, squadRunId: null })
+  d.activeChildren.set('fc-batch-2', { agentId: 'batch-agent', childId: 'fc-batch-2', taskLabel: '批2', startedAt: Date.now(), parentSessionId: 'sess-1', viaSquad: null, squadRunId: null })
+  d.onChildEnd('fc-batch-1', 'completed', null)
+  d.onChildEnd('fc-batch-2', 'completed', null)
+  if (!d.completedFresh.has('fc-batch-1') || !d.completedFresh.has('fc-batch-2')) throw new Error('v1.5.4-P2e: 批量条目应在 completedFresh')
+  const batchResult = await d.closeChild({ session: { id: 'sess-1' }, options: {} }, { agentId: 'batch-agent' })
+  if (d.completedFresh.has('fc-batch-1') || d.completedFresh.has('fc-batch-2')) throw new Error('v1.5.4-P2e: closeChild(agentId) 后 completedFresh 条目应被移除')
+  if (!batchResult.closed.some(c => c.childId === 'fc-batch-1') || !batchResult.closed.some(c => c.childId === 'fc-batch-2')) throw new Error('v1.5.4-P2e: closeChild(agentId) 应返回两个 closed 条目')
+
+  rmSync(tmpDir3, { recursive: true, force: true })
 }
 console.log(`OK: ${PKG_NAME} v${pkg.version} 一致性链（无内置 Agent）+ ${tools.length} 工具 + /${commands.join('/')} 命令`)

@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.5.4 (2026-09-02)
+
+**修复 agent_children 不展示 fresh 策略已完成子代理线程**——fresh/reusePolicy:fresh 或小队专属子代理完成后从 `activeChildren` 移除且从未进入 `childPool`，`agent_children` 无法看到它们，导致不可通过 `agent_dispatch(childId=...)` 定向续聊。
+
+### 修复
+
+- **`completedFresh` 历史记录**（`Dispatcher` 新增 `Map<childId, entry>`）：`onChildEnd` 检测到完成的 child 不在复用池时，插入轻量历史条目（`childId`/`agentId`/`taskLabels`/`parentSessionId`/`completedAt`），与 `childPool` 互斥——同一 `childId` 不同时出现在两处。全局上限 `COMPLETED_FRESH_CAP=50`，超限按 `completedAt` 淘汰最旧。
+- **`listChildren` 合并展示**：池条目与活跃条目之后遍历 `completedFresh`，未出现在池/活跃中的历史线程以 `status: 'ready'`（仅持久会话，可冷恢复续聊）展示。现有宿主 `listChildren` 状态细化逻辑（idle/ready override）和 `agentId` 过滤 + 排序不变。
+- **`closeChild` 识别历史记录**：`childId` 查找和 `agentId` 批量关闭均覆盖 `completedFresh` 条目；关闭 = 移除历史记录 + `drainChild`。不再报"不在复用池/活跃映射中"。`agentId` 批量路径增加 `seen` 去重（同一 childId 不重复关闭）。
+- **`followup()` 续聊状态同步**（P1 修复）：`agent_followup` 对 `completedFresh` 中的线程续聊时，移除历史条目（互斥）+ 写 `activeChildren`（使 `listChildren` 展示 `running` 而非 `ready`）+ 取消池条目释放定时器；续聊失败不修改状态。修复后：续聊运行中可见为 `running`，结束后正确重入 `completedFresh`（不丢失也不重复）。
+- **定向续聊进池时移除历史**：`agent_dispatch(childId=...)` 续聊池外线程时，该线程补记进 `childPool` 后同步从 `completedFresh` 删除（互斥保证）。
+- **清理路径**：`purgeParent` 清理该父会话全部 `completedFresh` 条目；`dispose` 清空 `completedFresh`。
+
+### 验证
+
+- `verify.mjs`：新增 v1.5.4 静态断言（`completedFresh` Map、`COMPLETED_FRESH_CAP`、`#isInPool`、`#pruneCompletedFresh`、`onChildEnd` 插入、`listChildren` 遍历、`closeChild` 清理、续聊互斥、`dispose`/`purgeParent` 清理）+ 运行时单元测试（fresh 子代理完成 → `completedFresh` 可见 → `listChildren` 返回 ready → `closeChild` 关闭 → 池线程不重复记录 → `purgeParent`/`dispose` 清理）。
+
 ## 1.5.3 (2026-09-02)
 
 **按 session id 定向续聊 + 线程列表**——续聊只认 session id，进程/驻留是否新启动无关（冷恢复自动），支持续聊"隔开的"旧线程（不是最近一个）。
