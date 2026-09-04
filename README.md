@@ -171,8 +171,9 @@ dsh plugin --profile <你的 profile 名> add /path/to/dsh-agent-dispatch
 
 ```
 $DSH_HOME/data/dsh-agent-dispatch/
-├── agents.json     # Agent 列表
-├── squads.json     # 小队列表
+├── agents.json      # Agent 列表
+├── squads.json      # 小队列表
+├── fab-config.json  # 悬浮球配置（隐藏状态/位置/显示模式/光效设置）
 └── dispatches.jsonl # 决策日志（最多 2000 行自动轮转）
 ```
 
@@ -247,7 +248,8 @@ $DSH_HOME/data/dsh-agent-dispatch/
 
 ### 悬浮活动球
 
-- **位置**：默认右下角，可任意拖动（不吸附边缘），位置存 `localStorage`（key `ad-fab-pos`）。
+- **位置**：默认右下角，可任意拖动（不吸附边缘）。
+- **持久化**（v1.6.0）：隐藏状态 / 位置 / 光效设置落宿主数据目录 `fab-config.json`（经 `/agent-api/fab-config` 读写），跨 VS Code 重启 / webview 重建 / 端口回退可恢复；宿主通道不可用时回退 `localStorage`（key `ad-fab-*`），已有 `localStorage` 存量配置自动上载一次。多端（如浏览器 + VS Code 面板）共享同一 `$DSH_HOME` 时，同字段并发写为 last-writer-wins（settings 浅合并同理，后写端的未提及键不丢）。
 - **光效**：8 种色调（雪白/品牌蓝/天蓝/雾紫/樱粉/杏橙/彩色渐变/毛玻璃），边缘流光，呼吸动效（`fab-live` 白光 / `done-glow` 彩光），面板透明度 0-100。
 - **总开关**：主面板「总览」顶部「显示悬浮球」开关，off 强制隐藏。
 - **弹窗**：从球心弹出，四分区卡片化（运行中 / 最近完成 / Agent 列表 / 小队列表），点整卡就地委派或跳子 Agent 会话。

@@ -34,12 +34,12 @@ if (!clientJs.includes('window.__ModuleLoader__.load')) errors.push('lib/client.
 if (!clientJs.includes("id: '@kiligzzz/dsh-agent-dispatch'")) errors.push('lib/client.js ModuleLoader id 必须是裸包名 @kiligzzz/dsh-agent-dispatch')
 
 // 4. 关键文件存在
-for (const f of ['index.js', 'lib/client.js', 'lib/agents.js', 'lib/dispatch.js', 'lib/defaults.js', 'lib/squads.js', 'lib/squad-registry.js', 'lib/skill-import.js', 'README.md', 'CHANGELOG.md', 'LICENSE']) {
+for (const f of ['index.js', 'lib/client.js', 'lib/agents.js', 'lib/dispatch.js', 'lib/defaults.js', 'lib/squads.js', 'lib/squad-registry.js', 'lib/skill-import.js', 'lib/fab-config.js', 'README.md', 'CHANGELOG.md', 'LICENSE']) {
   if (!existsSync(path.join(root, f))) errors.push(`缺文件: ${f}`)
 }
 
 // 5. 冒烟：模块加载 + apply 桩测试（DSH_HOME 指到临时目录避免污染）
-import { mkdtempSync, rmSync, readFileSync as rf } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync as rf, writeFileSync } from 'node:fs'
 import os from 'node:os'
 const tmp = mkdtempSync(path.join(os.tmpdir(), 'dad-verify-'))
 process.env.DSH_HOME = tmp
@@ -636,4 +636,70 @@ if (!c.includes('uiSubs')) throw new Error('v0.9.29: 持久化状态应有订阅
 
   rmSync(tmpDir3, { recursive: true, force: true })
 }
+// v1.6.0：FAB 配置宿主持久化——vscode webview 重建换 origin 致 localStorage 分区丢失，
+// 「隐藏状态 + 位置 + 设置」改落宿主 fab-config.json，client 经 /agent-api/fab-config 读写，
+// localStorage 降级为副本（宿主通道失败回退，单浏览器行为不回退）
+{
+  const fabCfgSrc = readFileSync(path.join(root, 'lib/fab-config.js'), 'utf8')
+  const hostSrc = readFileSync(path.join(root, 'index.js'), 'utf8')
+  const clientSrc2 = readFileSync(path.join(root, 'lib/client.js'), 'utf8')
+  if (!fabCfgSrc.includes('export function readFabConfig')) throw new Error('v1.6.0: fab-config 缺 readFabConfig')
+  if (!fabCfgSrc.includes('export function mergeFabConfig')) throw new Error('v1.6.0: fab-config 缺 mergeFabConfig')
+  if (!fabCfgSrc.includes('fs.renameSync(tmp, file)')) throw new Error('v1.6.0: fab-config 写盘必须原子（tmp + rename）')
+  if (!hostSrc.includes("pathname === '/agent-api/fab-config'")) throw new Error('v1.6.0: host 缺 GET /agent-api/fab-config')
+  if (!hostSrc.includes("case '/agent-api/fab-config'")) throw new Error('v1.6.0: host 缺 POST /agent-api/fab-config')
+  if (!clientSrc2.includes('fabHostSave')) throw new Error('v1.6.0: client 缺宿主通道写 fabHostSave')
+  if (!clientSrc2.includes('apiGet("/agent-api/fab-config")')) throw new Error('v1.6.0: client 装载应走 apiGet("/agent-api/fab-config")')
+  if (!clientSrc2.includes('fabBootDone')) throw new Error('v1.6.0: client 缺装载期防闪现状态位 fabBootDone')
+  if (!clientSrc2.includes('fabVisibleTouched')) throw new Error('v1.6.0: client 缺装载期开关竞态守卫 fabVisibleTouched')
+  if (!clientSrc2.includes('悬浮球配置宿主通道不可用，已回退 localStorage')) throw new Error('v1.6.0: 宿主通道失败必须告警并明示回退')
+  if (!clientSrc2.includes('悬浮球配置宿主持久化失败（已回退 localStorage）')) throw new Error('v1.6.0: 宿主通道写失败必须告警并明示回退')
+  if (!clientSrc2.includes('fabSettingsMem')) throw new Error('v1.6.0: 悬浮球设置应有内存态（宿主值装载 + localStorage 失效保会话）')
+  if (!clientSrc2.includes('writeFabSettings')) throw new Error('v1.6.0: 设置写路径应统一走 writeFabSettings')
+  if (!clientSrc2.includes('revealFab')) throw new Error('v1.6.0: 缺装载完成统一揭示 revealFab（成功/失败/超时三路）')
+  // 静默吞错清零：FAB 相关 localStorage 读写不再出现裸 catch 空块
+  if (/localStorage\.(getItem|setItem)\([^)]*\)[^\n]*\} catch \(e\) \{\}/.test(clientSrc2)) throw new Error('v1.6.0: FAB localStorage 读写不得静默吞错')
+}
+
+// ── v1.6.0 运行时单元测试：fab-config 字段级合并 + 原子落盘 + 校验 ──
+{
+  const { readFabConfig, mergeFabConfig } = await import(path.join(root, 'lib/fab-config.js'))
+  const tmpFab = mkdtempSync(path.join(os.tmpdir(), 'dad-fab-'))
+  // 无文件 → null（client 回退 localStorage）
+  if (readFabConfig(tmpFab) !== null) throw new Error('v1.6.0: 无 fab-config.json 时 readFabConfig 应返回 null')
+  // 部分字段合并写入 → 不丢已有字段
+  const m1 = mergeFabConfig(tmpFab, { visible: false })
+  if (m1.visible !== false) throw new Error('v1.6.0: merge 应写入 visible:false')
+  const m2 = mergeFabConfig(tmpFab, { pos: { x: 12, y: 34 } })
+  if (m2.visible !== false || m2.pos.x !== 12 || m2.pos.y !== 34) throw new Error('v1.6.0: merge 应字段级合并且不丢已有字段')
+  const m3 = mergeFabConfig(tmpFab, { settings: { tone: 'sky', alpha: 40 } })
+  if (m3.settings.tone !== 'sky' || m3.settings.alpha !== 40) throw new Error('v1.6.0: settings 应写入')
+  // settings 浅合并：新补丁不覆盖未提及旧键
+  const m4 = mergeFabConfig(tmpFab, { settings: { breathe: false } })
+  if (m4.settings.tone !== 'sky' || m4.settings.breathe !== false) throw new Error('v1.6.0: settings 应浅合并保留旧键')
+  // 落盘可读回（version 元数据 + 字段持久）
+  const disk = JSON.parse(rf(path.join(tmpFab, 'fab-config.json'), 'utf8'))
+  if (disk.version !== 1 || disk.visible !== false || disk.pos.x !== 12) throw new Error('v1.6.0: fab-config.json 落盘内容不符')
+  const back = readFabConfig(tmpFab)
+  if (!back || back.visible !== false || back.mode !== undefined || back.pos.y !== 34) throw new Error('v1.6.0: readFabConfig 读回字段不符')
+  // 非法补丁抛错（REST 面透传 400）。
+  // v1.6.0 审查补强：NaN/Infinity pos、>32 键 settings、数组顶层 3 类边界用例
+  const oversizeSettings = {}
+  for (let i = 0; i < 33; i++) oversizeSettings['k' + i] = 1
+  for (const bad of [{ visible: 'yes' }, { mode: 'sometimes' }, { pos: { x: 'a', y: 1 } }, { pos: { x: 1 } }, { settings: { bad: {} } }, { settings: null }, 'not-object',
+    { pos: { x: NaN, y: 1 } }, { pos: { x: 1, y: Infinity } }, { settings: oversizeSettings }, []]) {
+    let threw = false
+    try { mergeFabConfig(tmpFab, bad) } catch { threw = true }
+    if (!threw) throw new Error('v1.6.0: 非法补丁应抛错: ' + JSON.stringify(bad))
+  }
+  // 损坏文件 → null 且不影响后续写入自愈
+  writeFileSync(path.join(tmpFab, 'fab-config.json'), '{corrupt json', 'utf8')
+  if (readFabConfig(tmpFab) !== null) throw new Error('v1.6.0: 损坏 fab-config.json 应按无配置处理（null）')
+  const m5 = mergeFabConfig(tmpFab, { visible: true })
+  if (m5.visible !== true) throw new Error('v1.6.0: 损坏后写入应自愈（merge 应返回 visible:true，实际: ' + JSON.stringify(m5) + '）')
+  const healed = readFabConfig(tmpFab)
+  if (!healed || healed.visible !== true) throw new Error('v1.6.0: 损坏后写入应自愈（读回应含 visible:true，实际: ' + JSON.stringify(healed) + '）')
+  rmSync(tmpFab, { recursive: true, force: true })
+}
+
 console.log(`OK: ${PKG_NAME} v${pkg.version} 一致性链（无内置 Agent）+ ${tools.length} 工具 + /${commands.join('/')} 命令`)

@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.6.0 (2026-09-04)
+
+**悬浮球配置落盘改造**——FAB 的「隐藏状态 + 位置 + 光效设置」原先只写 webview iframe 的 `localStorage`；插件运行在 VS Code webview（`fengze233.dsh-vscode-panel`）中，每次重建窗口/面板都换 `vscode-webview://<uuid>` 顶层 origin，http-origin localStorage 被分区隔离整体丢失，配置随每次重开蒸发。现在配置经宿主半落盘 `$DSH_HOME/data/dsh-agent-dispatch/fab-config.json`，跨 VS Code 重启 / webview 重建 / 端口回退可恢复。
+
+### 新增
+
+- **宿主落盘模块 `lib/fab-config.js`**：`readFabConfig` / `mergeFabConfig`（字段级合并：`visible` / `mode` / `pos` / `settings`，settings 浅合并保留未提及旧键），同步原子写（同目录 `.tmp` + rename，与 agents.json 同机制），校验从严（类型不符抛错 → REST 400 透传），读取只透出已知且类型合法字段，损坏文件 loudly 告警并按无配置处理（下次写入自愈）。
+- **REST 路由**：`GET /agent-api/fab-config`（返回 `{ ok, config }`，无值 `config:null`）+ `POST /agent-api/fab-config`（字段级合并写入），复用既有 `/agent-api` prefix 注册，client 经同源 `apiGet`/`apiPost` 调用，无新增依赖与 inject。
+
+### 修复
+
+- **client 读时序**：宿主值 > `localStorage` > 默认。`mountAgentFab` 增加 boot 装载流程：先按 `localStorage` 同步就位（单浏览器行为不回退），异步拉宿主配置逐字段回放（visible / mode / pos / settings），宿主值镜像回 `localStorage` 保持运行时一致。
+- **防闪现**：装载完成前 FAB 保持 `display:none`，由 boot 统一揭示——否则 VS Code 重开后「已隐藏」的球会先闪现在默认位置再消失。三路保证揭示：宿主响应（含 null）/ 请求失败回退 / 1.5s 超时兜底，宿主卡死也不会丢球；装载期 `poll` / `setFabVisible` 不抢 display。超时后迟到的宿主值仍回放（宿主是权威持久源）。
+- **存量迁移**：宿主无值而 `localStorage` 有的字段，装载后一次性上载（仅一次，防重复写）；升级前的老配置不丢。
+- **竞态守卫**：装载期间用户在面板切换过总开关（`fabVisibleTouched`）则跳过该字段回放与上载——宿主响应已过期，本地值更新且已双写。
+- **消除静默吞错**：FAB 全部 `localStorage` 读写走 `lsGetFab`/`lsSetFab`（失败 `console.warn`）；宿主通道失败区分两类告警——「宿主通道不可用，已回退 localStorage」（读/装载失败）与「宿主持久化失败（已回退 localStorage）」（写失败）；损坏的 `ad-fab-pos`/`ad-fab-settings` JSON 解析失败也告警。
+- **设置写路径统一** `writeFabSettings`：内存态 + `localStorage` 副本 + 宿主通道三写；滑杆连续 input 高频触发时宿主通道 300ms 防抖合并（localStorage 仍逐次落），悬浮球卸载时冲刷防抖残留防丢最后一次改动。
+
+### 验证
+
+- `verify.mjs`：新增 v1.6.0 静态断言（fab-config 原子写、GET/POST 路由、`fabHostSave`/`fabBootDone`/`fabVisibleTouched`/`writeFabSettings`/`revealFab`、两类回退告警文案、FAB localStorage 无裸 catch 空块）+ 运行时单测（无文件 null → 部分合并不丢字段 → settings 浅合并 → 落盘读回 → 7 类非法补丁抛错 → 损坏文件 null + 写入自愈）。
+
 ## 1.5.4 (2026-09-02)
 
 **修复 agent_children 不展示 fresh 策略已完成子代理线程**——fresh/reusePolicy:fresh 或小队专属子代理完成后从 `activeChildren` 移除且从未进入 `childPool`，`agent_children` 无法看到它们，导致不可通过 `agent_dispatch(childId=...)` 定向续聊。

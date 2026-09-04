@@ -168,8 +168,9 @@ dsh plugin --profile <your-profile> add /path/to/dsh-agent-dispatch
 
 ```
 $DSH_HOME/data/dsh-agent-dispatch/
-├── agents.json     # agent list
-├── squads.json     # squad list
+├── agents.json      # agent list
+├── squads.json      # squad list
+├── fab-config.json  # FAB config (hidden state / position / mode / effects)
 └── dispatches.jsonl # decision log (max 2000 lines, auto-rotating)
 ```
 
@@ -243,7 +244,8 @@ $DSH_HOME/data/dsh-agent-dispatch/
 
 ### Floating action ball
 
-- **Position**: bottom-right by default, freely draggable (no edge snap), position in `localStorage` (`ad-fab-pos`).
+- **Position**: bottom-right by default, freely draggable (no edge snap).
+- **Persistence** (v1.6.0): hidden state / position / effect settings are persisted host-side in `fab-config.json` (via `/agent-api/fab-config`), surviving VS Code restarts / webview rebuilds / port fallback; falls back to `localStorage` (`ad-fab-*`) when the host channel is unavailable, and existing `localStorage` values are uploaded once automatically. When multiple clients (e.g. browser + VS Code panel) share the same `$DSH_HOME`, concurrent writes to the same field are last-writer-wins (same for the settings shallow merge; keys not mentioned by the later writer are kept).
 - **Effects**: 8 tones (snow / brand blue / sky / mist purple / cherry / apricot / rainbow / glass), edge glow, breathing effects (`fab-live` white / `done-glow` color), panel opacity 0-100.
 - **Master switch**: main panel "Overview" top "Show FAB" toggle, off forces hidden.
 - **Popup**: opens from the ball center, four card sections (running / recently completed / Agent list / squad list); tap a card to dispatch inline or jump to the subagent session.

@@ -30,6 +30,7 @@ import { Dispatcher } from './lib/dispatch.js'
 import { DEFAULT_SQUADS, renderInstruction, topoLayers } from './lib/squads.js'
 import { SquadRegistry } from './lib/squad-registry.js'
 import { listSkills, skillToAgent, defaultSkillsRoot } from './lib/skill-import.js'
+import { readFabConfig, mergeFabConfig } from './lib/fab-config.js'
 
 export const name = '@kiligzzz/dsh-agent-dispatch'
 
@@ -1125,6 +1126,12 @@ export function apply(ctx, config = {}) {
       if (req.method === 'GET' && pathname === '/agent-api/squads') {
         return send(res, 200, { ok: true, squads: squadRegistry.list() })
       }
+      // v1.6.0：悬浮球配置（隐藏状态/位置/显示模式/设置）——VS Code webview 重建换 origin，
+      // iframe localStorage 分区丢失，配置改由宿主落盘 fab-config.json 恢复。
+      // client 读时序：宿主值 > localStorage > 默认；无值返回 null（client 回退 localStorage）。
+      if (req.method === 'GET' && pathname === '/agent-api/fab-config') {
+        return send(res, 200, { ok: true, config: readFabConfig(dataDir) })
+      }
       if (req.method === 'POST') {
         // v0.8.2：所有 POST 路由合并到同一块。此前这里有两个 if(POST) 块，
         // 第一块 default 分支 404 return 把第二块的 toggle/upsert/remove/import-skill 全吞了。
@@ -1154,6 +1161,12 @@ export function apply(ctx, config = {}) {
             const { agent, warnings } = skillToAgent(defaultSkillsRoot(), body.skillDir)
             await registry.upsert(agent)
             out = { agent: { id: agent.id, name: agent.name }, warnings }
+            break
+          }
+          case '/agent-api/fab-config': {
+            // v1.6.0：悬浮球配置字段级合并写入（visible/mode/pos/settings），原子落盘；
+            // 校验失败 normalizeFabConfig 抛错 → 外层 catch 400 透传错误消息
+            out = { config: mergeFabConfig(dataDir, body) }
             break
           }
           case '/agent-api/history/remove': {
