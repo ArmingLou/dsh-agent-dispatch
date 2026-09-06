@@ -436,7 +436,8 @@ if (!c.includes('recentTtlMin')) throw new Error('v0.9.16: 最近完成展示时
 if (!c.includes('groups.push({ key, head: d, items: [d] })')) throw new Error('v0.9.16: 最近完成应按小队维度聚合（同 viaSquad+parentSessionId 连续行成组）')
 // v0.9.17：四分区卡片化（.ad-fab-box）+ 运行中白光呼吸加速（fab-live）+ 彩虹庆祝/闪光环删除
 if (!c.includes('.ad-fab-box-hd{')) throw new Error('v0.9.17: 四分区应卡片化（.ad-fab-box 标题行整卡折叠）')
-if (!c.includes('classList.toggle("fab-live", arr.length > 0)')) throw new Error('v0.9.17: 运行中应白光呼吸加速（fab-live 类按活跃切换）')
+if (!c.includes('classList.toggle("fab-live", arr.length > 0 && pendingCount === 0)')) throw new Error('v0.9.17: 运行中应白光呼吸加速（fab-live 类按活跃切换；v1.8.0 起待授权时让位）')
+if (!c.includes('fab.classList.toggle("fab-pending", pendingCount > 0)')) throw new Error('v1.8.0: 待授权应有琥珀脉冲（fab-pending 按 permissionPending 切换）')
 if (c.includes('flash-done') || c.includes('ad-fab-flash')) throw new Error('v0.9.17: flash-done 闪光环应已删除')
 // v0.9.22：flex 列容器超高时子项被压扁互叠（实测旧版 34/10/120px 重叠）——全部子项禁压缩改滚动
 if (!c.includes('.ad-fab-pop-body>*{flex:none}')) throw new Error('v0.9.22: 悬浮球弹窗 body 子项应禁压缩（防分区卡片互叠）')
@@ -481,7 +482,7 @@ if (!c.includes('fitFlowLabel(label, labelMax')) throw new Error('v0.9.30: 节�
 // v0.9.30：跳转会话后强制回对话页（用户：agent历史跳转没到对话页面）
 if (!c.includes('function ensureChatView(')) throw new Error('v0.9.30: 应有跳后强制对话页（ensureChatView）')
 if (!c.includes('label !== "对话" && label !== "Chat"')) throw new Error('v0.9.30: ensureChatView 应只认会话头部视图标签栏（对话/Chat）')
-if (!c.includes('ensureChatView(); // v0.9.30：跳后强制回对话页')) throw new Error('v0.9.30: openAgentSession 跳后应调 ensureChatView')
+if (!c.includes('ensureChatView();')) throw new Error('v0.9.30: openAgentSession 跳后应调 ensureChatView')
 // v0.9.29：面板状态跨会话持久化（返回后停在历史页，不重置总览）
 if (!c.includes('const uiState = { tab: "overview", histSub: "agent", histKey: null }')) throw new Error('v0.9.29: 应有模块级面板状态（uiState：tab/histSub/histKey）')
 if (!c.includes('function bindPersistentState(getter, setter)')) throw new Error('v0.9.29: 应有持久化状态绑定器（bindPersistentState）')

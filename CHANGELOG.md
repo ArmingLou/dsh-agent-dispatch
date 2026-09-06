@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.8.0 (2026-09-06)
+
+**主窗口感知「子代理待授权」**——ACP 交互授权（product-subagents 0.4.0/0.4.1）的 UX 闭环：审批弹窗按宿主 scope 设计落在子代理会话界面，主窗口此前无从知晓。本版让主代理环境即时感知有子代理在等权限授权。
+
+### 新增
+- **跨插件事件订阅**：监听 product-subagents 的 `permission-pending` / `permission-resolved`，在 activeChildren entry 上标记/清除 `permissionPending`（REST `/agent-api/active` 透出）。
+- **主代理对话内提示**：pending 时向父级主代理会话 inject 一条不唤醒的用户消息（⏳ 谁在请求什么权限、请提醒用户前往授权）；resolved 后再 inject 结果（✅ 已批准 / ⛔ 已拒绝）。仿宿主 user-approval 的 `agent.inject(createUserMessage)` 同款机制——只入会话不触发回合，主代理空闲时不被烧模型。
+- **独立「待授权」悬浮球**（`mountPermFab`）：有 pending 时屏幕右中位置自动出现琥珀 ⏳ 球 + 红色计数（3s 轮询），点击展开待授权列表（子代理名/权限描述/前往授权 → 点击跳转该子代理会话）；无 pending 自动消失。与主 FAB 完全独立（主 FAB 可隐藏/never 不影响授权球出现）。
+- **FAB/面板增强**：主 FAB 有 pending 时琥珀脉冲光效（fab-pending，优先级高于运行/完成光效，结束后按设置恢复呼吸）；AgentPanel 头部显示「⏳ N 待授权」胶囊；运行中卡片 pending 时徽标变「⏳ 待授权」（点击卡片仍跳转子代理会话）。
+
+### 变更
+- verify.mjs：fab-live 断言随 pending 让位逻辑更新，新增 fab-pending 断言。
+
 ## 1.7.1 (2026-09-06)
 
 **真实链路验证修复：自动换档触发信号改为结构性事件（跨插件）**

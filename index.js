@@ -138,6 +138,25 @@ export function apply(ctx, config = {}) {
   } catch (err) {
     console.error('[dsh-agent-dispatch] product-subagents/submit-ok 订阅失败:', err.message)
   }
+
+  // v1.8.0：ACP 权限审批挂起/决议事件 → 主窗口感知「待授权」
+  // （审批弹窗按宿主 scope 落在子代理会话 UI，主窗口通过 FAB/面板徽标获知）
+  let disposePermPendingListener = () => {}
+  let disposePermResolvedListener = () => {}
+  try {
+    disposePermPendingListener = ctx.on('product-subagents/permission-pending', (info) => {
+      try { dispatcher.markPermissionPending(info ?? {}) } catch (err) {
+        console.error('[dsh-agent-dispatch] markPermissionPending 失败:', err.message)
+      }
+    })
+    disposePermResolvedListener = ctx.on('product-subagents/permission-resolved', (info) => {
+      try { dispatcher.markPermissionResolved(info ?? {}) } catch (err) {
+        console.error('[dsh-agent-dispatch] markPermissionResolved 失败:', err.message)
+      }
+    })
+  } catch (err) {
+    console.error('[dsh-agent-dispatch] permission-pending/resolved 订阅失败（旧版 product-subagents?）:', err.message)
+  }
   const ready = registry.init().catch((error) => {
     console.error('[dsh-agent-dispatch] Agent 注册表初始化失败:', error)
     throw error
@@ -1335,6 +1354,8 @@ export function apply(ctx, config = {}) {
             squadName: squad?.name ?? (viaSquad || null),
             squadEmoji: squad?.emoji ?? '',
             squadRunId: entry?.squadRunId ?? null,
+            // v1.8.0：ACP 权限审批挂起中（主窗口「⏳ 待授权」徽标数据源）
+            permissionPending: entry?.permissionPending ?? null,
           }
         })
         return send(res, 200, { ok: true, active, recent: mergeDispatchHistory(readDispatches(20), new Set(active.map((a) => a.childId).filter(Boolean))) })
@@ -1436,6 +1457,8 @@ export function apply(ctx, config = {}) {
     disposeSessionListener?.()
     disposeSubmitFailedListener?.()
     disposeSubmitOkListener?.()
+    disposePermPendingListener?.()
+    disposePermResolvedListener?.()
     // v1.5.0：清空复用池定时器（驻留子代理的回收由宿主在插件 scope teardown 统一处理）
     try { dispatcher.dispose() } catch { /* ignore */ }
   }
