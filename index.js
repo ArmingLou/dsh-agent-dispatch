@@ -105,6 +105,39 @@ export function apply(ctx, config = {}) {
   } catch (err) {
     console.error('[dsh-agent-dispatch] session/disposed 订阅失败:', err.message)
   }
+
+  // v1.7.1：订阅 product-subagents 的提交失败事件（跨插件事件总线）——relay child
+  // 是 LLM agent，product_submit 工具报错后它会"转达错误"并以 completed 正常结束
+  // 回合，宿主 'subagent/end' 的 stopReason 无法反映产品侧故障（空正文/超时/限流
+  // 耗尽）。product-subagents 0.3.7 起在抛错处 emit 本事件，dispatcher 标记该
+  // child 失败 → onChildEnd 按失败处理（健康冷却 + fallback 链自动换档）。
+  let disposeSubmitFailedListener = () => {}
+  try {
+    disposeSubmitFailedListener = ctx.on('product-subagents/submit-failed', (info) => {
+      try {
+        dispatcher.markChildSubmitFailed(info ?? {})
+      } catch (err) {
+        console.error('[dsh-agent-dispatch] markChildSubmitFailed 失败:', err.message)
+      }
+    })
+  } catch (err) {
+    // 事件名不可用（旧版 product-subagents 无 0.3.7 发射点）→ 降级：
+    // 自动换档退回仅 stopReason==='error' 触发（罕见），不阻塞其余功能
+    console.error('[dsh-agent-dispatch] product-subagents/submit-failed 订阅失败（旧版 product-subagents?）:', err.message)
+  }
+  // v1.7.1：submit-ok 事件清除失败标记（relay child 同一回合内二次提交成功）
+  let disposeSubmitOkListener = () => {}
+  try {
+    disposeSubmitOkListener = ctx.on('product-subagents/submit-ok', (info) => {
+      try {
+        dispatcher.markChildSubmitOk(info ?? {})
+      } catch (err) {
+        console.error('[dsh-agent-dispatch] markChildSubmitOk 失败:', err.message)
+      }
+    })
+  } catch (err) {
+    console.error('[dsh-agent-dispatch] product-subagents/submit-ok 订阅失败:', err.message)
+  }
   const ready = registry.init().catch((error) => {
     console.error('[dsh-agent-dispatch] Agent 注册表初始化失败:', error)
     throw error
@@ -1401,6 +1434,8 @@ export function apply(ctx, config = {}) {
     disposeRoutesSection?.()
     disposeEndListener?.()
     disposeSessionListener?.()
+    disposeSubmitFailedListener?.()
+    disposeSubmitOkListener?.()
     // v1.5.0：清空复用池定时器（驻留子代理的回收由宿主在插件 scope teardown 统一处理）
     try { dispatcher.dispose() } catch { /* ignore */ }
   }

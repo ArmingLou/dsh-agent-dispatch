@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.7.1 (2026-09-06)
+
+**真实链路验证修复：自动换档触发信号改为结构性事件（跨插件）**
+
+1.7.0 的真实验证暴露缺陷：ACP relay child 是 LLM agent——product_submit 工具报错（空正文/超时/限流耗尽）后，它会把错误"转达"并以 `completed` **正常结束回合**，宿主 `subagent/end` 的 stopReason 恒为 completed，`onChildEnd` 的 `stopReason==='error'` 换档条件在真实链路上几乎永不触发；且失败的 deveco 还会被 `recordSuccess` 记成成功。
+
+修复：product-subagents 0.3.7 在 `product_submit` 抛错/成功处向事件总线 emit `product-subagents/submit-failed` / `submit-ok`；dsh-agent-dispatch 1.7.1 订阅事件，`markChildSubmitFailed` 在 activeChildren entry 上打结构性失败标记，`onChildEnd` 时**失败标记优先于回合 stopReason**——completed+失败标记按失败处理（记健康冷却 + 自动换档），`submit-ok` 清除标记防同一回合二次提交成功被误判。
+
+### 变更
+- product-subagents 0.3.7：`lib/tools/product-submit.js` 抛错处 emit `submit-failed`（childId/product/code/message）；成功处 emit `submit-ok`。
+- dsh-agent-dispatch 1.7.1：`index.js` 订阅两事件（带降级：旧版 product-subagents 无发射点时自动换档退回 stopReason==='error'）；`dispatch.js` 新增 `markChildSubmitFailed` / `markChildSubmitOk`；`onChildEnd` 以 `entry._submitFailed` 优先判定成败（日志 result 行带 `productFailed` 字段），换档失败详情用结构化 code/message。
+- 集成冒烟新增真实链路场景：submit-failed 事件 + completed 回合 → 自动换档（7b）；submit-ok 清除 → 不误判（8b/8c）。
+
+## 1.7.0 (2026-09-06)
+
+**运行期路由健康与自动换档（P1/P2）**——routes fallback 从「只在创建期互备」升级为「运行期失败可感知、可冷却、可回归」的档位系统。配合 dsh-plugin-product-subagents 0.3.6（ACP 桥超时/空正文检测/429 熔断）闭环：deveco 等产品运行期故障（429 熔断耗尽/超时/空正文 → 子代理 error 结算）不再需要主代理手动换人，链内自动消化。
+
+### 新增
+
+- **`lib/health.js`（新）Provider 健康状态机**：per (agent, provider) 记录失败计数与冷却（基准 60s、指数退避 ×3、上限 10min、resumeHold 防 flap）；ACP relay 子代理 error 视为 hard failure 立即冷却（relay 无任务逻辑错误，error 只可能来自产品侧）；成功清零。配置经 agent.routing.quality 透传（agents.json 可编辑，agent_upsert 保留）。
+- **P1 新建跳过冷却档**：`health.availableRoutes` 过滤冷却中的 provider 后再建 child——deveco 刚失败时新任务自动落 opencode/deepseek，不再撞同一堵墙；全部冷却时保留原序硬试（宁试不空等，冷却加深自然保护后续轮次）。
+- **P2 同任务自动换档（`onChildEnd` + `#retryOnChildFailure`）**：ACP relay child 以 error 结算时，沿 routes 取失败档之后第一个未冷却的 provider，用同一任务文本自动重新派发（fire-and-forget，带【前情提示】说明前档失败原因）；**fallback 链走完前主代理/squad 收不到失败**——waitResult 场景的 waiter 迁移到换档后的新 child，链内 error 不兑现、最终成功/整链失败才结账；aborted（用户主动取消）不触发换档；换档次数上限 = 档位数-1 防死循环。
+- **P2 轮间向上回归（upgrade 决策）**：续聊命中的 child 档位低于当前最高可用档时，优先改道续聊高档 ready child（零成本、历史完整），无现成 child 则放弃续聊 fall-through 新建高档 + 注入【前情摘要】（低档 child 留池打 keep 保底，LRU 淘汰豁免）。
+- **ACP relay persona 失败语义提示**：product_submit 报错时 relay child 会说明「将自动换档重试，无需重新派发」——避免主代理收到中间失败 notice 后误判停掉子代理。
+- **failover 新 child 继承池位**：换档成功线程入复用池（原线程留池保底），延续任务可续聊成功线程。
+- **创建期失败也记健康**：startContinuable reject（CLI 起不来/握手失败）立即冷却该 provider。
+- 决策日志：`kind:'result'` 行带 provider；换档/回归/冷却跳过各记一行 `note`，全链路可回溯。
+
+### 验证
+
+- `verify.mjs` 一致性链通过；新增 `test-p1p2-smoke.mjs` 集成冒烟（桩化宿主 subagents 全链路驱动：首派成功/error 换档/二次换档/链尾成功/冷却过滤/aborted 不换档/waiter 迁移/升级回归/keep 保底），全部通过。
+
 ## 1.6.0 (2026-09-04)
 
 **悬浮球配置落盘改造**——FAB 的「隐藏状态 + 位置 + 光效设置」原先只写 webview iframe 的 `localStorage`；插件运行在 VS Code webview（`fengze233.dsh-vscode-panel`）中，每次重建窗口/面板都换 `vscode-webview://<uuid>` 顶层 origin，http-origin localStorage 被分区隔离整体丢失，配置随每次重开蒸发。现在配置经宿主半落盘 `$DSH_HOME/data/dsh-agent-dispatch/fab-config.json`，跨 VS Code 重启 / webview 重建 / 端口回退可恢复。
