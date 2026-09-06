@@ -153,6 +153,7 @@ export function apply(ctx, config = {}) {
   // （审批弹窗按宿主 scope 落在子代理会话 UI，主窗口通过 FAB/面板徽标获知）
   let disposePermPendingListener = () => {}
   let disposePermResolvedListener = () => {}
+  let disposeUnknownPermListener = () => {}
   try {
     disposePermPendingListener = ctx.on('product-subagents/permission-pending', (info) => {
       try { dispatcher.markPermissionPending(info ?? {}) } catch (err) {
@@ -164,8 +165,14 @@ export function apply(ctx, config = {}) {
         console.error('[dsh-agent-dispatch] markPermissionResolved 失败:', err.message)
       }
     })
+    // v1.11.1：ACP 未知会话权限异常（无 binding）→ 富日志 + 尽力归属父级可见提示
+    disposeUnknownPermListener = ctx.on('product-subagents/permission-unknown-session', (info) => {
+      try { dispatcher.markUnknownPermission(info ?? {}) } catch (err) {
+        console.error('[dsh-agent-dispatch] markUnknownPermission 失败:', err.message)
+      }
+    })
   } catch (err) {
-    console.error('[dsh-agent-dispatch] permission-pending/resolved 订阅失败（旧版 product-subagents?）:', err.message)
+    console.error('[dsh-agent-dispatch] permission-pending/resolved/unknown-session 订阅失败（旧版 product-subagents?）:', err.message)
   }
 
   // ── v1.10.0：主代理宿主审批自动放行（'approval/request' waterfall，插链头）──
@@ -1474,6 +1481,8 @@ export function apply(ctx, config = {}) {
             taskLabel: entry?.taskLabel ?? '',
             startedAt: entry?.startedAt ?? null,
             parentSessionId: entry?.parentSessionId ?? null,
+            // v1.11.3：远程产品会话尾号（产品侧 submit/permission 事件回传）——多候选归属排查用
+            remoteSessionTail: entry?.remoteSessionId ? String(entry.remoteSessionId).slice(-8) : null,
             viaSquad,
             squadName: squad?.name ?? (viaSquad || null),
             squadEmoji: squad?.emoji ?? '',
@@ -1492,6 +1501,7 @@ export function apply(ctx, config = {}) {
             agentName: p.product ? `${p.product} 子代理` : 'product 子代理',
             emoji: '',
             childId: p.childId,
+            remoteSessionTail: p.remoteSessionId ? String(p.remoteSessionId).slice(-8) : null,
             taskLabel: String(p.description || '请求权限').slice(0, 80),
             startedAt: p.at ?? null,
             parentSessionId: p.parentSessionId ?? null,
@@ -1619,6 +1629,7 @@ export function apply(ctx, config = {}) {
     disposeSubmitOkListener?.()
     disposePermPendingListener?.()
     disposePermResolvedListener?.()
+    disposeUnknownPermListener?.()
     disposeHostApprovalListener?.()
     // v1.5.0：清空复用池定时器（驻留子代理的回收由宿主在插件 scope teardown 统一处理）
     try { dispatcher.dispose() } catch { /* ignore */ }

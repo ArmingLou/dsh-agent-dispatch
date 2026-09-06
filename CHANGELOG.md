@@ -1,3 +1,12 @@
+## 1.11.3（2026-09-07）
+- /agent-api/active 每条透出 remoteSessionTail（产品侧 submit/permission 事件回传的远程会话尾号）；markUnknownPermission 多候选提示列出候选（childId+远程尾号），便于人工对照关闭失配者。
+
+## 1.11.2（2026-09-07）
+- markUnknownPermission 自动关闭升级：deny 风暴（escalated）且该 product 活跃候选唯一时，自动关闭失配子代理（child-closed → 远程立即 dispose、删 binding、不复活），先通知父级「已自动关闭」；首次/偶发与多候选无法判定归属时仅提示（60s 去重），不自动关闭。
+
+## 1.11.1（2026-09-07）
+- 订阅 product-subagents 的 permission-unknown-session 事件（P1 宿主侧挂钩）：Dispatcher.markUnknownPermission——富日志（含 deny 风暴 escalated 标记）+ 按 provider 尽力归属活跃子代理的父级会话注入可见提示（60s 去重）；未知会话无 childId 可路由 UI，匹配不到仅落日志。
+
 ## 1.11.0（2026-09-07）
 
 **relay 子代理生命周期与远程产品会话一致性治理**
