@@ -1,4 +1,29 @@
+## 1.10.2（2026-09-06）
+- 规则粒度对齐：主代理「本会话总是允许/总是允许(项目)」写规则时为每个路径补直接父目录（expandPathsWithParents），对齐 ACP 子代理权限请求 [文件,父目录] 形态——否则子代理无法复用主代理落盘规则（父目录未被覆盖 → 弹窗）。已存在目录不向上补。
+
+## 1.10.1（2026-09-06）
+- 修复：GET /agent-api/host-approval-context 误用 popPendingContext（破坏性弹出），导致客户端先 GET 展示路径后 POST 写规则时上下文已空、规则写入 400 静默失败（点「本会话总是允许/总是允许(项目)」只放行本次、不记忆）。GET 改为 peekPendingContext 非破坏窥视；POST 保持单次 pop。
+
 # Changelog
+
+## 1.10.0 (2026-09-06)
+
+**主代理宿主审批分档自动放行 + 浮球四按钮**
+
+主代理（宿主 ApprovalService 层）的审批请求，除现有「允许一次/拒绝」外新增两个作用域档，按路径规则自动放行：
+
+### 新增
+- **会话级自动放行**：「本会话总是允许」内存规则，键=session id，值=路径规则集合；会话 dispose 时自动清理。命中 → 自动答 `allowed-once`（宿主仍逐条落 approval/asked+decided 审计）。
+- **项目级自动放行**：「总是允许(项目)」落盘共用文件 `$DSH_HOME/data/dsh-plugin-product-subagents/allowlist.json`，键=cwd+路径；与 ACP 层（product-subagents）双向复用——主代理落盘的条目 ACP 层可命中，反之亦然。覆盖判定忽略 product 字段。
+- **浮球四按钮面板**：`lib/client.js` 新增 `mountHostApprovalFab`，通过 `ctx.remote.$on("approval/request")` 接收审批请求，呈现四按钮：允许一次 / 本会话总是允许 / 总是允许(项目) / 拒绝。点击作用域按钮 = 先写规则再放行本次。
+- **REST 端点**：
+  - `GET /agent-api/host-approval-context?callId=&sessionId=` → 审批上下文（toolName, paths[], reason, cwd）
+  - `POST /agent-api/host-approval-rule {scope:'session'|'project', sessionId, callId, cwd}` → 写规则（服务端重取路径，不信任客户端）
+- **规则引擎**：`lib/host-approval.js` 纯函数引擎（normalizeCandidate/pathAllowed/allowlistDecision/extractToolPaths/findToolCallRecord/resolveApprovalContext），语义对齐 product-subagents lib/allowlist.js + lib/user-allowlist.js。
+
+### 变更
+- `index.js`：approval/request prepend 监听暂存解析结果，REST 端点消费；版本升至 1.10.0。
+- `lib/host-approval.js`：重构为共用 allowlist.json（移除独立文件落盘）；HostApprovalRules 类会话规则内存 + 项目规则共用落盘。
 
 ## 1.9.3 (2026-09-06)
 

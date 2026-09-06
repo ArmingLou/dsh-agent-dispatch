@@ -703,4 +703,50 @@ if (!c.includes('uiSubs')) throw new Error('v0.9.29: 持久化状态应有订阅
   rmSync(tmpFab, { recursive: true, force: true })
 }
 
+// v1.10.0：宿主审批分档规则引擎断言
+{
+  const { HostApprovalRules, normalizeCandidate, pathAllowed, allowlistDecision, extractToolPaths } = await import(path.join(root, 'lib/host-approval.js'))
+
+  // normalizeCandidate 基本功能
+  const home = os.homedir()
+  if (normalizeCandidate('~/foo') !== home + '/foo') throw new Error('v1.10.0: normalizeCandidate ~/foo 展开失败')
+  if (normalizeCandidate('/tmp/foo,') !== '/tmp/foo') throw new Error('v1.10.0: normalizeCandidate 去尾逗号失败')
+  if (normalizeCandidate('') !== null) throw new Error('v1.10.0: normalizeCandidate 空字符串应返回 null')
+
+  // pathAllowed 基本功能
+  if (!pathAllowed('/tmp/foo', ['/tmp/foo'])) throw new Error('v1.10.0: pathAllowed 精确匹配失败')
+  if (!pathAllowed('/tmp/foo/bar.txt', ['/tmp/foo/**'])) throw new Error('v1.10.0: pathAllowed 目录前缀匹配失败')
+  if (pathAllowed('/tmp/foobar', ['/tmp/foo/**'])) throw new Error('v1.10.0: pathAllowed 目录边界匹配失败')
+
+  // allowlistDecision 全部命中才放行
+  const d1 = allowlistDecision(['/tmp/a.txt', '/tmp/b.txt'], ['/tmp/**'])
+  if (!d1.allowed) throw new Error('v1.10.0: allowlistDecision 全部命中应放行')
+  const d2 = allowlistDecision(['/tmp/a.txt', '/var/b.txt'], ['/tmp/**'])
+  if (d2.allowed) throw new Error('v1.10.0: allowlistDecision 部分命中不应放行')
+
+  // extractToolPaths 基本功能
+  const p1 = extractToolPaths({ file_path: '/tmp/test.js' })
+  if (!p1.includes('/tmp/test.js')) throw new Error('v1.10.0: extractToolPaths file_path 提取失败')
+  const p2 = extractToolPaths({ command: 'cat /tmp/test.js' })
+  if (!p2.includes('/tmp/test.js')) throw new Error('v1.10.0: extractToolPaths bash command 提取失败')
+
+  // HostApprovalRules 会话规则
+  const engine = new HostApprovalRules(tmp)
+  engine.addSessionRule('test-session', ['/tmp/**'])
+  if (engine.sessionRules('test-session').length !== 1) throw new Error('v1.10.0: HostApprovalRules 会话规则写入失败')
+  engine.purgeSession('test-session')
+  if (engine.sessionRules('test-session').length !== 0) throw new Error('v1.10.0: HostApprovalRules 会话规则清理失败')
+
+  // client.js 包含 v1.10.0 相关代码
+  const clientJs = readFileSync(path.join(root, 'lib/client.js'), 'utf8')
+  if (!clientJs.includes('mountHostApprovalFab')) throw new Error('v1.10.0: client.js 缺少 mountHostApprovalFab 函数')
+  if (!clientJs.includes('host-approval-rule')) throw new Error('v1.10.0: client.js 缺少 host-approval-rule REST 调用')
+  if (!clientJs.includes('host-approval-context')) throw new Error('v1.10.0: client.js 缺少 host-approval-context REST 调用')
+
+  // index.js 包含 v1.10.0 相关端点
+  const indexJs = readFileSync(path.join(root, 'index.js'), 'utf8')
+  if (!indexJs.includes('/agent-api/host-approval-rule')) throw new Error('v1.10.0: index.js 缺少 host-approval-rule 端点')
+  if (!indexJs.includes('/agent-api/host-approval-context')) throw new Error('v1.10.0: index.js 缺少 host-approval-context 端点')
+}
+
 console.log(`OK: ${PKG_NAME} v${pkg.version} 一致性链（无内置 Agent）+ ${tools.length} 工具 + /${commands.join('/')} 命令`)

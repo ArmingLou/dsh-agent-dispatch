@@ -31,6 +31,7 @@ import { DEFAULT_SQUADS, renderInstruction, topoLayers } from './lib/squads.js'
 import { SquadRegistry } from './lib/squad-registry.js'
 import { listSkills, skillToAgent, defaultSkillsRoot } from './lib/skill-import.js'
 import { readFabConfig, mergeFabConfig } from './lib/fab-config.js'
+import { HostApprovalRules, resolveApprovalContext } from './lib/host-approval.js'
 
 export const name = '@kiligzzz/dsh-agent-dispatch'
 
@@ -48,6 +49,11 @@ export function apply(ctx, config = {}) {
   const envIdle = Number(process.env.DSH_AGENT_DISPATCH_IDLE_RELEASE_MS) > 0 ? Number(process.env.DSH_AGENT_DISPATCH_IDLE_RELEASE_MS) : 0
   const idleReleaseMs = cfgIdle || envIdle || undefined
   const dispatcher = new Dispatcher({ ctx, registry, dataDir, ...(idleReleaseMs ? { idleReleaseMs } : {}) })
+
+  // v1.10.0：主代理宿主审批分档规则引擎——「本会话总是允许」（内存，键=session）
+  // 与「总是允许(项目)」（落盘共用 allowlist.json，键=cwd+路径，与 ACP 层双向复用）。
+  // 供下方 'approval/request' prepend 监听自动放行 + REST 写规则端点使用。
+  const hostApproval = new HostApprovalRules(dataDir)
 
   // v1.4.1 执行级递归护栏（v1.5.0 重构）：宿主已删除 registerContinuableSetup，
   // 改为【全局 tools.guard】——按调用方 subagentDepth>=1 在【执行时】拒绝子代理调用
@@ -96,11 +102,15 @@ export function apply(ctx, config = {}) {
 
   // v1.5.0：父会话结束 → 清理该会话的复用池条目（host 已递归回收其 lineage，
   // 这里只清插件侧状态，防内存驻留 + 防孤儿池条目被误复用）。
+  // v1.10.0：同时清理该会话的宿主审批「本会话总是允许」内存规则。
   let disposeSessionListener = () => {}
   try {
     disposeSessionListener = ctx.on('session/disposed', (session) => {
       const sid = session?.id ?? (typeof session === 'string' ? session : null)
-      if (sid) dispatcher.purgeParent(sid)
+      if (sid) {
+        dispatcher.purgeParent(sid)
+        hostApproval.purgeSession(sid)
+      }
     })
   } catch (err) {
     console.error('[dsh-agent-dispatch] session/disposed 订阅失败:', err.message)
@@ -156,6 +166,52 @@ export function apply(ctx, config = {}) {
     })
   } catch (err) {
     console.error('[dsh-agent-dispatch] permission-pending/resolved 订阅失败（旧版 product-subagents?）:', err.message)
+  }
+
+  // ── v1.10.0：主代理宿主审批自动放行（'approval/request' waterfall，插链头）──
+  // 宿主 ApprovalService.request 对每次审批先落 approval/asked 审计，再
+  // ctx.waterfall(scopeTarget(agent), 'approval/request', req, ()=>unavailable)
+  // （dsh-user-approval/lib/index.js:131-192）。waterfall 按注册序串行，listener
+  // 不调 next 直接 return 合法 outcome（'allowed-once'/'rejected'/...）即截断整条
+  // 链——dsh-api-remotes 的客户端转发器（web 面板来源）在其后注册，被截断时
+  // 客户端面板不再弹出。cordis ctx.on 第三参 options.prepend → hooks.unshift
+  // （cordis/lib/index.js:336,371-384），本插件在 profile bundles 中晚于
+  // dsh-base/dsh-web-app 加载，必须 prepend 才能先于 api-remotes 转发器。
+  // dsh-scope 的 scopeTarget 过滤器对无 scope tag 的监听器全局放行
+  // （dsh-scope/lib/index.js:327-337）→ 主会话与子代理会话的宿主审批都会到达。
+  //   规则命中 → return 'allowed-once'（宿主仍逐条落 asked+decided 审计）；
+  //   未命中 / 解析不出路径 / 内部异常 → next() 委托，宿主标准面板照常兜底。
+  let disposeHostApprovalListener = () => {}
+  try {
+    disposeHostApprovalListener = ctx.on('approval/request', (req, next) => {
+      let ctxInfo = null
+      try {
+        const session = req?.agent?.session
+        const sessionId = session?.id
+        if (!sessionId) return next()
+        ctxInfo = resolveApprovalContext({ session, callId: req.callId, toolName: req.toolName, reason: req.reason })
+        // 暂存上下文供 REST 端点查询/写规则（服务端重取路径，不信任客户端）
+        if (req.callId && ctxInfo) {
+          hostApproval.pushPendingContext(req.callId, { ...ctxInfo, sessionId })
+        }
+        // 解析不出路径的请求不参与规则匹配，直接放行到交互层
+        if (ctxInfo.paths.length === 0) return next()
+        const hit = hostApproval.decide({ sessionId, cwd: ctxInfo.cwd, paths: ctxInfo.paths })
+        if (hit.allowed) {
+          console.log(
+            `[dsh-agent-dispatch] 宿主审批自动放行（${hit.scope === 'session' ? '本会话' : '项目'}规则命中）: ` +
+            `tool=${ctxInfo.toolName ?? '?'} session=${sessionId} paths=${ctxInfo.paths.join(', ')}`
+          )
+          return Promise.resolve('allowed-once')
+        }
+      } catch (err) {
+        // 判定内部异常一律委托（fail-open 到交互层，宿主兜底 fail-closed）
+        console.error('[dsh-agent-dispatch] 宿主审批规则判定异常（改为交互审批）:', err.message)
+      }
+      return next()
+    }, { prepend: true })
+  } catch (err) {
+    console.error('[dsh-agent-dispatch] approval/request 订阅失败（宿主审批自动放行不可用）:', err.message)
   }
   const ready = registry.init().catch((error) => {
     console.error('[dsh-agent-dispatch] Agent 注册表初始化失败:', error)
@@ -1343,6 +1399,58 @@ export function apply(ctx, config = {}) {
             }
             break
           }
+          case '/agent-api/host-approval-rule': {
+            // v1.10.0：宿主审批分档规则写入（服务端重取路径，不信任客户端）
+            // body: { scope: 'session'|'project', sessionId, callId?, cwd? }
+            const scope = body && body.scope
+            const sid = body && body.sessionId
+            if (!sid || !['session', 'project'].includes(scope)) {
+              return send(res, 400, { ok: false, error: 'host-approval-rule 需要 scope(session|project) 与 sessionId' })
+            }
+            // 服务端重取路径：按 callId 反查会话记录
+            let approvalCtx = null
+            const callId = body && body.callId
+            if (callId) {
+              // 找到对应 session：审批请求的 agent 绑定 session
+              // 客户端可能传 callId 但无直接 session 引用——
+              // 审批请求来自主会话（宿主审批），sessionId 已知
+              // 尝试从 dispatcher 活跃子代理反查 session
+              // 但主代理审批请求的 session 就是宿主的主会话——
+              // 这里走最简路径：通过 dispatcher 已有 session 引用
+              // 先试从 dispatcher 的 child 反查
+              let session = null
+              for (const [, entry] of dispatcher.activeChildren.entries()) {
+                if (entry?.parentSessionId === sid || entry?.childId === sid) {
+                  session = entry?._parentSession ?? null
+                  break
+                }
+              }
+              // 兜底：直接从宿主取——但宿主 session 不通过 dispatcher 暴露
+              // 实际场景：审批请求在 approval/request handler 里已解析出完整上下文，
+              // 客户端 POST 本端点时不再需要 session（路径已在 handler 解析并暂存）
+              // 方案：approval/request handler 把解析结果暂存到内存 Map；
+              // 客户端可能先 GET context（peek）展示路径后再 POST rule（pop）——
+              // POST 用 pop 取走即删（单次消费），与 GET 的 peek 互不干扰
+              approvalCtx = hostApproval.popPendingContext(callId)
+            }
+            // 优先用暂存上下文（approval/request handler 已解析），否则用 body 中的 cwd
+            const paths = approvalCtx?.paths ?? []
+            const cwd = approvalCtx?.cwd ?? (body && body.cwd) ?? null
+            if (paths.length === 0) {
+              return send(res, 400, { ok: false, error: '无法解析请求路径（可能无 callId 或工具调用记录未落盘）' })
+            }
+            let writeResult
+            if (scope === 'session') {
+              writeResult = hostApproval.addSessionRule(sid, paths)
+            } else {
+              writeResult = hostApproval.appendProjectRule({ cwd, paths, note: '用户在授权球点击总是允许(项目)' })
+            }
+            if (!writeResult.ok) {
+              return send(res, 400, { ok: false, error: writeResult.error || '写入规则失败' })
+            }
+            out = { written: true, scope, paths, count: writeResult.count }
+            break
+          }
           default:
             return send(res, 404, { ok: false, error: 'not found: ' + pathname })
         }
@@ -1455,6 +1563,22 @@ export function apply(ctx, config = {}) {
       if (req.method === 'GET' && pathname === '/agent-api/skills') {
         return send(res, 200, { ok: true, skills: listSkills(defaultSkillsRoot()) })
       }
+      // v1.10.0：宿主审批上下文查询（服务端重取路径，不信任客户端）
+      // ?callId=xxx&sessionId=xxx → {toolName, paths, reason, cwd}
+      if (req.method === 'GET' && pathname === '/agent-api/host-approval-context') {
+        const callId = query.get('callId')
+        const sid = query.get('sessionId')
+        if (!callId && !sid) return send(res, 400, { ok: false, error: '需要 callId 或 sessionId' })
+        // 优先从暂存取（approval/request handler 已解析）——GET 仅窥视不消费，
+        // 让后续 POST host-approval-rule 仍能 pop 到同一上下文（v1.10.1 修复）
+        let approvalCtx = callId ? hostApproval.peekPendingContext(callId) : null
+        if (!approvalCtx) {
+          // 暂存已消费（客户端先 POST rule 再 GET context 的场景）
+          // 返回空上下文
+          approvalCtx = { toolName: null, paths: [], reason: null, cwd: null, callId: callId || null, callFound: false }
+        }
+        return send(res, 200, { ok: true, ...approvalCtx })
+      }
       send(res, 405, { ok: false, error: 'method not allowed' })
     } catch (e) {
       send(res, 400, { ok: false, error: String((e && e.message) || e) })
@@ -1495,6 +1619,7 @@ export function apply(ctx, config = {}) {
     disposeSubmitOkListener?.()
     disposePermPendingListener?.()
     disposePermResolvedListener?.()
+    disposeHostApprovalListener?.()
     // v1.5.0：清空复用池定时器（驻留子代理的回收由宿主在插件 scope teardown 统一处理）
     try { dispatcher.dispose() } catch { /* ignore */ }
   }
