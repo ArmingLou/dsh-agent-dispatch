@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.9.3 (2026-09-06)
+
+**修复：授权球不显示 product_delegate（宿主 product 子代理）的 ACP 权限请求**
+
+真实链路（v16/v17 验证）暴露：`product_delegate` 创建的 deveco/ACP product 子代理读白名单外路径时，子代理侧「申请授权中」、宿主审批弹窗落在其会话界面，但主窗口独立「待授权」悬浮球（授权球）不出现、计数为 0——审批请求"只有入口没有出口"，用户在主窗口无从点选授权球四按钮。
+
+根因：product-subagents 对所有 ACP 子代理统一发 `permission-pending` 事件，但 dsh-agent-dispatch 的 `markPermissionPending` 只查 `activeChildren`（仅覆盖本插件派遣的 agent 子代理），非本插件派遣子代理（product_delegate 等）的挂起被静默丢弃；`/agent-api/active` 因而无其条目，授权球 3s 轮询永远看不到。
+
+### 变更
+- `dispatch.js`：新增 `externalPending` 表（childId → { product, description, paths, cwd, parentSessionId, at }）。`markPermissionPending` 对不在 `activeChildren` 的子代理改为登记 `externalPending`（不再丢弃）；`markPermissionResolved` 决议后清除；`onChildEnd` 子代理终结时同步清理（未决议即结束不残留授权球）。
+- `index.js` `/agent-api/active`：并入 externalPending 合成条目（agentName=`{product} 子代理`、含 `permissionPending`/`parentSessionId`）→ 授权球显示计数、描述与四按钮（允许一次/本会话总是允许/总是允许(项目)/拒绝）；决策端点 `/agent-api/permission-decision` 本就按 childId 转发、无归属检查，按钮对 product 子代理直接生效（双通道竞速照常）。
+
 ## 1.8.0 (2026-09-06)
 
 **主窗口感知「子代理待授权」**——ACP 交互授权（product-subagents 0.4.0/0.4.1）的 UX 闭环：审批弹窗按宿主 scope 设计落在子代理会话界面，主窗口此前无从知晓。本版让主代理环境即时感知有子代理在等权限授权。

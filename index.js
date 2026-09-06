@@ -1327,6 +1327,22 @@ export function apply(ctx, config = {}) {
             }
             break
           }
+          case '/agent-api/permission-decision': {
+            // v1.9.0：授权球按钮决策 → 转发 product-subagents（双通道竞速）
+            // body: { childId, answer: 'allow-once'|'allow-session'|'allow-always'|'deny' }
+            const answer = body && body.answer
+            const target = body && body.childId
+            if (!target || !['allow-once', 'allow-session', 'allow-always', 'deny'].includes(answer)) {
+              return send(res, 400, { ok: false, error: 'permission-decision 需要 childId 与合法 answer' })
+            }
+            try {
+              ctx.emit('product-subagents/permission-decision', { childId: target, answer })
+              out = { forwarded: true, answer }
+            } catch (err) {
+              return send(res, 409, { ok: false, error: err.message })
+            }
+            break
+          }
           default:
             return send(res, 404, { ok: false, error: 'not found: ' + pathname })
         }
@@ -1358,6 +1374,26 @@ export function apply(ctx, config = {}) {
             permissionPending: entry?.permissionPending ?? null,
           }
         })
+        // v1.9.3：非本插件派遣子代理（product_delegate 等宿主 product 子代理）的
+        // ACP 权限挂起 → 授权球合成条目（agentId 用 product 命名空间，决策端点按
+        // childId 转发无归属限制，四按钮直接可用；行点击跳转需其会话在宿主目录中）
+        for (const [, p] of dispatcher.externalPending.entries()) {
+          if (active.some((a) => a.childId === p.childId)) continue
+          active.push({
+            agentId: p.product ? `product:${p.product}` : 'product',
+            agentName: p.product ? `${p.product} 子代理` : 'product 子代理',
+            emoji: '',
+            childId: p.childId,
+            taskLabel: String(p.description || '请求权限').slice(0, 80),
+            startedAt: p.at ?? null,
+            parentSessionId: p.parentSessionId ?? null,
+            viaSquad: null,
+            squadName: null,
+            squadEmoji: '',
+            squadRunId: null,
+            permissionPending: { product: p.product ?? null, description: p.description ?? '未知操作', at: p.at ?? Date.now() },
+          })
+        }
         return send(res, 200, { ok: true, active, recent: mergeDispatchHistory(readDispatches(20), new Set(active.map((a) => a.childId).filter(Boolean))) })
       }
       if (req.method === 'GET' && pathname === '/agent-api/suggest') {
