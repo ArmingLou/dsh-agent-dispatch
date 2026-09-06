@@ -1,3 +1,22 @@
+## 1.11.0（2026-09-07）
+
+**relay 子代理生命周期与远程产品会话一致性治理**
+
+### 新增
+- **关闭即终止**（A）：agent_close 清理后 emit `product-subagents/child-closed` 事件（payload `{ childId, immediate: true }`），product-subagents 订阅后取消空闲定时器 + 立即 dispose 远程会话（closeSession + 进程终止）。
+- **中断语义**（B）：ACP bridge submit 监听 exec.signal abort → closeSession + SIGKILL 终止 in-flight prompt；保留 binding 允许后续 reconnect 冷恢复。抛出 `SUBMIT_ABORTED` 错误。
+- **reconnect 守卫**（C）：product-submit 恢复路径检查 `closedChildren` 集合——已被 child-closed 标记的 childId 抛出 `RECONNECT_BLOCKED` 错误，不再拉起进程。
+- **自动重试同任务去重**（D）：
+  - 新增 `normalizeTaskForDedup(task)` 纯函数：剥离「【前情提示】…」「【全新会话执行指令】…」等重试前缀块，确保原文与重试文本 hash 一致。
+  - 新增 `activeTasks = Map<dedupKey, Set<childId>>`：dispatch 成功时注册，onChildEnd/closeChild 注销。
+  - `#canFailover` 增加同任务活跃兄弟检查——有活跃（running/未结束）兄弟时跳过自动重试，防止三连重复。
+  - 去重键 = `agentId + sha256(normalizeTaskForDedup(task))`。
+- **单测**：`test/dedup.test.js` 覆盖 normalizeTaskForDedup 与 dedupKey（原文、带前情提示、带全新会话指令、多前缀、空文本等场景）。
+
+### 变更
+- `purgeParent` / `dispose` 清理 activeTasks 去重表。
+- closeChild 对运行中 child 也发 child-closed 事件。
+
 ## 1.10.2（2026-09-06）
 - 规则粒度对齐：主代理「本会话总是允许/总是允许(项目)」写规则时为每个路径补直接父目录（expandPathsWithParents），对齐 ACP 子代理权限请求 [文件,父目录] 形态——否则子代理无法复用主代理落盘规则（父目录未被覆盖 → 弹窗）。已存在目录不向上补。
 
