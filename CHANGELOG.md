@@ -1,3 +1,8 @@
+## 1.11.10（2026-09-14）
+- **换档文案按目标档形态生成（修复末档 spawn child 误调 product_submit）**：旧实现把换档前缀硬编码为「${failoverFrom}（ACP 产品）」，当 fallback 链走到末档——末档通常是宿主侧 spawn 路由（deepseek-official 等 LLM 路由，**没有** ACP 产品会话）——spawn child 读到"ACP 产品"语境后仍去调用 product_submit，必然报 `no remote product session is bound to this agent (recovery failed)`，白烧一轮。现改为：来源档按实际形态称「（ACP 产品）/（模型路由）」，目标档非 ACP 时追加「【执行模式】你是宿主侧普通子代理…不要调用 product_submit 或任何产品中继工具」；前缀在 routes 解析之后拼装（新增导出 `buildFailoverTaskText` 纯函数，便于单测）。去重键基于 `entry.task`（原始任务），不受影响。
+- **非 ACP 档失败也参与自动换档**：`#canFailover` / `onChildEnd` 去掉 `entry.acpMode` 前置条件（改为要求 `entry.provider`）——routes 首档是模型路由的 Agent 此前完全拿不到 fallback；末档与换档次数上限由既有档位判定兜底，不会原地自旋。
+- **换档停止不再静默**：失败占位文本新增停止原因（新增私有 `#failoverBlockReason`，仅用于回传诊断、不参与换档决策）——「后续档位全部处于冷却中（60s×3ⁿ，上限 600s）」「已是最末档，无后续路由」「换档次数已达上限」「同任务已有活跃兄弟线程（去重跳过）」，上层不再需要猜测"链走完了"是产品故障还是调度主动停止。
+
 ## 1.11.9（2026-09-07）
 - 拒绝引导改为强指令：下一条 product_submit 的 task 只允许是纯指引原文本身，禁止附加任何标题/解释/重述/格式包装（产品会话保留完整上下文，续聊只需增量）——消除 relay 的过度包装与重述。
 
