@@ -1,3 +1,7 @@
+## 1.11.11（2026-09-18）
+- **修复「追加任务不再续聊、凭空多出一个子代理」（定向续聊 TDZ 回归）**：`const reuseKey` 原本声明在 v1.5.0 复用段（函数体后部），而 v1.5.3 的**定向续聊（childId）**分支在【池外线程】路径（`reuse:'fresh'` 建的孩子／进程重启后插件内存复用池被清空／被 LRU 淘汰／completedFresh 历史线程）上用它拼池键，于是抛 `ReferenceError: Cannot access 'reuseKey' before initialization`。此时 `sendMessage` 其实**已经投递成功**，却被当成"续聊失败"上报，主代理据此改判"续聊不可用"→ 新开子代理，同一任务在两个线程里重复执行。修复：① `reuseKey` 上移到两个分支之前声明；② 定向续聊的 try/catch 只包【投递】——投递成功后的池记账即使出错也按成功处理（`delivered` 标记 + 降级返回），不再把成功报成失败。新增 `test/childid-continuation.test.js`（3 例：池外线程续聊成功并补记池条目／池内线程对照／只有投递失败才算失败），`node --test test/*.test.js` 62/62 通过。
+- 说明：该缺陷自 v1.5.3 起潜伏，**只在"池外线程定向续聊"时命中**——DSH 升级/重启会清空插件内存复用池，使绝大多数"追加任务"落到该路径，因而表现为"升级后就不再续聊了"；并非宿主接口变更。
+
 ## 1.11.10（2026-09-14）
 - **换档文案按目标档形态生成（修复末档 spawn child 误调 product_submit）**：旧实现把换档前缀硬编码为「${failoverFrom}（ACP 产品）」，当 fallback 链走到末档——末档通常是宿主侧 spawn 路由（deepseek-official 等 LLM 路由，**没有** ACP 产品会话）——spawn child 读到"ACP 产品"语境后仍去调用 product_submit，必然报 `no remote product session is bound to this agent (recovery failed)`，白烧一轮。现改为：来源档按实际形态称「（ACP 产品）/（模型路由）」，目标档非 ACP 时追加「【执行模式】你是宿主侧普通子代理…不要调用 product_submit 或任何产品中继工具」；前缀在 routes 解析之后拼装（新增导出 `buildFailoverTaskText` 纯函数，便于单测）。去重键基于 `entry.task`（原始任务），不受影响。
 - **非 ACP 档失败也参与自动换档**：`#canFailover` / `onChildEnd` 去掉 `entry.acpMode` 前置条件（改为要求 `entry.provider`）——routes 首档是模型路由的 Agent 此前完全拿不到 fallback；末档与换档次数上限由既有档位判定兜底，不会原地自旋。
