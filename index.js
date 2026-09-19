@@ -48,7 +48,15 @@ export function apply(ctx, config = {}) {
   const cfgIdle = Number(config.idleReleaseMs) > 0 ? Number(config.idleReleaseMs) : 0
   const envIdle = Number(process.env.DSH_AGENT_DISPATCH_IDLE_RELEASE_MS) > 0 ? Number(process.env.DSH_AGENT_DISPATCH_IDLE_RELEASE_MS) : 0
   const idleReleaseMs = cfgIdle || envIdle || undefined
-  const dispatcher = new Dispatcher({ ctx, registry, dataDir, ...(idleReleaseMs ? { idleReleaseMs } : {}) })
+  // v1.11.12：注入 ACP provider 目录读取器（懒解引用：readProductCatalog 在本函数
+  // 后段才声明，直接传会命中 TDZ）。仅用于派发日志的可疑 model/effort 预检。
+  const dispatcher = new Dispatcher({
+    ctx,
+    registry,
+    dataDir,
+    productCatalog: () => readProductCatalog(),
+    ...(idleReleaseMs ? { idleReleaseMs } : {}),
+  })
 
   // v1.10.0：主代理宿主审批分档规则引擎——「本会话总是允许」（内存，键=session）
   // 与「总是允许(项目)」（落盘共用 allowlist.json，键=cwd+路径，与 ACP 层双向复用）。
@@ -173,6 +181,20 @@ export function apply(ctx, config = {}) {
     })
   } catch (err) {
     console.error('[dsh-agent-dispatch] permission-pending/resolved/unknown-session 订阅失败（旧版 product-subagents?）:', err.message)
+  }
+
+  // v1.11.12：ACP 配置项被产品拒绝 → 落一行观测日志（requested vs effective）。
+  // route 里写错的 model/effort 不会让回合失败（产品沿用自身默认），过去完全不可见；
+  // product-subagents 0.6.x 起在拒绝处 emit 本事件，本插件只记账、不改档不重试。
+  let disposeConfigErrorListener = () => {}
+  try {
+    disposeConfigErrorListener = ctx.on('product-subagents/config-option-error', (info) => {
+      try { dispatcher.logConfigOptionError(info ?? {}) } catch (err) {
+        console.error('[dsh-agent-dispatch] logConfigOptionError 失败:', err.message)
+      }
+    })
+  } catch (err) {
+    console.error('[dsh-agent-dispatch] product-subagents/config-option-error 订阅失败（旧版 product-subagents?）:', err.message)
   }
 
   // ── v1.10.0：主代理宿主审批自动放行（'approval/request' waterfall，插链头）──
@@ -510,7 +532,9 @@ export function apply(ctx, config = {}) {
           triggers: e.triggers,
           enabled: e.enabled !== false,
           reusePolicy: e.reusePolicy === 'fresh' ? 'fresh' : 'reuse',
-          routes: (e.routes || []).map((r) => `${r.provider}/${r.model}`),
+          // v1.11.12：补 effort（旧实现压成 provider/model 丢了档位）；
+          // model 为空（ACP 用产品默认模型）时不拼出 "provider/undefined"
+          routes: (e.routes || []).map((r) => [r.provider, r.model].filter(Boolean).join('/') + (r.effort ? '@' + r.effort : '')),
         })),
       }
     },
@@ -877,7 +901,7 @@ export function apply(ctx, config = {}) {
         return { action: 'list', skills: listSkills(skillsRoot).map((s) => ({ dir: s.name, description: s.description })) }
       }
       const { agent, warnings } = skillToAgent(skillsRoot, args.skillDir)
-      await registry.upsert(agent)
+      await registry.upsert(agent, { isSubagentProvider: isSubagentProviderRoute })
       return { action: 'import', agent: { id: agent.id, name: agent.name, warnings } }
     },
   }))
@@ -904,16 +928,17 @@ export function apply(ctx, config = {}) {
         },
         routes: {
           type: 'array',
-          description: 'Optional model routes; each item {provider, model, effort?}.',
+          description: 'Optional model routes; each item {provider, model?, effort?}. LLM providers (dsh-llm adapters) require a non-empty model; ACP/subagent providers (qoder, deveco, opencode, ...) may omit model or use "default" to mean "use the product\'s own default model".',
           items: {
             type: 'object',
             additionalProperties: false,
             properties: {
               provider: { type: 'string' },
+              // ACP 路由允许空串/缺省 = 用产品默认模型（校验见 lib/agents.js validateRoutes）
               model: { type: 'string' },
               effort: { type: 'string' },
             },
-            required: ['provider', 'model'],
+            required: ['provider'],
           },
         },
         enabled: { type: 'boolean', description: 'Optional enabled flag (default true).' },
@@ -948,7 +973,7 @@ export function apply(ctx, config = {}) {
         routes: args.routes || [],
         enabled: args.enabled !== false,
       }
-      const normalized = await registry.upsert(agent)
+      const normalized = await registry.upsert(agent, { isSubagentProvider: isSubagentProviderRoute })
       return { ok: true, id: normalized.id, name: normalized.name }
     },
   }))
@@ -1116,11 +1141,215 @@ export function apply(ctx, config = {}) {
     } catch { /* ignore */ }
     return providers
   }
+
+  // ── ACP（dsh-plugin-product-subagents）模型目录 ──
+  // provider 级缓存文件由那个插件独占写入，本插件只读。任一环节缺失
+  // （文件不存在 / JSON 损坏 / version 不认识 / 字段形状不符）都按"无 ACP 数据"降级，
+  // 绝不让 /agent-api 报错——GUI 拿不到 ACP 目录时只是下拉退化为手输。
+  const productCatalogPath = path.join(dshHome, 'data', 'dsh-plugin-product-subagents', 'provider-catalog.json')
+  const PRODUCT_CATALOG_TTL_MS = 3000 // 同一 GET 反复命中时免重复 stat/read
+  let productCatalogCache = { at: 0, mtimeMs: -1, size: -1, data: {} }
+  const strArr = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string' && x.trim() !== '') : [])
+  /**
+   * 选项元数据数组净化（v1.11.12 契约增量）：ACP 侧 model/effort 既有 value（要落盘的）
+   * 又有 name（给人看的显示名）。只保留 value 非空字符串的项，name/description 缺失就不落键。
+   */
+  const optArr = (v) => {
+    if (!Array.isArray(v)) return []
+    const out = []
+    const seen = new Set()
+    for (const o of v) {
+      if (!o || typeof o !== 'object') continue
+      const value = typeof o.value === 'string' ? o.value.trim() : ''
+      if (!value || seen.has(value)) continue
+      seen.add(value)
+      const item = { value }
+      if (typeof o.name === 'string' && o.name.trim()) item.name = o.name.trim()
+      if (typeof o.description === 'string' && o.description.trim()) item.description = o.description.trim()
+      out.push(item)
+    }
+    return out
+  }
+  /** 值数组 = 纯 value 列表 ∪ 选项里的 value（保序去重）：只给 options 不给 values 时也能用 */
+  const mergeValues = (values, opts) => {
+    const out = values.slice()
+    for (const o of opts) if (out.indexOf(o.value) < 0) out.push(o.value)
+    return out
+  }
+  /** 读并净化 provider 级缓存：{ [provider]: {models, efforts, modelEfforts, modelOptions?, effortOptions?, modelEffortOptions?, defaultModel?, defaultEffort?, probedAt, error} } */
+  const readProductCatalog = () => {
+    const now = Date.now()
+    if (now - productCatalogCache.at < PRODUCT_CATALOG_TTL_MS) return productCatalogCache.data
+    let stat = null
+    try {
+      stat = fs.statSync(productCatalogPath)
+    } catch {
+      productCatalogCache = { at: now, mtimeMs: -1, size: -1, data: {} } // 文件不存在
+      return productCatalogCache.data
+    }
+    if (stat.mtimeMs === productCatalogCache.mtimeMs && stat.size === productCatalogCache.size) {
+      productCatalogCache = { ...productCatalogCache, at: now }
+      return productCatalogCache.data
+    }
+    let data = {}
+    try {
+      const raw = JSON.parse(fs.readFileSync(productCatalogPath, 'utf8'))
+      if (raw && typeof raw === 'object' && (raw.version === undefined || raw.version === 1) && raw.providers && typeof raw.providers === 'object') {
+        for (const [name, entry] of Object.entries(raw.providers)) {
+          if (!entry || typeof entry !== 'object') continue
+          const modelOpts = optArr(entry.modelOptions)
+          const effortOpts = optArr(entry.effortOptions)
+          const models = mergeValues(strArr(entry.models), modelOpts)
+          const efforts = mergeValues(strArr(entry.efforts), effortOpts)
+          const modelEfforts = {}
+          const modelEffortOptions = {}
+          if (entry.modelEfforts && typeof entry.modelEfforts === 'object') {
+            for (const [mid, list] of Object.entries(entry.modelEfforts)) {
+              const ids = mergeValues(strArr(list), optArr(list)) // 兼容：该键的值数组里混对象形态时按选项净化
+              if (ids.length) modelEfforts[mid] = ids
+            }
+          }
+          if (entry.modelEffortOptions && typeof entry.modelEffortOptions === 'object') {
+            for (const [mid, list] of Object.entries(entry.modelEffortOptions)) {
+              const opts = optArr(list)
+              if (!opts.length) continue
+              modelEffortOptions[mid] = opts
+              // 档位值同样并进来，避免 P 只给 options 时该模型没有可选档位
+              const merged = mergeValues(modelEfforts[mid] || [], opts)
+              modelEfforts[mid] = merged
+            }
+          }
+          const item = { models, efforts }
+          if (Object.keys(modelEfforts).length) item.modelEfforts = modelEfforts
+          if (modelOpts.length) item.modelOptions = modelOpts
+          if (effortOpts.length) item.effortOptions = effortOpts
+          if (Object.keys(modelEffortOptions).length) item.modelEffortOptions = modelEffortOptions
+          // v1.11.12 增量 3：产品自报的"当前默认值"（P 侧从会话 configOptions 的
+          // currentValue 取），GUI 用它把「默认」项写成 默认（glm-5.1）而不是 默认（由 ACP 决定）。
+          // 可选字段：缺失就不落键，老目录形状不变。
+          const cleanDefault = (v) => (typeof v === 'string' && v.trim() ? v.trim() : '')
+          const defModel = cleanDefault(entry.defaultModel)
+          const defEffort = cleanDefault(entry.defaultEffort)
+          if (defModel) item.defaultModel = defModel
+          if (defEffort) item.defaultEffort = defEffort
+          if (typeof entry.probedAt === 'string') item.probedAt = entry.probedAt
+          if (typeof entry.error === 'string' && entry.error.trim()) item.error = entry.error
+          data[name] = item
+        }
+      }
+    } catch {
+      data = {} // 读/解析失败：无 ACP 数据
+    }
+    productCatalogCache = { at: now, mtimeMs: stat.mtimeMs, size: stat.size, data }
+    return data
+  }
+  // 缓存失效：事件到达（缓存刚被那个插件重写）或显式探测请求后
+  const invalidateProductCatalog = () => {
+    productCatalogCache = { at: 0, mtimeMs: -1, size: -1, data: {} }
+  }
+  // product-subagents 写完缓存文件后的通知——只用来失效本插件的读缓存。
+  // 订阅失败（旧版本无此事件）不影响功能：TTL 到期后自然读到新目录。
+  let disposeCatalogListener = () => {}
+  try {
+    disposeCatalogListener = ctx.on('product-subagents/provider-catalog-updated', () => invalidateProductCatalog())
+  } catch (err) {
+    console.error('[dsh-agent-dispatch] provider-catalog-updated 订阅失败（旧版 product-subagents?）:', err.message)
+  }
+
+  /** 已注册的 subagent provider 名（宿主 ctx.subagents.list()）；老宿主无此方法时空数组 */
+  const readSubagentProviders = () => {
+    try {
+      return strArr(ctx.subagents?.list?.())
+    } catch {
+      return []
+    }
+  }
+  /** 路由是否走 ACP 中继（与 lib/dispatch.js 判定一致）——registry 校验用 */
+  const isSubagentProviderRoute = (provider) => {
+    if (typeof provider !== 'string' || provider.trim() === '') return false
+    try {
+      return !!ctx.subagents?.getProvider?.(provider)
+    } catch {
+      return false
+    }
+  }
+
+  // LLM 侧真实推理档位：resolveModelInfo 会调适配器，逐个 provider×model 全量探
+  // 有延迟风险，故做内存缓存 + 单次请求预算（条数上限 + 等待上限），
+  // 超预算的模型本轮不下发档位 → GUI 该档退化为"不选 + 可手输"。
+  const llmEffortCache = new Map() // `${provider}\u0000${model}` → { at, value|null }
+  const LLM_EFFORT_TTL_MS = 300000
+  const LLM_EFFORT_PROBE_BUDGET = 24
+  const LLM_EFFORT_WAIT_MS = 1200
+  const llmEffortInflight = new Set()
+  const llmEffortKey = (p, m) => `${p}\u0000${m}`
+  const probeLlmEfforts = (provider, model) => {
+    const key = llmEffortKey(provider, model)
+    const hit = llmEffortCache.get(key)
+    if (hit && Date.now() - hit.at < LLM_EFFORT_TTL_MS) return Promise.resolve(hit.value)
+    if (llmEffortInflight.has(key)) return Promise.resolve(null)
+    llmEffortInflight.add(key)
+    return (async () => {
+      try {
+        const llm = ctx.get('llm')
+        if (!llm || typeof llm.resolveModelInfo !== 'function') return null
+        const info = await llm.resolveModelInfo(provider, model)
+        const ids = strArr((info?.reasoning?.efforts || []).map((e) => (typeof e === 'string' ? e : e?.id)))
+        if (!ids.length) return null
+        const def = info?.reasoning?.defaultEffort
+        return { efforts: ids, ...(typeof def === 'string' && def ? { defaultEffort: def } : {}) }
+      } catch {
+        return null // 适配器不支持/抛错：该模型无档位可枚举
+      }
+    })()
+      .then((value) => {
+        llmEffortCache.set(key, { at: Date.now(), value })
+        return value
+      })
+      .finally(() => llmEffortInflight.delete(key))
+  }
+  /** 按模型目录收集 LLM 档位：{ [provider]: { [model]: {efforts, defaultEffort?} } } */
+  const readLlmEfforts = async (modelOptions) => {
+    const out = {}
+    const take = (provider, model, value) => {
+      out[provider] = out[provider] || {}
+      out[provider][model] = value
+    }
+    const pending = []
+    for (const [provider, models] of Object.entries(modelOptions || {})) {
+      for (const model of strArr(models)) {
+        const hit = llmEffortCache.get(llmEffortKey(provider, model))
+        if (hit && Date.now() - hit.at < LLM_EFFORT_TTL_MS) {
+          if (hit.value) take(provider, model, hit.value)
+          continue
+        }
+        if (pending.length < LLM_EFFORT_PROBE_BUDGET) pending.push(probeLlmEfforts(provider, model).then((v) => (v ? take(provider, model, v) : undefined)))
+      }
+    }
+    if (pending.length) {
+      // 超时只放弃"本轮等待"，探测本身继续跑完并落缓存，下次 GET 即命中
+      await Promise.race([
+        Promise.allSettled(pending),
+        new Promise((resolve) => {
+          const t = setTimeout(resolve, LLM_EFFORT_WAIT_MS)
+          t.unref?.()
+        }),
+      ])
+    }
+    return out
+  }
+
   const readDefaultModel = () => {
     try {
       const settings = ctx.get('settings')
       const d = settings?.get?.('agent-default-model') ?? settings?.get?.('default-model')
-      if (d && typeof d === 'object') return d
+      // 只认 provider 与 model 都非空的对象：GUI 直接拼 provider/model，
+      // 半截对象（settings 里 {} 或只配了一侧）会渲染成 "undefined / xxx"。
+      if (
+        d && typeof d === 'object' &&
+        typeof d.provider === 'string' && d.provider.trim() !== '' &&
+        typeof d.model === 'string' && d.model.trim() !== ''
+      ) return d
     } catch { /* ignore */ }
     return null
   }
@@ -1179,6 +1408,9 @@ export function apply(ctx, config = {}) {
     const pending = new Map() // childId → 最近未匹配的派遣行下标（按时间正序推进）
     for (let i = merged.length - 1; i >= 0; i--) {
       const r = merged[i]
+      // v1.11.12：kind:'config' 是「配置项被产品拒绝」的观测行，不是一次委派——
+      // 只留档供 grep/排障，不参与 result 配对，也不进历史页卡片。
+      if (r.kind === 'config') { merged[i] = null; continue }
       if (r.kind === 'result') {
         if (r.childId && pending.has(r.childId)) {
           const j = pending.get(r.childId)
@@ -1227,12 +1459,20 @@ export function apply(ctx, config = {}) {
       const query = new URL(req.url || '/', 'http://x').searchParams
       await Promise.all([ready, squadsReady])
       if (req.method === 'GET' && pathname === '/agent-api') {
+        const models = await readModelOptions()
         return send(res, 200, {
           ok: true,
           dataDir: tildify(dataDir),
           agents: registry.list(),
-          models: await readModelOptions(),
+          models,
           defaultModel: readDefaultModel(),
+          // ACP 侧数据面（GUI 唯一来源，事件不会转发到 web）：
+          // subagentProviders = 宿主已注册 subagent provider 名；
+          // productModels = product-subagents 落盘的 provider 级模型/档位缓存（只读）。
+          // 刻意不并入 models：混进去会让前端 onProviderChange 误判并清空 model。
+          subagentProviders: readSubagentProviders(),
+          productModels: readProductCatalog(),
+          llmEfforts: await readLlmEfforts(models),
         })
       }
       if (req.method === 'GET' && pathname === '/agent-api/dispatches') {
@@ -1263,9 +1503,23 @@ export function apply(ctx, config = {}) {
             out = { updated: await squadRegistry.setEnabled(body.id, body.enabled) }
             break
           case '/agent-api/upsert':
-            await registry.upsert(body.agent)
+            await registry.upsert(body.agent, { isSubagentProvider: isSubagentProviderRoute })
             out = {}
             break
+          // ACP 模型目录刷新：只发探测请求，绝不在本请求里等探测完成
+          //（探测可能起子进程、冷启动数秒）。完成后那个插件重写缓存文件并发
+          // provider-catalog-updated 事件，本插件失效内存缓存，GUI 再 GET 即拿到新目录。
+          case '/agent-api/probe-product-models': {
+            const provider = typeof body.provider === 'string' && body.provider.trim() ? body.provider.trim() : undefined
+            invalidateProductCatalog()
+            try {
+              ctx.emit('product-subagents/probe-provider', { ...(provider ? { provider } : {}), reason: 'gui-agent-form' })
+            } catch (err) {
+              return send(res, 200, { ok: true, accepted: false, error: '探测请求发送失败: ' + (err?.message || String(err)) })
+            }
+            out = { accepted: true, ...(provider ? { provider } : {}) }
+            break
+          }
           case '/agent-api/remove':
             out = { removed: await registry.remove(body.id) }
             break
@@ -1274,7 +1528,7 @@ export function apply(ctx, config = {}) {
             break
           case '/agent-api/import-skill': {
             const { agent, warnings } = skillToAgent(defaultSkillsRoot(), body.skillDir)
-            await registry.upsert(agent)
+            await registry.upsert(agent, { isSubagentProvider: isSubagentProviderRoute })
             out = { agent: { id: agent.id, name: agent.name }, warnings }
             break
           }
@@ -1630,6 +1884,8 @@ export function apply(ctx, config = {}) {
     disposePermPendingListener?.()
     disposePermResolvedListener?.()
     disposeUnknownPermListener?.()
+    disposeConfigErrorListener?.()
+    disposeCatalogListener?.()
     disposeHostApprovalListener?.()
     // v1.5.0：清空复用池定时器（驻留子代理的回收由宿主在插件 scope teardown 统一处理）
     try { dispatcher.dispose() } catch { /* ignore */ }

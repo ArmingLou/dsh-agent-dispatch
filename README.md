@@ -205,7 +205,13 @@ $DSH_HOME/data/dsh-agent-dispatch/
 ```
 
 - `routes`：模型优先级表，首个失败自动换下一个；留空继承主会话当前模型。
-- `effort`：`minimal/low/medium/high/xhigh/max`（xhigh/max 底层钳到 high）。
+- `provider` 两类（v1.11.12 起 GUI 表单同时可选，运行期按 `ctx.subagents.getProvider` 判定）：
+  - **LLM 路由**（宿主 dsh-llm 适配器，如 `deepseek-official`）：`model` 必填；
+  - **ACP 产品路由**（`dsh-plugin-product-subagents` 注册，如 `qoder`/`deveco`/`opencode`）：`model` 可省略或填 `default`，语义是"用产品自己的默认模型"。
+- `effort`：取值域由该 provider/model 决定——LLM 侧来自适配器上报（`llm.resolveModelInfo().reasoning.efforts`），ACP 侧来自产品目录（`product-subagents` 的 `provider-catalog.json`）；留空 = 不指定，用模型/产品默认档位。面板下拉即按此动态生成，拿不到目录时退化为手输。
+- 面板的「刷新 ACP 模型目录」向 `product-subagents` 发一条探测请求（立即返回，不等探测完成），完成后自动重取。ACP 目录未探测或探测失败时，该行的 model / effort 都是可手输输入框（附候选提示），不会把你锁死在下拉里。
+- **下拉显示的是产品自报名，落盘的仍是可执行值**：产品目录除 `models`/`efforts` 外还可带 `modelOptions`/`effortOptions`/`modelEffortOptions`（`[{value,name?,description?}]`），选项文本用 `name`（没有就退回 `value`）、`description` 作悬停提示，但**写进 `agents.json` 的永远是 `value`**（也就是能直接喂给 ACP `session/set_config_option` 的那个字符串）。
+- **填了不生效不会静默**：`model`/`effort` 写错（provider 对、值不在目录里）时任务照常跑——产品侧按自己的默认值继续，插件不会因此失败，也不会改写你的配置；面板会标「不在模型表中，可能不生效」，`data/dsh-agent-dispatch/dispatches.jsonl` 里该次派发记 `configNote`（可疑值）与 `effort` 字段，产品真正拒绝时另记一行 `kind:"config"`（`requested` 请求值 → `effective` 实际生效值，来自 `product-subagents/config-option-error` 事件；这类行不是一次委派，历史页不展示，供 grep 排障）。注意：配置变更只对**新开**的子代理线程生效，已驻留续聊的线程沿用其创建时的设置。
 - `reusePolicy`（v1.5.0；v1.5.1 起 `reuse` 为智能复用）：`reuse`（默认）= auto 智能判断——延续上一任务（续写词/相同文件术语）时复用同一子代理，独立新任务自动新开（`agent_dispatch` 可用 `reuse:"reuse"/"fresh"` 显式覆盖）；`fresh` = 每次委派独立新开子代理（适合探索型角色）。省略/缺省按 `reuse`。
 - 改动保存即生效，**免重启**（下一轮对话即生效）。
 

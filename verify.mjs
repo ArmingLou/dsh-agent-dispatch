@@ -733,7 +733,9 @@ if (!c.includes('uiSubs')) throw new Error('v0.9.29: 持久化状态应有订阅
   // HostApprovalRules 会话规则
   const engine = new HostApprovalRules(tmp)
   engine.addSessionRule('test-session', ['/tmp/**'])
-  if (engine.sessionRules('test-session').length !== 1) throw new Error('v1.10.0: HostApprovalRules 会话规则写入失败')
+  // v1.10.2 起 addSessionRule 会补直接父目录（['/tmp/**','/tmp']），故按内容断言而非条数
+  const sessRules = engine.sessionRules('test-session')
+  if (!sessRules.includes('/tmp/**') || !sessRules.includes('/tmp')) throw new Error('v1.10.0: HostApprovalRules 会话规则写入失败')
   engine.purgeSession('test-session')
   if (engine.sessionRules('test-session').length !== 0) throw new Error('v1.10.0: HostApprovalRules 会话规则清理失败')
 

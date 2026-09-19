@@ -14,3 +14,6 @@ data/
 .squads/
 *.bak-before-*
 *.tgz
+
+# CLI 本地权限/会话产物
+.qoder/
