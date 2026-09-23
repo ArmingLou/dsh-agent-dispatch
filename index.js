@@ -26,7 +26,7 @@ import path from 'node:path'
 import os from 'node:os'
 import fs from 'node:fs'
 import { AgentRegistry } from './lib/agents.js'
-import { Dispatcher } from './lib/dispatch.js'
+import { Dispatcher, serializePermissionPending as permPending } from './lib/dispatch.js'
 import { DEFAULT_SQUADS, renderInstruction, topoLayers } from './lib/squads.js'
 import { SquadRegistry } from './lib/squad-registry.js'
 import { listSkills, skillToAgent, defaultSkillsRoot } from './lib/skill-import.js'
@@ -1646,15 +1646,18 @@ export function apply(ctx, config = {}) {
           }
           case '/agent-api/permission-decision': {
             // v1.9.0：授权球按钮决策 → 转发 product-subagents（双通道竞速）
-            // body: { childId, answer: 'allow-once'|'allow-session'|'allow-always'|'deny' }
+            // body: { childId, permId?, answer: 'allow-once'|'allow-session'|'allow-always'|'deny' }
+            // v1.11.14(A)：permId 精确决议某一条；缺省（老 client）时由
+            // product-subagents 按 FIFO 摘最早一条，不会丢请求。
             const answer = body && body.answer
             const target = body && body.childId
             if (!target || !['allow-once', 'allow-session', 'allow-always', 'deny'].includes(answer)) {
               return send(res, 400, { ok: false, error: 'permission-decision 需要 childId 与合法 answer' })
             }
+            const permId = typeof body.permId === 'string' && body.permId.trim() ? body.permId.trim() : null
             try {
-              ctx.emit('product-subagents/permission-decision', { childId: target, answer })
-              out = { forwarded: true, answer }
+              ctx.emit('product-subagents/permission-decision', { childId: target, permId, answer })
+              out = { forwarded: true, answer, permId }
             } catch (err) {
               return send(res, 409, { ok: false, error: err.message })
             }
@@ -1742,19 +1745,27 @@ export function apply(ctx, config = {}) {
             squadEmoji: squad?.emoji ?? '',
             squadRunId: entry?.squadRunId ?? null,
             // v1.8.0：ACP 权限审批挂起中（主窗口「⏳ 待授权」徽标数据源）
-            permissionPending: entry?.permissionPending ?? null,
+            // v1.11.14(A)：改为按请求逐条。permissionPending 保留"最早未决那条"
+            // 的旧对象形态（老 client 只认这个字段，行为等同改前），
+            // permissionPendingList 是新 client 用来一请求渲染一行的全量数组。
+            ...permPending(entry?.permissionPending),
           }
         })
         // v1.9.3：非本插件派遣子代理（product_delegate 等宿主 product 子代理）的
         // ACP 权限挂起 → 授权球合成条目（agentId 用 product 命名空间，决策端点按
         // childId 转发无归属限制，四按钮直接可用；行点击跳转需其会话在宿主目录中）
-        for (const [, p] of dispatcher.externalPending.entries()) {
-          if (active.some((a) => a.childId === p.childId)) continue
+        for (const [childIdKey, records] of dispatcher.externalPending.entries()) {
+          const rows = Array.isArray(records) ? records : [records] // 兼容旧结构（单对象）
+          if (rows.length === 0) continue
+          const p = rows[0]
+          const childId = (p && p.childId) || childIdKey
+          if (!childId || !p) continue
+          if (active.some((a) => a.childId === childId)) continue
           active.push({
             agentId: p.product ? `product:${p.product}` : 'product',
             agentName: p.product ? `${p.product} 子代理` : 'product 子代理',
             emoji: '',
-            childId: p.childId,
+            childId,
             remoteSessionTail: p.remoteSessionId ? String(p.remoteSessionId).slice(-8) : null,
             taskLabel: String(p.description || '请求权限').slice(0, 80),
             startedAt: p.at ?? null,
@@ -1763,7 +1774,8 @@ export function apply(ctx, config = {}) {
             squadName: null,
             squadEmoji: '',
             squadRunId: null,
-            permissionPending: { product: p.product ?? null, description: p.description ?? '未知操作', at: p.at ?? Date.now() },
+            permissionPending: null,
+            ...permPending(rows),
           })
         }
         return send(res, 200, { ok: true, active, recent: mergeDispatchHistory(readDispatches(20), new Set(active.map((a) => a.childId).filter(Boolean))) })
