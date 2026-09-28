@@ -57,6 +57,8 @@ test('禁用的 Agent 不出现在花名册条目里', () => {
   const text = renderRoster([senior, { ...reviewer, enabled: false }])
   assert.ok(hasRow(text, 'senior-dev'))
   assert.ok(!hasRow(text, 'final-reviewer'), '禁用者不应有条目行')
+  // 契约：禁用者是"整行不出现"，而不是"出现但带已禁用标记"——本表只列可委派的角色
+  assert.doesNotMatch(text, /已禁用/)
   assert.match(renderRoster([{ ...senior, enabled: false }]), /当前没有启用中的 Agent/)
 })
 
