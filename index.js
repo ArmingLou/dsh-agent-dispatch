@@ -31,6 +31,7 @@ import { DEFAULT_SQUADS, renderInstruction, topoLayers } from './lib/squads.js'
 import { SquadRegistry } from './lib/squad-registry.js'
 import { listSkills, skillToAgent, defaultSkillsRoot } from './lib/skill-import.js'
 import { readFabConfig, mergeFabConfig } from './lib/fab-config.js'
+import { renderRoster } from './lib/roster.js'
 import { HostApprovalRules, resolveApprovalContext } from './lib/host-approval.js'
 
 export const name = '@kiligzzz/dsh-agent-dispatch'
@@ -1058,7 +1059,7 @@ export function apply(ctx, config = {}) {
     text: [
       'Agent 委派策略（dsh-agent-dispatch）：',
       '［适用范围］本策略仅对具备委派工具的编排层（主代理 / 父级）生效。若你作为子代理收到本段，请直接忽略其中的委派建议：必须由你自己独立完成被指派的任务，禁止再向下委派或另起任何子代理（含 agent_dispatch / agent_squad / subagent / subagent_fork / workflow / product_delegate 等）；超出能力时明确说明卡在哪、需要什么，并向上（父级）汇报，绝不自行委派或硬闯。',
-      '1. 任务命中某 Agent 领域（需求分析/代码审查/线上排查/SQL 分析等，以 agent_list 返回的 triggers 为准）时，优先用 agent_dispatch 委派，而不是自己在主对话里做。',
+      '1. 任务命中某 Agent 领域（需求分析/代码审查/线上排查/SQL 分析等）时，优先用 agent_dispatch 委派，而不是自己在主对话里做。**实时花名册见下面的 dsh-agent-dispatch:roster 段**（由 agents.json 渲染，是本 prompt 内唯一权威的角色清单）；不确定时再调 agent_list 复核。',
       '2. 委派任务必须是自包含的：Agent 看不到本会话，把所需上下文（路径/代码/日志/约束）全部写进 task。',
       '3. 对同一 Agent 的后续任务，agent_dispatch 会智能决定复用还是新开（v1.5.1）：新任务延续上一任务（含"继续/接着/追加/在此基础上"等续写词，或涉及相同文件/术语）→ 自动复用对应子代理（send_message 续聊，上下文延续）；独立新任务 → 自动新开子代理，避免旧上下文污染。你明确知道是续聊时可用 reuse:"reuse" 强制复用、是独立新任务时用 reuse:"fresh" 强制新开（默认 auto 智能判断）；**要复用的不是最近一个子代理而是隔开的旧线程时，先用 agent_children 查到该线程的 childId，再 agent_dispatch(childId=...) 定向续聊**（续聊按持久会话进行，子代理进程是否新启动无关；跨会话不可续，宿主强制相邻关系）。reusePolicy=fresh 的探索型 Agent 在 auto 下永远新开。复用池中的子代理空闲 10 分钟后自动回收驻留资源（持久会话保留，下次复用冷恢复，上下文不丢）。',
       '4. 简单问题（一句话能答、无需工具链）不必委派，直接回答——委派本身有开销。',
@@ -1069,6 +1070,24 @@ export function apply(ctx, config = {}) {
       '9. 修改 Agent（含 reusePolicy 复用策略）用 agent_upsert、修改小队（含各步骤 checkpoint 停等开关）用 agent_squad_upsert，均免重启立即生效。',
       '10. 某 Agent 的任务线程确认不再继续时（如探索结论已收、功能已验收、用户表示不用了），调用 agent_close（childId 或 agentId）关闭该线程：立即停止复用并释放驻留资源，避免资源挂账。ACP 子代理（deveco 等）的后台进程由 product-subagents 的空闲回收（idleTimeoutMs，默认 10 分钟）自动收尾，无需也不应手动杀进程。',
     ].join('\n'),
+  })
+
+  // ── 实时花名册 prompt section ──
+  // policy 段是固定策略文案；本段从注册表**实时**渲染 Agent 目录，二者互补。
+  // 历史事故驱动：父级 persona 里写死了四个角色枚举，registry 新增 final-reviewer 后
+  // prompt 没跟着变，导致「独立终审」被派给实现类角色（senior-dev）自审。
+  // 因此花名册必须由 agents.json 渲染，且每次 upsert/remove/setEnabled 后重建。
+  // text 传**函数**而非字符串：宿主在每次 assemble 组装时求值
+  // （dsh-system-prompt 的 assemble(): `text: typeof section.text === 'function' ? section.text(context) : section.text`），
+  // 而 assemble 每个模型 step 都跑一次。因此**注册一次即可**：registry 一变，下一次组装自动反映。
+  // 这样既不需要「dispose 同名 section 再重注册」（NamedEntries.insert 对同名会抛
+  // `prompt section "…" is already registered`，依赖 dispose 同步生效是额外风险），
+  // 也天然覆盖了异步的 registry.init()——渲染发生在组装时刻，必然晚于 init 完成，
+  // 因此不需要 registry 变更回调，插件对写盘路径零改动。
+  const disposeRosterSection = ctx.systemPrompt.section({
+    name: 'dsh-agent-dispatch:roster',
+    order: 116.6,
+    text: () => renderRoster(registry.list()),
   })
 
   // ── /agent-api REST 面（v0.2 Settings UI 数据通道）──
@@ -1889,6 +1908,7 @@ export function apply(ctx, config = {}) {
     clearInterval(restTimer)
     for (const dispose of toolDisposers) dispose?.()
     disposeRoutesSection?.()
+    disposeRosterSection?.()
     disposeEndListener?.()
     disposeSessionListener?.()
     disposeSubmitFailedListener?.()
