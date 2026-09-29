@@ -34,7 +34,7 @@ if (!clientJs.includes('window.__ModuleLoader__.load')) errors.push('lib/client.
 if (!clientJs.includes("id: '@kiligzzz/dsh-agent-dispatch'")) errors.push('lib/client.js ModuleLoader id 必须是裸包名 @kiligzzz/dsh-agent-dispatch')
 
 // 4. 关键文件存在
-for (const f of ['index.js', 'lib/client.js', 'lib/agents.js', 'lib/dispatch.js', 'lib/defaults.js', 'lib/squads.js', 'lib/squad-registry.js', 'lib/skill-import.js', 'lib/fab-config.js', 'README.md', 'CHANGELOG.md', 'LICENSE']) {
+for (const f of ['index.js', 'lib/client.js', 'lib/agents.js', 'lib/dispatch.js', 'lib/defaults.js', 'lib/squads.js', 'lib/squad-registry.js', 'lib/skill-import.js', 'lib/fab-config.js', 'lib/json-safe.js', 'README.md', 'CHANGELOG.md', 'LICENSE']) {
   if (!existsSync(path.join(root, f))) errors.push(`缺文件: ${f}`)
 }
 
@@ -46,10 +46,10 @@ process.env.DSH_HOME = tmp
 const mod = await import(path.join(root, 'index.js'))
 if (mod.name !== PKG_NAME) errors.push(`模块导出 name 应为 ${PKG_NAME}，实际 ${mod.name}`)
 if (!Array.isArray(mod.inject) || mod.inject.length === 0) errors.push('inject 数组缺失')
-const tools = [], sections = [], commands = []
+const tools = [], toolDefs = [], sections = [], commands = []
 const ctx = {
   tools: {
-    register: d => { tools.push(d.name); return () => {} },
+    register: d => { tools.push(d.name); toolDefs.push(d); return () => {} },
     // v1.5.0：apply 挂全局递归护栏（tools.guard）+ 动态 deny 名单读取（tools.view）
     guard: () => () => {},
     view: () => ({ knownNames: [] }),
@@ -67,6 +67,17 @@ for (const t of ['agent_dispatch', 'agent_followup', 'agent_close', 'agent_child
   if (!tools.includes(t)) errors.push(`apply 未注册工具 ${t}`)
 }
 if (commands.includes('agent')) errors.push('v0.9.37: /agent 命令应已删除')
+// v1.11.21（行为级）：注册进来的工具**全部**必须带 jsonSafe 收口标记——数量从实际注册
+// 结果数出，不写死、也不靠源码字符串匹配（终审实测：多行写法的裸注册能骗过字符串护栏，
+// 但骗不过标记）。任一新工具忘了走 registerTool，这里立刻红。
+{
+  const marked = toolDefs.filter(d => d && d[mod.JSON_SAFE_MARK] === true)
+  if (typeof mod.JSON_SAFE_MARK !== 'symbol') errors.push('v1.11.21: index.js 应导出 JSON_SAFE_MARK（工具出参收口标记）')
+  if (marked.length !== toolDefs.length) {
+    errors.push(`v1.11.21: 有 ${toolDefs.length - marked.length} 个工具绕过了 jsonSafe 收口（未带 JSON_SAFE_MARK）: ${toolDefs.filter(d => !d || d[mod.JSON_SAFE_MARK] !== true).map(d => d && d.name).join(', ')}`)
+  }
+  if (toolDefs.length !== 10) errors.push(`v1.11.21: 工具数应为 10，实际 ${toolDefs.length}`)
+}
 const reg = JSON.parse(rf(path.join(tmp, 'data', 'dsh-agent-dispatch', 'agents.json'), 'utf8'))
 // v1.1：不再预置任何内置 Agent，全新安装从空列表开始
 if (!Array.isArray(reg.agents) || reg.agents.length !== 0) errors.push(`v1.1: agents.json 应为空数组，实际 ${reg.agents?.length ?? '非数组'} 个`)
@@ -108,6 +119,23 @@ if (!host.includes('mergeDispatchHistory')) throw new Error('v0.7.1: 缺真实�
 if (!host.includes('next.squadName = sq?.name')) throw new Error('v0.9.16: mergeDispatchHistory 应按 viaSquad 回填小队名')
 // v0.9.35：label 在Agent名后拼 squadMark（S{n}/{total}）——断言 squadMark 构造与拼接逻辑存在
 const dispatchSrc = readFileSync(path.join(root, 'lib/dispatch.js'), 'utf8')
+// v1.11.21（dsh 0.2.0-rc.1 兼容）：listChildren 返回的 SubagentCatalogEntry 没有
+// activity 字段（带 activity 的是 listDescendants 的目录行）；直接读 en.activity
+// 会恒为 undefined → 非运行中线程被误报成 ready。
+// 这里只保留一条**源码级**兜底（赋值形态匹配，避免把解释缺陷的注释误判）；真正的
+// 行为断言在下方"v1.11.21 运行时单元测试"块里用假宿主实跑 listChildren。
+if (/\.status\s*=\s*en\.activity/.test(dispatchSrc)) {
+  throw new Error("v1.11.21: 不得再直接读 listChildren 条目的 activity（0.2 起该字段不存在），应走 #residentActivity")
+}
+// v1.11.21：工具出参必须经 jsonSafe 收口（宿主对出参做无损 JSON 校验，undefined 属性
+// 会让整次调用 INVALID_TOOL_OUTPUT）。判定走**行为标记**（JSON_SAFE_MARK，见下方
+// apply 桩断言），不再依赖源码字符串计数——那能被注释/换行写法绕过（终审实测）。
+{
+  const js = await import(path.join(root, 'lib/json-safe.js'))
+  if (typeof js.jsonSafe !== 'function') throw new Error('v1.11.21: lib/json-safe.js 应导出 jsonSafe')
+  if (js.isLosslessJson({ a: 1, b: undefined }) !== false) throw new Error('v1.11.21: isLosslessJson 应判定含 undefined 属性的对象为非法')
+  if (js.isLosslessJson(js.jsonSafe({ a: 1, b: undefined })) !== true) throw new Error('v1.11.21: jsonSafe 输出必须通过无损 JSON 判定')
+}
 // v1.1.2 起：递归护栏——deny 候选名单必须覆盖全部 8 个委派工具 + 通用委派工具
 // v1.5.0：名单改为 DENY_CANDIDATES 常量 + #safeDenyList 动态求交集（新宿主
 // tools.restrict 对未知工具名 loud throw，静态名单会炸掉子代理创建）；
@@ -749,6 +777,61 @@ if (!c.includes('uiSubs')) throw new Error('v0.9.29: 持久化状态应有订阅
   const indexJs = readFileSync(path.join(root, 'index.js'), 'utf8')
   if (!indexJs.includes('/agent-api/host-approval-rule')) throw new Error('v1.10.0: index.js 缺少 host-approval-rule 端点')
   if (!indexJs.includes('/agent-api/host-approval-context')) throw new Error('v1.10.0: index.js 缺少 host-approval-context 端点')
+}
+
+// ── v1.11.21 运行时单元测试：0.2 形状宿主上的驻留性派生（行为级，非字符串匹配）──
+// 终审指出：原来的源码字符串护栏可被"把 #residentActivity 改成 return new Map()、
+// 只留注释"绕过。这里用假宿主实跑 listChildren，断言 idle/ready 的真实取值。
+{
+  const { Dispatcher } = await import(path.join(root, 'lib/dispatch.js'))
+  class StubRegistry {
+    get(id) { return { id, name: id, reusePolicy: 'reuse', systemPrompt: '', routes: [] } }
+    resolveRoutes() { return [] }
+  }
+  const mkDispatcher = (subagents, sessionsGet) => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'dad-resident-'))
+    const d = new Dispatcher({
+      ctx: { subagents, get: (n) => (n === 'sessions' && sessionsGet ? { get: sessionsGet } : undefined), emit: () => {} },
+      registry: new StubRegistry(),
+      dataDir: dir,
+      idleReleaseMs: 0,
+    })
+    for (const cid of ['c-live', 'c-gone']) {
+      d.childPool.set(`sess-1::x::${cid}`, {
+        key: `sess-1::x::${cid}`, childId: cid, agentId: 'x', parentSessionId: 'sess-1',
+        provider: null, acpMode: false, lastUsedAt: Date.now(), releaseTimer: null,
+        lastTasks: ['t'], viaSquad: null, squadRunId: null, keep: false,
+      })
+    }
+    return d
+  }
+  const fakeAgent = { session: { id: 'sess-1' }, options: {} }
+
+  // ① 0.2 形状：activity 只在 listDescendants 上；listChildren 无该字段
+  const d1 = mkDispatcher({
+    listChildren: async () => [{ id: 'c-live', createdAt: 1, mode: 'continuable', label: 'x' }],
+    listDescendants: async () => [
+      { id: 'c-live', kind: 'child', activity: 'running', parentId: 'sess-1' },
+      { id: 'c-gone', kind: 'child', activity: 'inactive', parentId: 'sess-1' },
+    ],
+  })
+  const r1 = new Map((await d1.listChildren(fakeAgent)).children.map(r => [r.childId, r.status]))
+  if (r1.get('c-live') !== 'idle') throw new Error(`v1.11.21: 宿主报 running 应为 idle，实际 ${r1.get('c-live')}`)
+  if (r1.get('c-gone') !== 'ready') throw new Error(`v1.11.21: 宿主报 inactive 应为 ready，实际 ${r1.get('c-gone')}`)
+
+  // ② 回归护栏：宿主只给"无 activity 的 listChildren"时，不得把 idle 误降级成 ready
+  const d2 = mkDispatcher({ listChildren: async () => [{ id: 'c-live', createdAt: 1, mode: 'continuable', label: 'x' }] })
+  const r2 = (await d2.listChildren(fakeAgent)).children.find(r => r.childId === 'c-live')
+  if (r2.status !== 'idle') throw new Error(`v1.11.21: listChildren 无 activity 时应保留派生值 idle，实际 ${r2.status}`)
+
+  // ③ 目录面抛错 → 降级到会话存储（在册 = 驻留）
+  const d3 = mkDispatcher(
+    { listDescendants: async () => { throw new Error('UNAUTHORIZED') } },
+    (id) => (id === 'c-live' ? { id } : undefined),
+  )
+  const r3 = new Map((await d3.listChildren(fakeAgent)).children.map(r => [r.childId, r.status]))
+  if (r3.get('c-live') !== 'idle') throw new Error(`v1.11.21: 会话在册应为 idle，实际 ${r3.get('c-live')}`)
+  if (r3.get('c-gone') !== 'ready') throw new Error(`v1.11.21: 会话不在册应为 ready，实际 ${r3.get('c-gone')}`)
 }
 
 console.log(`OK: ${PKG_NAME} v${pkg.version} 一致性链（无内置 Agent）+ ${tools.length} 工具 + /${commands.join('/')} 命令`)

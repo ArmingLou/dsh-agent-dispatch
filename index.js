@@ -33,8 +33,16 @@ import { listSkills, skillToAgent, defaultSkillsRoot } from './lib/skill-import.
 import { readFabConfig, mergeFabConfig } from './lib/fab-config.js'
 import { renderRoster } from './lib/roster.js'
 import { HostApprovalRules, resolveApprovalContext } from './lib/host-approval.js'
+import { jsonSafe } from './lib/json-safe.js'
 
 export const name = '@kiligzzz/dsh-agent-dispatch'
+
+/**
+ * v1.11.21：工具出参收口标记。`registerTool` 给每个经 jsonSafe 包装的工具定义打上
+ * （不可枚举），`verify.mjs` 用同一个 Symbol 做**行为级**断言：注册进来的工具是不是
+ * 全部过了收口——比"数源码里出现几次 registerTool"可靠（后者能被注释/换行绕过）。
+ */
+export const JSON_SAFE_MARK = Symbol.for('dsh-agent-dispatch/jsonSafe-tool')
 
 export const inject = ['tools', 'subagents', 'systemPrompt', 'agents']
 
@@ -277,8 +285,25 @@ export function apply(ctx, config = {}) {
 
   const toolDisposers = []
 
+  // v1.11.21：工具出参统一过 jsonSafe。宿主对**每个**工具出参做无损 JSON 校验
+  // （dsh-tools 的 createSuccessResult → snapshotJsonValue）：任何值为 undefined 的
+  // 自有属性都会让整次调用失败（INVALID_TOOL_OUTPUT: value is not lossless JSON），
+  // 而不是只丢那个字段。0.1.0-rc.6 与 0.2.0-rc.1 同样严格（不是升级回归），本插件
+  // 过去只是恰好每个字段都填满了。收口一次，后续再加可选字段（output / warnings …）
+  // 不会再把工具调用弄坏。语义详见 lib/json-safe.js。
+  const registerTool = (def) => {
+    const wrapped = {
+      ...def,
+      execute: async (args, exec) => jsonSafe(await def.execute(args, exec)),
+    }
+    // 收口标记（不可枚举，不会进宿主的定义快照/JSON）：供 verify.mjs 做**行为级**
+    // 一致性链断言——"有没有工具绕过收口"，而不是靠源码字符串匹配（那种会被注释绕过）。
+    Object.defineProperty(wrapped, JSON_SAFE_MARK, { value: true, enumerable: false })
+    return ctx.tools.register(wrapped)
+  }
+
   // agent_dispatch：把任务委派给Agent（建/复用可续聊子 agent）
-  toolDisposers.push(ctx.tools.register({
+  toolDisposers.push(registerTool({
     name: 'agent_dispatch',
     description:
       'Dispatch a task to a pre-configured agent agent (a continuable subagent with a fixed agent persona, its own context, and its own model route). Use this when the task falls in an agent\'s domain — requirement analysis, code review, production debugging, SQL analysis. Reuse is automatic and context-aware (v1.5.1): a task that continues the agent\'s previous work (continuation wording like 继续/追加/continue, or shared files/terms) is sent to the same subagent via send_message with full context; an independent new task spawns a fresh subagent. Dispatch returns immediately with a durable child id; the result arrives as a subagent notice when the agent finishes.',
@@ -333,7 +358,7 @@ export function apply(ctx, config = {}) {
 
   // agent_children：列出本会话的子代理线程（v1.5.3）——childId + 最近任务 + 状态，
   // 供主模型挑选"隔开的旧线程"做定向续聊（agent_dispatch(childId=...)）。
-  toolDisposers.push(ctx.tools.register({
+  toolDisposers.push(registerTool({
     name: 'agent_children',
     description:
       'List the subagent threads of the current session: each entry has childId (usable as agent_dispatch childId for targeted continuation), agentId, the recent task labels, and status (running = working now, idle = resident and free, ready = session persisted, cold-resume on reuse). Call this when you need to continue a specific older thread whose subagent is not the most recent one, or when you lost track of the child ids.',
@@ -390,7 +415,7 @@ export function apply(ctx, config = {}) {
   }))
 
   // agent_followup：对已存在的Agent追问（上下文延续）
-  toolDisposers.push(ctx.tools.register({
+  toolDisposers.push(registerTool({
     name: 'agent_followup',
     description:
       'Send a follow-up message to a live agent child subagent started earlier via agent_dispatch. The agent keeps its full conversation context, so state only what is new. Use this to ask the same agent another question or give it more information.',
@@ -424,7 +449,7 @@ export function apply(ctx, config = {}) {
   // agent_close：显式关闭子代理线程（v1.5.2）——确认某条线程不再继续时调用：
   // 立即停止复用（移除复用池条目）+ 释放驻留资源；ACP 后台进程由
   // product-subagents 的 idleTimeoutMs 定时器收尾（无需手动处理）。
-  toolDisposers.push(ctx.tools.register({
+  toolDisposers.push(registerTool({
     name: 'agent_close',
     description:
       'Close one or more subagent threads so they are never reused again and their resident resources are recycled promptly. Call this when you are sure a thread is done (work accepted, exploration concluded, feature verified) and no further follow-up will target it. Pass childId (a durable child id returned by agent_dispatch) to close one subagent, or agentId to close all idle subagents of that agent in this session. Running subagents are not interrupted — they lose reuse eligibility and are recycled when their current task settles. ACP-backed subagents (deveco etc.) keep their background process until the product-subagents idle timeout (idleTimeoutMs, default 10 min) recycles it; this call releases the in-process relay immediately.',
@@ -483,7 +508,7 @@ export function apply(ctx, config = {}) {
   }))
 
   // agent_list：列出Agent目录（供主 agent 路由判断）
-  toolDisposers.push(ctx.tools.register({
+  toolDisposers.push(registerTool({
     name: 'agent_list',
     description:
       'List the configured agent agents with their ids, names, trigger domains, model routes, and reuse policy. Call this before agent_dispatch when unsure which agent fits, or when the user asks what agents exist.',
@@ -626,7 +651,7 @@ export function apply(ctx, config = {}) {
   }
 
   // agent_squad：按预置小队模板把目标拆给多Agent（v0.3）
-  toolDisposers.push(ctx.tools.register({
+  toolDisposers.push(registerTool({
     name: 'agent_squad',
     description:
       'Dispatch one goal to a preset agent squad (a template of multiple agent dispatches with dependencies — e.g. dev-pipeline runs requirement analysis then code review; debug-squad fans out log tracing, SQL analysis, and code review in parallel). Each step dispatches to its agent as a continuable subagent; steps with dependencies wait for earlier steps to finish, and their results feed the dependents. A step marked checkpoint:true pauses execution after it completes, returning paused:true with a squadRunId — call agent_squad_continue with that id (optionally with a note of user feedback) to resume. Use for multi-angle or pipeline goals; prefer agent_dispatch for single-domain tasks.',
@@ -742,7 +767,7 @@ export function apply(ctx, config = {}) {
   }))
 
   // agent_squad_continue：从 checkpoint 停等点续跑小队（v1.3.0）
-  toolDisposers.push(ctx.tools.register({
+  toolDisposers.push(registerTool({
     name: 'agent_squad_continue',
     description:
       'Resume a paused agent_squad run from its checkpoint. Required: the squadRunId returned by the previous agent_squad / agent_squad_continue call that reported paused:true. Optional note: user feedback on the just-completed stage, appended to the goal so every remaining step sees it. Runs until the next checkpoint step or until all steps complete; returns paused:true again (with the same squadRunId) if it hit another checkpoint, otherwise paused:false.',
@@ -846,7 +871,7 @@ export function apply(ctx, config = {}) {
   }))
 
   // agent_import_skill：把 ~/.dsh/skills 下的 skill 一键注册为Agent（v0.4）
-  toolDisposers.push(ctx.tools.register({
+  toolDisposers.push(registerTool({
     name: 'agent_import_skill',
     description:
       'Import a DSH skill (~/.dsh/skills/<name>/SKILL.md) as an agent agent: its body becomes the agent system prompt, its description becomes the trigger domain. Call with no skillDir to list importable skills first. Imported agents overwrite an existing agent with the same id.',
@@ -910,7 +935,7 @@ export function apply(ctx, config = {}) {
   // agent_upsert：新增/更新单个 Agent（与 GUI 编辑保存同一条 registry.upsert 逻辑，立即生效免重启）。
   // v1.2.0：暴露给主 agent，改 Agent（含 systemPrompt）无需重启 Desktop、无需点 GUI。
   // v1.5.0：支持 reusePolicy（'reuse' 复用同角色子代理 / 'fresh' 每次新开）。
-  toolDisposers.push(ctx.tools.register({
+  toolDisposers.push(registerTool({
     name: 'agent_upsert',
     description:
       'Create or update a single agent agent in the dsh-agent-dispatch registry. This is the same write path as the GUI edit-and-save (registry.upsert: in-memory + atomic disk write), so changes take effect immediately without restarting DSH. Use this to fix or adjust an agent\'s persona/systemPrompt, triggers, name, model routes, or reuse policy. The agent keeps its position if it already exists, otherwise it is appended.',
@@ -981,7 +1006,7 @@ export function apply(ctx, config = {}) {
 
   // agent_squad_upsert：新增/更新单个小队（与 GUI 小队编辑保存同一条 squadRegistry.upsert 逻辑，立即生效免重启）。
   // v1.3.0：暴露给主 agent 免重启改小队（含 checkpoint 字段）；GUI 表单同步加 checkpoint 开关后两条路径等价。
-  toolDisposers.push(ctx.tools.register({
+  toolDisposers.push(registerTool({
     name: 'agent_squad_upsert',
     description:
       'Create or update a single agent squad in the dsh-agent-dispatch squad registry. This is the same write path as the GUI squad edit-and-save (squadRegistry.upsert: in-memory + atomic disk write), so changes take effect immediately without restarting DSH. Use this to fix or adjust a squad\'s steps — including the checkpoint flag on each step (checkpoint:true = pause after that step completes, wait for user confirmation, resume via agent_squad_continue).',
