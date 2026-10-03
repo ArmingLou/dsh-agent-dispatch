@@ -39,6 +39,7 @@ The main panel is mounted to the host's native right tab **Agent 调度**, with 
 | `agent_list()` | List agents (id / trigger domain / routes); call first when unsure which agent fits |
 | `agent_squad(squad_id, goal)` | Expand a goal through a squad template; dependency results auto-injected |
 | `agent_import_skill(skillDir?)` | Import `~/.dsh/skills/<name>/SKILL.md` as an agent |
+| `agent_failover(childId)` | Hand a **route that is waiting for a failover decision** over to the next route; the replacement becomes your direct child (two-way messaging works) |
 
 ## Usage
 
@@ -233,6 +234,131 @@ $DSH_HOME/data/dsh-agent-dispatch/
 - `dependsOn` is an array of step indices; empty = first batch parallel.
 - `instruction` supports two placeholders: `{input}` (full goal) and `{prev:N}` (step N result summary).
 - Validation matches the `agent_squad` tool: out-of-range/self-reference/non-array report specific errors; cycles report "dependency cycle".
+
+## Fallback chain (automatic route switching) and failure grading
+
+An Agent's `routes` are an ordered failover chain. When one slot fails this plugin
+switches to the next one and re-runs the **same** task text. **The replacement is
+always a direct child of the main agent** (depth-1 sibling, never a grandchild of the
+failing child) — so the main agent can `send_message` it, see it in `agent_children`,
+and `interrupt_agent` it.
+
+> **At any moment a single task has at most ONE replacement subagent.** Manual and
+> automatic failover share the **same atomic claim** (`#claimHandoff`'s
+> synchronous `has → set → run` block); the loser is idempotent and returns the same
+> `childId`, never a second replacement. This is a mechanism guarantee, not a
+> best-effort heuristic.
+
+Key mechanics (v1.11.24):
+
+- **The main agent owns the failover decision.** When a route fails the orchestrator
+  sends the main agent a **waking** notice (idle → `followup`, running → `steer`;
+  `inject` is non-waking and would go unread while the agent is idle) and exposes the
+  idempotent tool **`agent_failover({ childId })`**. Calling it **terminates and
+  releases the failed child (the plugin redeems its blocked wait) and dispatches the
+  next route as a sibling child** — the main agent does **not** need to call
+  `interrupt_agent` separately (the host scheduler waits for in-flight tools even on
+  abort, so `interrupt_agent` cannot unblock a stuck `product_submit`; the real release
+  is the plugin redeeming that promise). In `notify-then-auto` mode the plugin runs the
+  exact same flow on timeout.
+- The tool takes **only `childId`**: the task text, agent id, failing route, next
+  route, tried list and error trail are all resolved by the orchestrator. The existing
+  `agent_dispatch` has no provider/model parameter, so the main agent simply cannot
+  express "switch to that route" — hence a dedicated tool.
+- **Notice order (new semantics)**: (1) the waking failover notice → (2)
+  `Background subagent <id> was stopped before it finished.` for the failed child →
+  (3) the replacement's settlement notice. (2) is emitted unconditionally by the
+  host's `notifySettlement` and **cannot be suppressed from the plugin side**, but it
+  always lands *after* the explicit notice and is semantically true. The release
+  order is fixed: **interrupt the old child → migrate the waiter → dispatch the
+  sibling replacement → redeem the rendezvous**, so "old child released" is never
+  earlier than "replacement exists".
+- **No double failover**: when the failed child ends, `onChildEnd` still evaluates
+  whether to auto-fail-over, and three gates stop it — `entry.inTurnChain`
+  (durable, set **before** the notice goes out), a live rendezvous (transient), and the
+  `activeTasks` live-sibling gate (the replacement is registered, so it is a natural
+  second line of defence).
+- The final failure report explains itself:
+  `(step failed: …; tried 3 routes: deveco → EMPTY_RESPONSE …; opencode → RATE_LIMITED …;
+  deepseek-official → …; automatic failover stopped: already on the last route)`.
+- Failures are graded (`failover` / `fatal` / `interrupted`; the authority is the
+  `info.grade` published by product-subagents): quota/rate-limit/empty-response/
+  timeout/transport-death are `failover` (silent switch); auth failure, invalid
+  arguments, syntax errors, unknown model, human rejection and an exhausted chain are
+  `fatal` (**no** switch — retrying cannot help); human cancellation is `interrupted`.
+  Anything unlisted falls back to `failover`, so only an explicitly `fatal` error stops
+  a route switch.
+- **A route whose failover was already handled is not retried again after the turn
+  ends** (v1.11.23, kept in v1.11.24). The reason reads
+  `; automatic failover stopped: already handled by the failover chain this turn
+  (explicit or auto-on-timeout), not retried`. Without that gate the main agent would
+  simultaneously hold the replacement and an out-of-turn sibling both working the same
+  task — the same shape as the incident fixed in v1.11.22.
+- **Requires product-subagents >= 0.7.4** (for the `failoverMode` / `notifyWaitMs`
+  payload and the `FAILOVER_HANDED_OFF` termination semantics). Against 0.7.3 the
+  behaviour degrades but stays **safe** (the old PSUB does not know `handedOff`, treats
+  the post-handoff verdict as "no result" and rethrows; the old child was already
+  interrupted and its rendezvous already cleared, so its turn ends normally and
+  `inTurnChain` blocks a second failover). Against an even older version, or with
+  `failoverInTurn: false`, the plugin falls back to post-settlement failover — which
+  also dispatches a **sibling** replacement.
+
+### Related configuration
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `failoverMode` | `"notify-then-auto"` \| `"notify"` \| `"auto"` | `notify-then-auto` | Failover hand-off mode. All three modes use a **sibling** replacement; they differ only in *who decides* and *when*:<br>· `notify-then-auto` (default) — send a waking notice + expose `agent_failover`, wait `notifyWaitMs`; if the main agent acts, it drives the failover explicitly; **on timeout the plugin dispatches a sibling replacement automatically**.<br>· `notify` — pure manual: only wait for the main agent; **on timeout the task fails** and no automatic failover happens.<br>· `auto` — the old fully-automatic feel: no waiting, no notice, dispatch the sibling immediately.<br>Env: `DSH_AGENT_DISPATCH_FAILOVER_MODE`. |
+| `notifyWaitMs` | number | `90000` (90 s) | How long `notify` / `notify-then-auto` waits for the main agent's decision. On timeout: auto sibling failover (`notify-then-auto`) or failure with a self-explaining message (`notify`). Never an indefinite hang. Env: `DSH_AGENT_DISPATCH_NOTIFY_WAIT_MS`. |
+| `failoverInTurn` | boolean | `true` | The failing child blocks waiting for the failover decision (so it does not settle first). `false` restores "fail over after settlement" (intermediate notices leak) for troubleshooting. Env: `DSH_AGENT_DISPATCH_FAILOVER_IN_TURN=0/1`. |
+| `failoverWaitMs` | number | `900000` (15 min) | Compatibility: only the post-settlement fallback path (old product-subagents, or `failoverInTurn: false`) uses it. |
+| `failoverGrades` | object | — | `{ "<error code>": "failover"\|"fatal"\|"interrupted" }` grading overrides; same name and meaning as product-subagents' `config.submitFailureGrades`. |
+
+### Known boundaries (recorded honestly — please don't file these as bugs)
+
+1. **The host's per-child settlement notice cannot be suppressed from the plugin side.**
+   `Background subagent <childId> finished and will do no further work unless you send it
+   more.` is produced and emitted **unconditionally** by the host
+   (`@deepseek-ai/dsh-subagent` `lib/index.js:1255` — `notifySettlement` starts with
+   `if (!activation.announced) return`, and `announced` is set unconditionally on admit
+   at `:1837` followup / `:1957` first submission). This plugin avoids the intermediate
+   notice **indirectly**: the failing slot always keeps a live child, so the host's
+   `settlementState()` takes the `ownedChildren` branch and answers `wait` instead of
+   settling. That path still holds for a plugin-only solution — but it leans on the
+   host's internal state machine, not on a plugin-controlled switch.
+   > The paragraph below is a reference for an upstream fix. **Not implemented here, and
+   > no patch file was produced.**
+   > A real fix needs the host to accept an explicit marker on the `startContinuable` spec
+   > (e.g. `failoverGroup` / `suppressSettleNotice`) and to set `announced = true` at
+   > `:1837` / `:1957` only when the child is the final slot of its failover group; the
+   > plugin would then pass `isFinal = !#canFailover(entry)`. The host is a global npm
+   > package that `npm i -g` overwrites, so this is deliberately not done plugin-side.
+2. **A failover re-run starts from scratch with no idempotency guard.** `#retryOnChildFailure`
+   re-dispatches the **same task text** to a fresh child, so side effects already half-written
+   by the earlier slot (files, database rows, external calls) run again. The `activeTasks`
+   dedup only skips an *automatic* retry when another sibling with the same task is live; it
+   does **not** prevent duplicated side effects and does **not** block a manual re-dispatch
+   (`dispatch()` has no same-task early return). Whether to add idempotency protection is the
+   user's call — this version does not.
+3. **The failing slot's turn is stretched until the chain is exhausted** (bounded by
+   `failoverWaitMs`, 15 min by default), so that child takes no new `send_message` meanwhile.
+   That is **not** message loss: the host queues the message in the child's Inbox, and
+   `settlementState()`'s `inbox.hasPending` branch answers `wait` instead of settling, so the
+   message is never cleared by the disposal's `keepInbox:false` cancel. On top of that this
+   plugin **reroutes**: an appended message landing on an already-failed slot is redirected to
+   the chain's currently live slot (`#liveHopFor` inside `followup()`), so it does not travel
+   back to a dead product session and trigger another round of failover. If rerouting fails it
+   falls back to the original target, and only throws when both paths fail — **never silently
+   dropped**.
+
+### Cost and boundaries
+
+- **The parent waits longer**: the failing slot's turn now blocks until the chain is
+  exhausted, bounded by `failoverWaitMs`. That wait does **not** consume a parent turn
+  (the host does not wake it); what it adds is "the chain's runtime after the failing
+  slot".
+- Per-slot **retry and backoff** still live on the product side: product-subagents'
+  `rateLimitRetries` / `rateLimitBackoffMs` / `requestsPerMinute` (default 3 retries,
+  60s×2ⁿ backoff) are exhausted on the current slot first; only then does the chain move on.
 
 ## UI overview
 

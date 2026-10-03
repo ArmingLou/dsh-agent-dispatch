@@ -26,7 +26,7 @@ import path from 'node:path'
 import os from 'node:os'
 import fs from 'node:fs'
 import { AgentRegistry } from './lib/agents.js'
-import { Dispatcher, serializePermissionPending as permPending } from './lib/dispatch.js'
+import { Dispatcher, FAILOVER_MODES, serializePermissionPending as permPending } from './lib/dispatch.js'
 import { DEFAULT_SQUADS, renderInstruction, topoLayers } from './lib/squads.js'
 import { SquadRegistry } from './lib/squad-registry.js'
 import { listSkills, skillToAgent, defaultSkillsRoot } from './lib/skill-import.js'
@@ -57,6 +57,35 @@ export function apply(ctx, config = {}) {
   const cfgIdle = Number(config.idleReleaseMs) > 0 ? Number(config.idleReleaseMs) : 0
   const envIdle = Number(process.env.DSH_AGENT_DISPATCH_IDLE_RELEASE_MS) > 0 ? Number(process.env.DSH_AGENT_DISPATCH_IDLE_RELEASE_MS) : 0
   const idleReleaseMs = cfgIdle || envIdle || undefined
+  // v1.11.22：fallback 链语义配置（见 lib/dispatch.js 同名 JSDoc）
+  //   failoverInTurn  默认 true  —— 失败档在自己回合内把链走完，主代理只看到一次最终结果；
+  //                                 false 退回 v1.11.21 行为（结算通知先于换档，中间态信号会泄漏）。
+  //   failoverWaitMs  默认 900000（15 分钟）——回合内等链走完的上限，超时按链走完仍失败处理。
+  //   failoverGrades  code → failover|fatal|interrupted 的分级覆盖（与 product-subagents
+  //                                 config.submitFailureGrades 同名同义）。
+  const envFailoverInTurn = process.env.DSH_AGENT_DISPATCH_FAILOVER_IN_TURN
+  const cfgFailoverInTurn = typeof config.failoverInTurn === 'boolean'
+    ? config.failoverInTurn
+    : envFailoverInTurn === '0' || envFailoverInTurn === 'false'
+      ? false
+      : envFailoverInTurn === '1' || envFailoverInTurn === 'true'
+        ? true
+        : undefined
+  const cfgFailoverWaitMs = Number(config.failoverWaitMs) > 0 ? Number(config.failoverWaitMs) : 0
+  // v1.11.24：换档交接模式（见 lib/dispatch.js 同名 JSDoc）
+  //   failoverMode  auto | notify | notify-then-auto，默认 notify（纯手动）：
+  //                   失败档把换档决定权交给主代理（agent_failover），替补档是主代理的
+  //                   【直接子级】可双向对话；主代理不响应即失败，不自动换档。
+  //                   auto = v1.11.23 行为（回合内自动孙代链）；notify-then-auto =
+  //                   先等主代理，超时逐字退回 auto 链。
+  //   notifyWaitMs  notify 模式下等主代理决定的上限，默认 90000。
+  const envFailoverMode = process.env.DSH_AGENT_DISPATCH_FAILOVER_MODE
+  const rawFailoverMode = typeof config.failoverMode === 'string' ? config.failoverMode : envFailoverMode
+  const cfgFailoverMode = typeof rawFailoverMode === 'string' ? rawFailoverMode.trim().toLowerCase() : ''
+  const cfgNotifyWaitMs = Number(config.notifyWaitMs) > 0 ? Number(config.notifyWaitMs) : 0
+  const envNotifyWaitMs = Number(process.env.DSH_AGENT_DISPATCH_NOTIFY_WAIT_MS) > 0
+    ? Number(process.env.DSH_AGENT_DISPATCH_NOTIFY_WAIT_MS)
+    : 0
   // v1.11.12：注入 ACP provider 目录读取器（懒解引用：readProductCatalog 在本函数
   // 后段才声明，直接传会命中 TDZ）。仅用于派发日志的可疑 model/effort 预检。
   const dispatcher = new Dispatcher({
@@ -65,6 +94,11 @@ export function apply(ctx, config = {}) {
     dataDir,
     productCatalog: () => readProductCatalog(),
     ...(idleReleaseMs ? { idleReleaseMs } : {}),
+    ...(cfgFailoverInTurn !== undefined ? { failoverInTurn: cfgFailoverInTurn } : {}),
+    ...(cfgFailoverWaitMs ? { failoverWaitMs: cfgFailoverWaitMs } : {}),
+    ...(FAILOVER_MODES.has(cfgFailoverMode) ? { failoverMode: cfgFailoverMode } : {}),
+    ...((cfgNotifyWaitMs || envNotifyWaitMs) ? { notifyWaitMs: cfgNotifyWaitMs || envNotifyWaitMs } : {}),
+    ...(config.failoverGrades && typeof config.failoverGrades === 'object' ? { failoverGrades: config.failoverGrades } : {}),
   })
 
   // v1.10.0：主代理宿主审批分档规则引擎——「本会话总是允许」（内存，键=session）
@@ -84,6 +118,9 @@ export function apply(ctx, config = {}) {
   const noDelegateTools = new Set([
     'agent_dispatch', 'agent_followup', 'agent_list', 'agent_squad', 'agent_squad_continue',
     'agent_squad_upsert', 'agent_upsert', 'agent_import_skill', 'agent_close', 'agent_children',
+    // v1.11.24：换档是【编排层】的职责——子代理不得自己给兄弟任务换档，
+    // 更不得借换档绕过"不得再向下委派"的硬闸（主代理 depth 0 放行）。
+    'agent_failover',
     'subagent', 'subagent_fork', 'subagent_progress', 'list_agents', 'interrupt_agent',
     'product_delegate', 'product_wait', 'product_roles', 'product_agents',
     'workflow', 'ralph', 'create_goal', 'get_goal', 'update_goal',
@@ -133,6 +170,31 @@ export function apply(ctx, config = {}) {
     console.error('[dsh-agent-dispatch] session/disposed 订阅失败:', err.message)
   }
 
+  /**
+   * v1.11.23：集成层降级/失败留痕——console.error 之外**再写一行决策日志**。
+   *
+   * 为什么必须落盘：DSH 的 stdout 是 VS Code 终端的 unix socket（不是文件），
+   * console.error 只在终端闪一下，进程重启后不留任何痕迹。而这几条恰恰是最需要事后
+   * 回溯的降级路径（事件总线订阅失败 → 自动换档整个失效；换档处理器登记失败 → 退回结算
+   * 后换档的旧行为）。沿用 dispatcher 既有行格式（{ts, kind, ...}）追加到
+   * dataDir/dispatches.jsonl，不新造格式，便于历史页/grep 统一处理。
+   *
+   * @param {string} text  面向人的中文说明（与原 console 文案一致）
+   * @param {Error} err   原始错误
+   * @param {string} component 机器可读的组件/阶段标识
+   */
+  const warn = (text, err, component) => {
+    console.error(`[dsh-agent-dispatch] ${text}:`, err?.message ?? err)
+    try {
+      dispatcher.logDiagnostic({
+        kind: 'plugin-warn',
+        component,
+        ok: false,
+        message: `${text}: ${err?.message ?? String(err)}`,
+      })
+    } catch { /* 留痕失败不影响降级本身 */ }
+  }
+
   // v1.7.1：订阅 product-subagents 的提交失败事件（跨插件事件总线）——relay child
   // 是 LLM agent，product_submit 工具报错后它会"转达错误"并以 completed 正常结束
   // 回合，宿主 'subagent/end' 的 stopReason 无法反映产品侧故障（空正文/超时/限流
@@ -144,13 +206,37 @@ export function apply(ctx, config = {}) {
       try {
         dispatcher.markChildSubmitFailed(info ?? {})
       } catch (err) {
-        console.error('[dsh-agent-dispatch] markChildSubmitFailed 失败:', err.message)
+        warn('markChildSubmitFailed 失败', err, 'markChildSubmitFailed')
+      }
+      // v1.11.22：同步登记回合内换档处理器。载荷带 onFailover 时（product-subagents
+      // ≥0.7.3）才登记——product_submit 会在本次工具调用里【阻塞】等本函数返回结果，
+      // 于是失败档不会在链走完前结算，宿主那条结算通知也就不会提前落到主代理。
+      // 旧版无此钩子 → 降级为仅 stopReason==='error' 的兜底换档（#retryOnChildFailure）。
+      // v1.11.24：按 failoverMode 分流（三种模式一律派**同级**替补，差别只在谁来决定）：
+      //   auto            → handleSubmitFailover：立即派同级替补，不等主代理；
+      //   notify          → handleSubmitFailoverNotify：发唤醒信号等主代理，超时按失败收尾；
+      //   notify-then-auto → 同上，超时后由本插件执行同一套流程自动派同级替补。
+      // req.autoFallback 是 notify-then-auto 的超时兜底标记（由 product-submit 用
+      // 【同一个】处理器再调一次触发，**不**二次 emit submit-failed —— 二次 emit 会因
+      // 未知 code 的兜底分级是 failover 而重复登记 onFailover、再跑一条链）。
+      const register = info && typeof info.onFailover === 'function' ? info.onFailover : null
+      if (register) {
+        try {
+          register((req) => {
+            if (req && req.autoFallback === true) return dispatcher.handleSubmitFailover(req)
+            const mode = typeof info.failoverMode === 'string' ? info.failoverMode : dispatcher.failoverMode
+            if (mode === 'auto') return dispatcher.handleSubmitFailover(req)
+            return dispatcher.handleSubmitFailoverNotify(req)
+          })
+        } catch (err) {
+          warn('回合内换档处理器登记失败', err, 'failover-handler-register')
+        }
       }
     })
   } catch (err) {
     // 事件名不可用（旧版 product-subagents 无 0.3.7 发射点）→ 降级：
     // 自动换档退回仅 stopReason==='error' 触发（罕见），不阻塞其余功能
-    console.error('[dsh-agent-dispatch] product-subagents/submit-failed 订阅失败（旧版 product-subagents?）:', err.message)
+    warn('product-subagents/submit-failed 订阅失败（旧版 product-subagents?）', err, 'submit-failed-subscribe')
   }
   // v1.7.1：submit-ok 事件清除失败标记（relay child 同一回合内二次提交成功）
   let disposeSubmitOkListener = () => {}
@@ -443,6 +529,67 @@ export function apply(ctx, config = {}) {
       const parent = exec.agent
       if (!parent) throw new Error('agent_followup 需要调用方 agent（exec.agent 为空）')
       return dispatcher.followup(parent, args.childId, args.message)
+    },
+  }))
+
+  // agent_failover：把一个【正在等待换档决定】的失败档换到下一档（v1.11.24）
+  //
+  // 只接受 childId：原任务原文、agentId、失败档 provider、下一档 route、已试档列表、
+  // 错误轨迹全部由编排层从 activeChildren / handoffs 自查。模型传不了也传不错——
+  // 现有 agent_dispatch 没有 provider/model 参数，主代理根本无法表达"换到哪一档"。
+  //
+  // 一次调用完成三件事，**不需要**再单独调 interrupt_agent：
+  //   1) 中止并释放旧档（宿主调度器即使 abort 也会等 in-flight 工具 settle，
+  //      interrupt_agent 解不开被阻塞的 product_submit —— 真正的释放是插件显式兑现它）；
+  //   2) 以【主代理为父】派一个同级（depth-1）替补档，可与它双向 send_message；
+  //   3) 把旧档的等待放行，使旧档随后以 "was stopped before it finished." 结束。
+  // 幂等：重复调用（含与超时自动路径撞车）返回同一 childId，绝不产生第二个替补。
+  toolDisposers.push(registerTool({
+    name: 'agent_failover',
+    description:
+      'Fail over one blocked subagent to the next model route in its agent\'s chain. Call this when a failover notice tells you a subagent\'s current route failed and a replacement is worthwhile — the replacement runs as YOUR direct child, so you can send_message it and interrupt_agent it like any other subagent. This call aborts and releases the failed child, dispatches the replacement, and unblocks the failed child so it stops; you do NOT need to call interrupt_agent yourself. Pass only childId — the task text, the agent, the failed route and the next route are all resolved by the orchestrator. Idempotent: calling it twice returns the same replacement child id.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        childId: {
+          type: 'string',
+          description:
+            'The durable child id from the failover notice (the "🔁 换档待决" message). Only a subagent that is currently blocked waiting for a failover decision can be handed off.',
+        },
+      },
+      required: ['childId'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          childId: { type: 'string', description: 'The new replacement subagent id (a direct child of this session).' },
+          agentId: { type: 'string' },
+          fromProvider: { type: 'string' },
+          toProvider: { type: 'string' },
+          interrupted: { type: 'string' },
+          failoverCount: { type: 'number' },
+          trigger: { type: 'string' },
+        },
+        required: ['childId', 'agentId', 'fromProvider', 'toProvider', 'interrupted', 'failoverCount', 'trigger'],
+      },
+      render: (_args, value) => [
+        {
+          type: 'text',
+          text: `已换档：${value.fromProvider} 失败 → ${value.toProvider}（第 ${value.failoverCount} 次，来源 ${value.trigger}）。\n`
+            + `替补子代理 ${value.childId}（Agent ${value.agentId}）已作为你的直接子级派出，可直接 send_message 与它对话。\n`
+            + `旧档已中止并释放（${value.interrupted}），稍后会收到一条它被停止的通知。`,
+        },
+      ],
+    },
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      await ready
+      const parent = exec.agent
+      if (!parent) throw new Error('agent_failover 需要调用方 agent（exec.agent 为空）')
+      return dispatcher.handoff(args.childId, { parentAgent: parent })
     },
   }))
 
@@ -1094,6 +1241,7 @@ export function apply(ctx, config = {}) {
       '8. 用户消息以「$<id> 」前缀开头时（如 "$sql-analyst 查下 orders 慢查询"），这是用户显式指定：把后续文本作为 task 直接 agent_dispatch 给该 id 的 Agent（组队 id 用 agent_squad），不要追问、不要改派。$ 前缀来自输入框 / 菜单选 Agent 的插入（或用户手打），是用户的明确意图。',
       '9. 修改 Agent（含 reusePolicy 复用策略）用 agent_upsert、修改小队（含各步骤 checkpoint 停等开关）用 agent_squad_upsert，均免重启立即生效。',
       '10. 某 Agent 的任务线程确认不再继续时（如探索结论已收、功能已验收、用户表示不用了），调用 agent_close（childId 或 agentId）关闭该线程：立即停止复用并释放驻留资源，避免资源挂账。ACP 子代理（deveco 等）的后台进程由 product-subagents 的空闲回收（idleTimeoutMs，默认 10 分钟）自动收尾，无需也不应手动杀进程。',
+      '11. 收到「🔁 换档待决」通知时（某档失败、已换下一档更划算），调 agent_failover(childId=…)：它会终止并释放旧档、并派发下一档作为你的【直接子级】（可双向 send_message）。**不需要**另外调 interrupt_agent。是否换档由你决定；不调用则按配置超时处理（默认 90s 后自动换到下一档）。',
     ].join('\n'),
   })
 

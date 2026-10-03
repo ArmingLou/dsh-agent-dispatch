@@ -323,11 +323,11 @@ describe('P2 工具出参「无损 JSON」（宿主 snapshotJsonValue 规则）'
     assert.equal(needsNormalize({ ...ok, routes: [{ provider: 'p', model: 5 }] }), true, 'model 非字符串')
   })
 
-  it('源码护栏：10 个工具全部经 registerTool 收口，不得再有裸 ctx.tools.register', () => {
+  it('源码护栏：11 个工具全部经 registerTool 收口，不得再有裸 ctx.tools.register', () => {
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
     assert.equal(src.includes('toolDisposers.push(ctx.tools.register({'), false, '裸注册会绕过 jsonSafe 收口')
     const wrapped = src.match(/toolDisposers\.push\(registerTool\(\{/g) ?? []
-    assert.equal(wrapped.length, 10, '十个工具都必须经 registerTool 注册')
+    assert.equal(wrapped.length, 11, '十一个工具都必须经 registerTool 注册（v1.11.24 新增 agent_failover）')
     assert.equal((src.match(/const registerTool = /g) ?? []).length, 1, 'registerTool 只应定义一次')
   })
 

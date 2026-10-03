@@ -62,7 +62,7 @@ const ctx = {
 }
 mod.apply(ctx)
 await new Promise(r => setTimeout(r, 300))
-for (const t of ['agent_dispatch', 'agent_followup', 'agent_close', 'agent_children', 'agent_list', 'agent_squad', 'agent_squad_continue', 'agent_squad_upsert', 'agent_import_skill', 'agent_upsert']) {
+for (const t of ['agent_dispatch', 'agent_followup', 'agent_close', 'agent_children', 'agent_list', 'agent_squad', 'agent_squad_continue', 'agent_squad_upsert', 'agent_import_skill', 'agent_upsert', 'agent_failover']) {
       // 小队注册表：内置 3 队可加载
   if (!tools.includes(t)) errors.push(`apply 未注册工具 ${t}`)
 }
@@ -76,7 +76,7 @@ if (commands.includes('agent')) errors.push('v0.9.37: /agent 命令应已删除'
   if (marked.length !== toolDefs.length) {
     errors.push(`v1.11.21: 有 ${toolDefs.length - marked.length} 个工具绕过了 jsonSafe 收口（未带 JSON_SAFE_MARK）: ${toolDefs.filter(d => !d || d[mod.JSON_SAFE_MARK] !== true).map(d => d && d.name).join(', ')}`)
   }
-  if (toolDefs.length !== 10) errors.push(`v1.11.21: 工具数应为 10，实际 ${toolDefs.length}`)
+  if (toolDefs.length !== 11) errors.push(`v1.11.21: 工具数应为 11，实际 ${toolDefs.length}`)
 }
 const reg = JSON.parse(rf(path.join(tmp, 'data', 'dsh-agent-dispatch', 'agents.json'), 'utf8'))
 // v1.1：不再预置任何内置 Agent，全新安装从空列表开始
@@ -193,7 +193,8 @@ if (!dispatchSrc.includes('this.completedFresh = new Map()')) throw new Error('v
 if (!dispatchSrc.includes('COMPLETED_FRESH_CAP = 50')) throw new Error('v1.5.4: 缺 COMPLETED_FRESH_CAP 上限常量')
 if (!dispatchSrc.includes('#isInPool(childId)')) throw new Error('v1.5.4: 缺 #isInPool 辅助方法（判断 childId 是否在复用池）')
 if (!dispatchSrc.includes('#pruneCompletedFresh()')) throw new Error('v1.5.4: 缺 #pruneCompletedFresh 淘汰方法（超限清理）')
-if (!dispatchSrc.includes("if (!this.#isInPool(childId)) {")) throw new Error('v1.5.4: onChildEnd 应在非池线程完成时插入 completedFresh 记录')
+// v1.11.22：孙代（回合内换档 child）不是主代理的直接线程，不得进 completedFresh
+if (!dispatchSrc.includes("if (!this.#isInPool(childId) && !entry.nested) {")) throw new Error('v1.5.4/v1.11.22: onChildEnd 应在非池、非孙代线程完成时插入 completedFresh 记录')
 if (!dispatchSrc.includes('this.completedFresh.set(childId, {')) throw new Error('v1.5.4: onChildEnd 应 set completedFresh 条目（含 childId/agentId/taskLabels/parentSessionId/completedAt）')
 if (!dispatchSrc.includes("for (const h of this.completedFresh.values())")) throw new Error('v1.5.4: listChildren 应遍历 completedFresh 合并展示（status: ready）')
 if (!dispatchSrc.includes('this.completedFresh.delete(t.childId)')) throw new Error('v1.5.4: closeChild 应清理 completedFresh 条目')

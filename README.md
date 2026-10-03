@@ -39,6 +39,7 @@
 | `agent_list()` | 列 Agent 目录（id/适用域/路由），路由判断不确定时先查 |
 | `agent_squad(squad_id, goal)` | 按小队模板展开目标，依赖前置结果自动代入 |
 | `agent_import_skill(skillDir?)` | 把 `~/.dsh/skills/<name>/SKILL.md` 一键导入为 Agent |
+| 把某个**正在等待换档决定**的失败档换到下一档 routes 档位（替补档成为你的直接子级，可双向对话） |
 
 ## 怎么用
 
@@ -240,6 +241,103 @@ $DSH_HOME/data/dsh-agent-dispatch/
 - `dependsOn` 为步骤下标数组，空数组 = 首批并行。
 - `instruction` 支持两个占位符：`{input}`（用户目标全文）和 `{prev:N}`（第 N 步结果摘要）。
 - 校验规则（与 `agent_squad` 工具相同）：下标越界/自指/非数组单独报错，存在循环依赖报「依赖环」。
+
+## fallback 链（换档）与失败分级
+
+Agent 的 `routes` 是一条有序的互备链。某一档失败时本插件会换下一档、用**同一份任务文本**重投，
+而**替补档一律是主代理的直接子级**（depth-1 同级，不是失败档的孙代）——因此主代理可以直接
+`send_message` 它、`agent_children` 看得见它、`interrupt_agent` interrupt 得动它。
+
+> **同一任务在任何时刻至多只有一个替补子代理。** 手动换档与自动换档共用**同一个原子 claim**
+> （`#claimHandoff` 的 `has → set → run` 同步块），未抢到者**幂等返回同一 `childId`**，
+> 不会产生第二个替补。这不是「尽量避免」，是机制保证。
+
+实现要点（v1.11.24）：
+
+- **换档决定权归主代理**：失败档失败时向主代理发一条**唤醒型**信号（idle → `followup`、
+  running → `steer`；`inject` 是 non-waking，主代理空闲时读不到），并暴露幂等工具
+  **`agent_failover({ childId })`**。调用它会**终止并释放旧档（由插件兑现其阻塞等待），
+  并派发下一档同级子代理**——主代理**不需要**额外单独调 `interrupt_agent`（宿主调度器即使
+  abort 也会等 in-flight 工具 settle，`interrupt_agent` 解不开被阻塞的 `product_submit`；
+  真正的释放是插件显式兑现那条 promise）。
+  `notify-then-auto` 模式超时后**由插件执行同一套流程**。
+- **工具只接受 childId**：原任务原文、agentId、失败档 provider、下一档 route、已试档列表、
+  错误轨迹全部由编排层自查。现有 `agent_dispatch` 没有 provider/model 参数，主代理根本无法
+  表达「换到哪一档」——所以必须新增一个专用工具。
+- **通知顺序（新语义）**：① 唤醒型换档信号 → ② 失败档的
+  `Background subagent <id> was stopped before it finished.` → ③ 替补档的结算通知。
+  ② 由宿主 `notifySettlement` 无条件发出、**无法从插件侧抑制**，但它**晚于**显式信号且语义真实。
+  释放顺序写死为 **interrupt 旧档 → 迁移 waiter → 派同级替补 → 兑现 rendezvous**，
+  保证「旧档释放」永远晚于「替补存在」。
+- **不双份换档**：失败档结束时 `onChildEnd` 仍会算「要不要自动换档」，三道闸门拦住它——
+  `entry.inTurnChain`（持久，在**发信号之前**置位）、未决 rendezvous（瞬时）、
+  `activeTasks` 活跃兄弟闸（替补已登记，是天然的双保险）。
+- 最终失败报告**自解释**：`（步骤失败: …；已尝试 3 档: deveco → EMPTY_RESPONSE …；
+  opencode → RATE_LIMITED …；deepseek-official → …；自动换档已停止: 当前已是最末档，无后续路由）`。
+- 失败按等级分流（`failover` / `fatal` / `interrupted`，权威来源是 product-subagents 下发的
+  `info.grade`）：限额/限流/空正文/超时/传输中断判 `failover`（静默换档）；认证失败、参数非法、
+  语法错误、模型不存在、人为拒绝、链已耗尽判 `fatal`（**不换档**，重试也不会改善）；
+  人为取消判 `interrupted`。未列出的错误兜底 `failover`——只有被明确归入 `fatal` 的才停止换档。
+- **已换过档的失败档，回合结束后不会再原样重试一遍**（v1.11.23 起，v1.11.24 保留）。
+  终止原因写明 `；自动换档已停止: 本回合内已由换档链路处理过（显式或超时自动），不重复重试`。
+  没有这条闸时，主代理之下会同时存在「已派出的替补」与「回合外兄弟」两个跑同一任务的 child，
+  即 1.11.22 修掉的那个事故的同形复发。
+- **需要 product-subagents ≥ 0.7.4**（提供 `failoverMode` / `notifyWaitMs` 载荷与
+  `FAILOVER_HANDED_OFF` 收尾语义）。对接 0.7.3 时行为退化但**安全**（旧 PSUB 不知
+  `handedOff`，把交接后的裁决当作「没结果」而照原样抛错；旧档已被 interrupt、rendezvous 已
+  清理，回合照常结束，`inTurnChain` 拦住二次换档）。对接更旧版本或 `failoverInTurn: false` 时，
+  退回结算后兜底换档，它**同样派同级替补**。
+
+### 相关配置
+
+| 配置项 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `failoverMode` | `"notify-then-auto"` \| `"notify"` \| `"auto"` | `notify-then-auto` | 换档交接模式，三种模式**一律使用同级替补**，差别只在「谁来决定、何时决定」：<br>· `notify-then-auto`（默认）—— 发唤醒信号 + 暴露 `agent_failover`，等 `notifyWaitMs`；主代理响应则由主代理显式换档，**超时未响应则由插件自动派同级替补**。<br>· `notify` —— 纯手动：只发信号等主代理，**超时按失败收尾**，绝不自动换档。<br>· `auto` —— 保持旧的全自动手感：不等待、不发信号，立即派同级替补。<br>环境变量 `DSH_AGENT_DISPATCH_FAILOVER_MODE`。 |
+| `notifyWaitMs` | number | `90000`（90 秒） | `notify` / `notify-then-auto` 模式下等主代理决定的上限。超时按模式收尾：自动派同级替补（`notify-then-auto`）或按失败收尾（`notify`）。绝不无限挂起。环境变量 `DSH_AGENT_DISPATCH_NOTIFY_WAIT_MS`。 |
+| `failoverInTurn` | boolean | `true` | 失败档阻塞等待换档决定（换档期间不会先结算）。置 `false` 退回「结算后再换档」（中间态通知会泄漏），仅供排障对照。环境变量 `DSH_AGENT_DISPATCH_FAILOVER_IN_TURN=0/1`。 |
+| `failoverWaitMs` | number | `900000`（15 分钟） | 兼容项：仅在无回合内握手时（旧版 product-subagents / `failoverInTurn: false`）作为结算后兜底换档的等待上限。 |
+| `failoverGrades` | object | — | `{ "<错误码>": "failover"\|"fatal"\|"interrupted" }`，分级覆盖；与 product-subagents 的 `config.submitFailureGrades` 同名同义。 |
+
+### 已知边界（如实记录，勿当 bug 报）
+
+1. **宿主的 per-child 结算通知无法从插件侧抑制。** 那条
+   `Background subagent <childId> finished and will do no further work unless you send it more.`
+   由宿主 `@deepseek-ai/dsh-subagent` 生成并**无条件**发出
+   （`lib/index.js:1255` `notifySettlement` 首行 `if (!activation.announced) return`，
+   而 `announced` 在 child 被 admit 时无条件置真 —— `:1837` followup / `:1957` 首次）。
+   本插件通过「让失败档始终有活着的子代理（`settlementState()` 的 `ownedChildren` 分支）、
+   使宿主对它返回 `wait` 而不结算」来**间接**避免中间档通知；纯插件方案下这条路径仍然成立，
+   但它依赖的是宿主内部状态机，不是插件可控的开关。
+   > **下面这段是给上游修 bug 的参考，本方案【未实施】，也没有生成任何补丁文件。**
+   > 治本需要宿主在 `startContinuable` spec 上增加一个显式标记（如
+   > `failoverGroup` / `suppressSettleNotice`），并让 `:1837` / `:1957` 仅在
+   > 「该 child 是其 failover 组的最终档」时置 `announced = true`；插件侧再由
+   > `dispatch()` 按 `isFinal = !#canFailover(entry)` 透传该标记。
+   > 由于宿主是全局 npm 包，`npm i -g` 升级即覆盖，**故不在插件侧实施**。
+2. **换档重投是从头重跑，没有幂等保护。** `#retryOnChildFailure` 用**同一份任务文本**新建
+   child 重投；第一档已经写了一半的副作用（文件、数据库、外部调用）会被重复执行。
+   `activeTasks` 去重只在「同任务已有活跃兄弟」时跳过自动重试，**不防副作用重复**、
+   也不拦人工重投（`dispatch()` 没有同任务 early-return）。
+   是否补幂等保护（如按任务指纹登记已执行副作用）由用户决定，本版未做。
+3. **失败档的回合会被拉长到整条链走完**（上限 `failoverWaitMs`，默认 15 分钟）。
+   期间该 child 收不到新 `send_message`——但这**不等于丢消息**：宿主把消息排进该 child 的
+   Inbox，`settlementState()` 的 `inbox.hasPending` 分支使宿主对它返回 `wait` 而不结算，
+   消息因此不会被 dispose 时 `keepInbox:false` 的 cancel 清掉。
+   本插件额外做了**改投**：追加消息若落在链上已失败的档，改投到链上**当前活跃的那一档**
+   （`followup()` 里的 `#liveHopFor`），避免消息绕回已经挂掉的产品会话再触发一轮换档；
+   改投失败则回落到原目标，两条路径都失败才上抛——**任何情况下都不静默丢弃**。
+
+### 代价与边界
+
+- **主代理多读两条通知**：换档不再「静默」。除唤醒信号外，失败档会有一条
+  `was stopped before it finished.`——宿主 `notifySettlement` 无条件发出，无法从插件侧抑制。
+  换来的是主代理对替补的**完全可及性**（双向 `send_message` / 可见 / 可中断），孙代做不到这一点。
+- **失败档会暂停等主代理决定**：上限 `notifyWaitMs`（默认 90 秒）。这段等待**不占用**主代理的
+  回合（宿主此时不唤醒它），但主代理**确实**会被唤醒去读那条信号。
+  `notify-then-auto` 超时后由插件自动换档，任务不会因为主代理不响应而卡死。
+- 每档的**同档重试与退避**仍在产品侧：product-subagents 的 `rateLimitRetries` /
+  `rateLimitBackoffMs` / `requestsPerMinute`（默认 3 次重试、60s×2ⁿ 退避）先在本档耗尽，
+  耗尽后才换档。
 
 ## UI 全景
 

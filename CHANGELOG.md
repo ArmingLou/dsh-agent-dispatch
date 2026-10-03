@@ -1,3 +1,248 @@
+## 1.11.24（2026-10-03）
+**行为变更（用户可见，不是内部重构）：fallback 换档从「自动孙代」改为「主代理显式换档（同级子代理）」。**
+
+### 背景：为什么换掉孙代
+v1.11.22 引入孙代（`nestedFailover: true`，替补挂在失败档之下）只有一个目的——让失败档
+「始终有活着的子代理」，从而被宿主的 `settlementState()` 判成 `wait` 而不结算，主代理就不会
+先读到「已结束」再看到后台新起一个 child。这个目的**现在已不需要**：失败档阻塞在被阻塞的
+`product_submit` 上，而宿主 `watchSettlement` 在算 `settlementState()` 之前先
+`await whenIdle()`（`dsh-subagent/lib/types/continuation-activation.js:541`），工具调度器
+即使 abort 也会等 in-flight 工具 settle（`dsh-agent-loop/lib/index.js:631-641`）⇒ 它根本不会结算。
+代价是主代理对替补**完全不可及**：孙代不是它的直接子级，`send_message` 走不到（宿主强制相邻
+关系）、`agent_children` 看不见、`interrupt_agent` 无效。
+
+### Added
+- **新工具 `agent_failover({ childId })`（第 11 个工具）**：主代理对某个**正在等待换档决定**的
+  失败档显式换档。**只接受 childId**——原任务原文、agentId、失败档 provider、下一档 route、
+  已试档列表、错误轨迹全部由编排层从 `activeChildren` / `handoffs` 自查，主代理传不进来，
+  也就传不错（现有 `agent_dispatch` 没有 provider/model 参数，根本无法表达「换到哪一档」）。
+  一次调用完成三件事，**不需要**再单独调 `interrupt_agent`：
+  1. **中断并释放旧档**——宿主调度器等 in-flight 工具，`interrupt_agent` **解不开**被阻塞的
+     `product_submit`；真正的释放是本插件显式兑现那条 rendezvous promise；
+  2. **派发下一档同级子代理**（`nestedFailover: false` + `reuse: 'fresh'`），主代理可与它双向
+     `send_message`；
+  3. 旧档随后以 `Background subagent <id> was stopped before it finished.` 结束（真实且预期内）。
+  **幂等**：重复调用（含与超时自动路径在窗口边缘撞车）返回同一 `childId`，绝不产生第二个替补。
+  已完成的换档按 `handoffsDone` 备忘返回同一结果，避免模型自愈重试把「已成功」报成失败。
+- **配置 `failoverMode`（默认 `notify-then-auto`）与 `notifyWaitMs`（默认 `90000`）**，
+  另有 `DSH_AGENT_DISPATCH_FAILOVER_MODE` / `DSH_AGENT_DISPATCH_NOTIFY_WAIT_MS` 环境变量。
+  三种模式**一律使用同级替补**，差别只在「谁来决定、何时决定」：
+
+  | `failoverMode` | 行为 | 取舍 |
+  |---|---|---|
+  | `notify-then-auto`（**默认**） | 发**唤醒型**信号 + 暴露 `agent_failover`，等 `notifyWaitMs`：主代理响应则由主代理显式换档；**超时未响应 → 由插件自动派同级替补** | 先给主代理决定的机会，超时自动兜底；主代理不响应也不会把任务卡死 |
+  | `notify` | 只发信号等主代理；**超时 → 按失败收尾**，绝不自动换档 | 纯手动：换档必须有人显式决定；主代理不响应即失败 |
+  | `auto` | **不等待、不发信号**，立即由插件派同级替补 | 保持 v1.11.23 的「全自动」手感，但替补改为同级、结果直接回主代理 |
+
+- **唤醒型投递**（`#notifyParent(…, { delivery: 'wake' })`）：idle → `parent.followup(msg)`，
+  running → `parent.steer(msg)`，规则照抄宿主 `sendWaking`
+  （`continuation-activation.js:681` + `:199-203`）。原先的 `parent.inject()` 是 **non-waking**
+  （`dsh-agent/lib/types/runtime-types.d.ts:204-209`：只入队、不唤醒驱动），主代理空闲时根本
+  读不到换档请求——「主代理显式换档」在主代理空闲时会是死路。
+- **`handoffs` 唯一 claim 点（`#claimHandoff`）**：手动工具、`notify-then-auto` 超时自动、
+  `auto` 立即三条路径全部经过同一个 `has → set → run` **同步原子块**（块内无 `await`）。
+
+### Changed
+- **【最高优先不变量】同一任务在任何时刻至多只有一个替补子代理。** 手动换档与自动换档共用
+  同一个原子 claim，**未抢到者幂等返回同一 `newChildId`，不会产生第二个替补**。
+  覆盖的竞态窗口与对应测试：`test/failover-claim-race.test.js` 的 W1（超时前手动调用）、
+  W2（超时临界点撞车，× 60 轮，两个方向都被覆盖）、W3（超时先到后到者 no-op，× 20 轮）、
+  W4（连续多次重复调用，× 30 轮）、W5（`onChildEnd` 在交接进行中到达）、
+  W6（并发重复失败 + 混合调用，× 30 轮）、W7/W7b（两个「首次 claim」并发抵达，× 30 轮）。
+  旧档结束时的 `#retryOnChildFailure` 兜底路径也被拦：闸门是 `entry.inTurnChain`（持久，
+  在**发信号之前**置位）+ 未决 rendezvous（瞬时）+ `activeTasks` 活跃兄弟闸，共三道。
+- **通知语义变更（旧 → 新）**：旧的「主代理恰好收到 1 条终局通知」不再成立。新语义下主代理按序读到：
+  ①（`notify` / `notify-then-auto`）唤醒型换档信号 → ② 失败档的
+  `was stopped before it finished.` → ③ 替补档的结算通知（带替补的答案）。
+  ② 是真实的、无法从插件侧抑制（宿主 `notifySettlement` 无条件发出），但它**晚于**显式信号且语义真实。
+  释放顺序写死为：**interrupt 旧档 → 迁移 waiter → 派同级替补 → 兑现 rendezvous**，
+  保证「旧档释放」永远晚于「替补存在」。
+
+### Removed（孙代路径彻底移除）
+- `handleSubmitFailover` 的 `nestedFailover: true`（原 `:2023`）——改为与 `#runHandoff` 合流，
+  换档派发只有一处实现（`#runHandoff`）。
+- `#retryOnChildFailure` 的 `nestedFailover: !!entry.nested`（原 `:2172`）→ 常量 `false`。
+- `inTurnHandled = !!entry.inTurnChain && !entry.nested`（原 `:1815`）→ `= !!entry.inTurnChain`
+  （孙代形态不存在了，那个例外分支永不再触发）。
+- `#canFailover` 的孙代去重豁免 `if (others.length > 0 && !entry.nested)` → 去掉豁免，
+  替补正常参与同任务去重（它是主代理的直接子级，与普通 child 无异）。
+- `dispatch()` 的 `nestedFailover` 入参与 `entry.nested` 字段**保留**（恒 false），
+  仅供既有 entry 读取点（`#canFailover` / `#failoverBlockReason` / `completedFresh`）不再失效；
+  **生产代码路径不再有任何一处传 `true`**（有专门的源码护栏断言）。
+
+### Fixed
+- **链拓扑过早退役**：同级模型下「根档被中止先于替补结算」是常态，而 `#settleChain` 原本无条件
+  `chainLiveChild.delete(rootId)`、`onChildEnd` 原本无条件 `chainRootOf.delete(childId)`，
+  于是替补刚就位、改投索引就被抹掉，换档期间落向失败档的追加消息会**投回已挂掉的旧线程**
+  （绕回坏产品再触发一轮换档）。改为 `#dropChainTopology`：**只有链上当前活跃档自己结算时**
+  才退役拓扑，并顺带清扫指向该链的失效改投入口。
+- **交接路径不得二次 emit `submit-failed`**：`FAILOVER_HANDED_OFF`（product-subagents v0.7.4
+  新增）已归入 `interrupted` 级，且 `product-submit` 在交接分支直接抛出、不再 emit；
+  否则未知码的兜底分级是 `failover`，会重复登记 `onFailover` 并再跑一条链 → 同一任务两个替补。
+- **`handoff()` 对已结算/不存在的 childId 抛自解释错误**（含当前 `failoverMode`、
+  「之后的档位是否全部冷却/已试过/已到末档」），主代理据此决定下一步，而不是含糊的失败。
+
+### Tests
+- `test/failover-claim-race.test.js`（新，11 个用例 / 6 个 describe）：W1–W7 + W7b 竞态窗口
+  （W2/W3/W4/W6/W7/W7b 分别循环 60/20/30/30/30/30 轮），以及两条源码护栏
+  （`#claimHandoff` 块内不得出现 `await`/`setTimeout`；代码里不得再出现 `nestedFailover: true`）。
+- `test/failover-notify.test.js`（新，12 个用例）：唤醒投递（idle→followup / running→steer）、
+  `agent_failover` 三件事一次做完、幂等、二次 emit 护栏、手动 vs 超时自动的**通知序列等价**、
+  `notify` 超时按失败收尾且旧档在 `notifyWaitMs` 量级内结束（不是 15 分钟）。
+- `test/failover-settlement.test.js`（重写）：断言从「恰好 1 条通知」改为新语义下的确定顺序
+  与拓扑（`nested===0`、`parentSessionId === 主代理会话`、逐档自解释终局文本）。
+- `test/helpers/failover-host.js`（新）：按宿主真实语义建模的共享假宿主
+  （结算文案/顺序、唤醒规则、`whenIdle` 不结算、`interrupt` 解不开工具、`request.parent` 语义）。
+- **变异验证（4 项，全部贴过原始输出）**：
+  1. 去掉 `entry.inTurnChain = true` → `notify` 超时用例报 `notify 超时绝不自动换档，实际派了 ["child-1","child-2"]`；
+  2. 在 claim 的 `has` 与 `set` 之间插入 `await` → W7b 报
+     `同一任务至多一个替补，实际派了 2 个：[{child-1},{child-2},{child-3}]`（且旧档被 interrupt 两次）；
+  3. 删掉「已存在」判断 → W1–W6 全部变红（同样出现两条 dispatch）；
+  4. 复活 `nestedFailover: true` → 源码护栏报
+     `孙代路径已彻底移除：代码里不得再出现 nestedFailover: true`，行为用例报
+     `孙代形态已彻底移除：任何 entry 都不许有 nested=true`。
+
+### Compatibility
+- 需要 product-subagents ≥ 0.7.4（提供 `failoverMode` / `notifyWaitMs` 载荷与
+  `FAILOVER_HANDED_OFF` 收尾语义）。对接 0.7.3 时行为退化但**安全**：旧 PSUB 不知
+  `handedOff`，会把交接后的裁决当作「没结果」而照原样抛错——旧档已被 interrupt、rendezvous
+  已清理，根档回合照常结束，`inTurnChain` 拦住二次换档。
+- 对接更旧的 product-subagents（无 `onFailover` 握手）或 `failoverInTurn: false` 时，
+  退回结算后兜底换档（`#retryOnChildFailure`），它**同样派同级替补**。
+
+## 1.11.23（2026-10-03）
+三项小修，其中第 ① 项是上一轮审核的**静态推断经实测确证为真**的缺陷。
+
+### Fixed
+- **回合内链接管过的换档，回合外不得再起第二条重试链**（上一轮推断，本次实测确证可达并修复）。
+  根因是四处叠加：`willFailover`（`lib/dispatch.js:1804`）不检查「本链是否已在回合内处理过」；
+  根档 `failoverTried` 恒为 `[]`（`triedProviders` 只在 `failoverCount>0` 时记账，见 `dispatch():625`），
+  于是 `#nextRoute` 仍指向链内刚用过的档位；孙代 `nestedFailover` 不登记 `activeTasks`（`:1062`），
+  `#canFailover`（`:2054`）的同任务去重又排除自身，挡不住；且回合内链成功时 `submit-ok` 已清掉
+  `_submitFailed`，此后 relay 回合若以 `stopReason='error'` 收场，`productFailed` 为假 → `grade` 取
+  `null` → `fatal` 为假，四道闸门同时失效。
+  实测（`test/failover-settlement.test.js` ⑪）在修复前派出了 `child-1`(deveco, 顶层) /
+  `child-2`(opencode, 链内孙代) / `child-3`(opencode, **顶层兄弟**)，三个 child 携带**同一份任务文本**，
+  即 1.11.22 事故的同形复发。修复：`handleSubmitFailover` 接管时给 entry 打 `inTurnChain` 标记，
+  `willFailover` 对「非孙代且已被回合内链接管」的 entry 一律不再换档，终止原因自解释为
+  `；自动换档已停止: 本回合内已由 fallback 链处理过，不重复重试`。链内孙代之间的接力不受影响。
+- **超时兜底路径同时清理 `chainLiveChild`**：`handleSubmitFailover` 的 guard 原先只删
+  `chainOutcomes`，与 `#settleChain`（`:1901`）不同规格，导致链超时终结后的短窗口内
+  `#liveHopFor` 仍会把追加消息改投给这条已终结的链上档位。现两处同规格清理。
+- **插件集成层的降级失败可回溯**：DSH 的 stdout 是 VS Code 终端的 unix socket（不是文件），
+  `index.js` 里 `console.error('…submit-failed 订阅失败…')` 此前只在终端闪一下、进程重启后
+  零痕迹——而这恰恰是最需要事后排查的降级路径（订阅失败 = 自动换档整个静默失效）。
+  新增 `dispatcher.logDiagnostic(row)`（行格式与既有 `#log` 完全一致，未新造格式），
+  `index.js` 的 `warn()` 辅助把 `submit-failed` 订阅失败、换档处理器登记失败、
+  `markChildSubmitFailed` 失败三处一并落盘，`kind:'plugin-warn'` 可直接 grep。
+
+### Tests
+- `test/failover-settlement.test.js` ⑪⑫⑬：分别钉死「链内已换档成功 + relay 回合 error ⇒ 无顶层
+  兄弟 child」「链走完仍失败 ⇒ 停止原因自解释且无回合外兄弟」「超时兜底 ⇒ `chainLiveChild`
+  与 `chainOutcomes` 一并摘除、后续追加消息回原路径」。三项均做过变异验证（改坏实现 → 对应用例变红）。
+- `test/plugin-diagnostic-log.test.js`：`logDiagnostic` 的落盘格式、追加语义、写盘失败不抛，
+  以及 `index.js` 接线护栏（订阅失败分支必须落盘，不得退回纯 `console.error`）。
+
+## 1.11.22（2026-10-03）
+- **【用户现场事故 ×2】fallback 链未走完就把「失败」信号释放给主代理 → 主代理误判并手工重派，两个同角色子代理并发覆盖同一批文件**。
+  根因不在本插件的 waiter 迁移（那条链早就写好了），而在**信号释放的时机与归属**：
+  ① **谁发的**：宿主 `@deepseek-ai/dsh-subagent` 的 `SubagentContinuationManager.notifySettlement()`
+  （`lib/types/continuation.js:1452`），对每个拿到过 id 的 child **无条件**发结算通知；
+  ② **什么时候发**：失败档的 Activation 结算时，即 relay child 回合结束的**瞬间**，
+  由 `watchSettlement` 观察到 `stateOf() === 'settled'` 触发——**早于** `subagent/end`
+  （编排层据此判失败换档）。所以主代理读到的顺序是「已结束」→（后台新起 child 干同一件事）；
+  ③ **新 child 是否对父代理可见**：换档 child 原先建在**主代理**之下（`#retryOnChildFailure`
+  取 `agents.get(entry.parentSessionId)`），它的存在与结算都直接回主代理。
+  旧实现把「只有 ACP relay 模式能换档」去掉是对的（v1.11.10），但没处理通知时机，
+  于是「不换档就不会误判」的承诺只在 waiter 一侧成立，父代理那一侧一直漏。
+
+### Fixed
+- **失败档在自己的回合内把 fallback 链走完，链走完之前不向主代理释放任何失败/完成信号**。
+  `handleSubmitFailover()` 由 `index.js` 在 `product-subagents/submit-failed` 事件里通过载荷
+  的 `onFailover` 登记，`product-submit.js`（product-subagents ≥0.7.3）在同一次工具调用里
+  **阻塞**等待它。两条配套改动缺一不可：
+  - **换档 child 挂成【失败档的孙代】**（`parent = 失败档 Agent`，`nestedFailover: true`）。
+    孙代的结算通知只回到失败档，主代理看不见它的存在；失败档因「自己还有活着的子代理」
+    停在宿主的 `waiting` 态，宿主便**不会**对它发那条 `finished and will do no further work`。
+    链走完后失败档才结算，主代理于是**只收到一次**结果——成功，或「全部 route 都已失败」。
+  - **链终局只兑现一次**（`#settleChain` + `chainOutcomes`）：链上任何**中途**档位都不兑现，
+    只有不换档的那一档（链真正走完）兑现 `{ok, text, …}`。多跳递归时每一跳的处理器
+  **复用同一条裁决通道**（按 `chainRootId` 建一次）——否则内层跳会覆盖外层跳的 resolver，
+    首档回合永久挂死（这是实现过程中真实踩到并由测试逼出来的 bug）。
+- **最终失败报告自解释**：`（步骤失败: …）` 现在追加 `；已尝试 N 档: deveco → EMPTY_RESPONSE …；
+  opencode → RATE_LIMITED …；deepseek-official → …`，逐档带各自最后错误（`#chainFailureSummary`，
+  轨迹经 `failoverErrors` 沿链累积）。全部 route 失败时回给父代理的**唯一那条**通知里
+  就有完整清单，不再是一句无从判断的「步骤失败: completed」。
+- **失败分级闸门**：`gradeSubmitFailure()` 把失败划成 `failover`（限额/限流/空正文/超时/
+  传输中断/5xx）/ `fatal`（认证/参数/语法/模型不存在/人为拒绝/链已耗尽）/ `interrupted`。
+  `fatal` **不再进入换档链**——旧实现把任何产品故障都换档重跑一遍，认证失败这类
+  「重试也不会有改善」的错误因此白烧请求，还把原因掩盖成「自动换档已停止」。
+  权威来源是 product-subagents 下发的 `info.grade`；本地实现只是对接旧版时的兜底，
+  两仓逐条同构（判定顺序：覆盖 → 精确码 → 文本正则 → 兜底 failover）。
+- **`submit-failed` 早到不再被丢弃**：`markChildSubmitFailed` 在条目尚未登记时改为**缓冲**，
+  `dispatch()` 登记条目后立刻回放。宿主 `startContinuable` 在「收件箱受理」即 resolve，
+  若某宿主版本同步起跑回合，失败标记会先于条目落地而被静默丢掉（换档链永不触发）。
+
+### Added
+- 配置项（`config` / 环境变量，均为**新增**，缺省即新行为）：
+  - `failoverInTurn`（bool，默认 `true`；env `DSH_AGENT_DISPATCH_FAILOVER_IN_TURN=0` 关）
+    ——置 `false` 退回 v1.11.21 行为（失败档先结算再换档，中间态通知会泄漏），仅供排障对照。
+  - `failoverWaitMs`（number，默认 `900000`＝15 分钟）——回合内等链走完的硬上限，
+    超时按「链走完仍失败」处理，绝不无限挂起。
+  - `failoverGrades`（`{ "<错误码>": "failover"|"fatal"|"interrupted" }`）——分级覆盖，
+    与 product-subagents `config.submitFailureGrades` 同名同义。
+- `gradeSubmitFailure()`（导出，纯函数）：与 product-subagents `lib/submit-failure.js` 同构的兜底分级。
+- `test/failover-settlement.test.js`（8 例）：用**按宿主真实结算语义建模**的假宿主
+  （子代理有活着的子代理时处于 waiting → 宿主不发结算通知；先发结算通知、再发
+  `subagent/end`——顺序与 `finishDisposal` 一致）驱动真实 `Dispatcher`，
+  断言的是**通知条数与通知文本**：① 空正文→第二档成功→恰好 1 条成功通知；
+  ② 429→第二档成功→同样 1 条；③ 三档全失败→恰好 1 条且含 3 档各自错误；
+  ④ 认证失败（fatal）→不换档、只 1 条；⑤ 换档 child 的父子关系与 `byAgent` 不被挤掉；
+  ⑥ 同回合重复失败只起一条链；⑦ `failoverInTurn=false` 的对照用例。
+
+### Compatibility
+- 向后兼容：对接**旧版** product-subagents（无 `onFailover` 字段）时自动退回 v1.11.21 语义，
+  `dispatch()` / `onChildEnd` 的对外签名与返回结构未变；孙代 child 不进 `byAgent`、
+  不进 `completedFresh`、不进同任务去重表，故 `agent_children` / `send_message` /
+  `/agent-api/*` 等既有消费者看到的线程列表与之前一致。
+- **父代理等待时间变长**：失败档的回合现在会阻塞到 fallback 链走完（原先失败即结算）。
+  上限由 `failoverWaitMs`（默认 15 分钟）兜底；正常情况下只增加「失败档之后的链耗时」，
+  且这段等待**不消耗**主代理的回合（主代理此时无事可做，宿主也不唤醒它）。
+- 深度硬闸（`callerDepth >= 1` 禁止再向下委派）与全局 `tools.guard` 对**孙代**换档**不生效**
+  （内部调用，不经工具层）：换档是编排层对同一份任务的确定性重投，不接受模型自行发起，
+  故不构成递归委派。
+
+### Fixed
+- **换档期间到达的追加消息改投到链上【当前活跃的那一档】**。方案 A 让失败档的 relay child
+  在 `product_submit` 内阻塞等整条链，期间该 child 收不到新 `send_message`。**这不等于丢消息**：
+  宿主把消息排进该 child 的 Inbox（`sendMessage` → `deliverToChild` → `deliverFollowup` →
+  `submitAdmitted`），而 `settlementState()` 的 `inbox.hasPending` 分支使宿主对它返回 `wait`
+  而不结算，消息因此不会被 dispose 时 `keepInbox:false` 的 cancel 清掉。
+  **真正的问题是投错档**：那条档绑的是已经失败的产品，消息会绕回去再触发一轮换档。
+  修法：`chainRootOf` / `chainLiveChild` 两张索引记录「child 属于哪条链」与「链上当前最深、
+  仍活跃的那一档」，`followup()` 据此把追加消息改投到当前档（sender 用该档的直接父级 Agent，
+  满足宿主的相邻校验）。**改投失败回落到原目标，两条路径都失败才上抛——任何情况下不静默丢弃。**
+  链终结（`#settleChain`）即注销 `chainLiveChild`，此后的追加消息回到原路径（宿主冷恢复）。
+
+### Known boundaries（已在 README「已知边界」小节记录）
+- 宿主的 per-child 结算通知**无法从插件侧抑制**：`notifySettlement` 首行
+  `if (!activation.announced) return`，而 `announced` 在 admit 时无条件置真
+  （`@deepseek-ai/dsh-subagent` `lib/index.js:1255` / `:1837` / `:1957`）。本插件靠
+  「失败档始终有活着的子代理 → 宿主 `settlementState()` 返回 `wait`」间接避免中间档通知。
+  README 里另附一段**给上游修 bug 的参考方案（未实施、未生成补丁文件）**。
+- 换档重投**从头重跑、无幂等保护**（`#retryOnChildFailure`）；`activeTasks` 去重只防
+  「已有活跃兄弟」，不防副作用重复，也不拦人工重投（`dispatch()` 无同任务 early-return）。
+
+### Verification
+- `node --test test/*.test.js` **278/278 通过**（原 266 + 新 8）；`node verify.mjs` 绿灯。
+- **变异验证（测试都咬得住）**：M2 `handleSubmitFailover` 直接 `return null`（= 修复前行为：
+  失败档先结算、换档在其后）→ **5 例转红**（① ② ③ ④ ⑤ ⑥），① 报「主代理必须只收到一条
+  通知，实际收到 2 条」；M3 换档 child 不再孙代化（挂回主代理之下）→ **5 例转红**；
+  M4 去掉 `fatal` 闸门 → **2 例转红**（③ ④）；M1 把「只在链走完后释放」改成「每次尝试都释放」
+  → 0 例转红（**如实记录**：ACP 档失败时回合仍阻塞在 `product_submit` 里，中途档根本走不到
+  `onChildEnd`，该变异点不可达——真正承重的变异是 M2/M3）；
+  M5（product-subagents 侧）`product_submit` 不阻塞等待换档结果 → **3 例转红**。
+
 ## 1.11.21（2026-09-29）
 - **适配 dsh 0.2.0-rc.1（宿主接口换代）**。升级后逐项核对了本插件对宿主的全部调用面（`ctx.subagents.*` / `Session` / `ctx.tools.*` / `systemPrompt` / `agents` / `approval/request` / `webServer` / 客户端半边），**三处需要处理**；本版修完，1.11.20 及更早版本在 0.2 上有静默失真与未爆的雷。宿主包无破坏性依赖声明（peerDeps 只有 `@deepseek-ai/cordis`），因此**没有**像 `dsh-plugin-product-subagents` 那样被 `dsh-app-boot` 在加载期整包跳过——`evaluatePluginCompatibility` 只校验 `@deepseek-ai/dsh*` 前缀的 peerDependencies。
 
