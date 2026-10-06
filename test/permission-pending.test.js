@@ -153,4 +153,48 @@ describe('A /agent-api/active 的 permissionPending 序列化（新老客户端�
     const out = serializePermissionPending([{ permId: 'a#1', description: 'R', at: 1 }])
     assert.deepEqual(JSON.parse(JSON.stringify(out)).permissionPendingList[0].description, 'R')
   })
+
+  // v1.12.6（U1「面板说实话」/ U2 弹框预填）：真实记忆键与目录预填的数据源。
+  // 前端过去只能拿 category（title 的 slug）硬凑「本会话将记住…」，那是假的。
+  it('v1.12.6：透传 toolName / toolNameSource / suggestedDirs（缺省时为 null/null/[]）', () => {
+    const out = serializePermissionPending([
+      { permId: 'a#1', product: 'qoder', description: 'R1', toolName: 'Bash', toolNameSource: 'name/toolName', suggestedDirs: ['/tmp/p7/alpha', '/tmp/p7/alpha', '', 5, null], at: 1 },
+      { permId: 'b#2', product: 'qoder', description: 'R2', category: 'qoder:web_search', at: 2 },
+    ])
+    assert.equal(out.permissionPending.toolName, 'Bash')
+    assert.equal(out.permissionPending.toolNameSource, 'name/toolName')
+    // suggestedDirs 只做防御性清洗（保序去重、丢非字符串与空串），不重新推导
+    assert.deepEqual(out.permissionPending.suggestedDirs, ['/tmp/p7/alpha'])
+    // 老 payload（没有这三个字段）必须降级可用，不能变成 undefined 漏进响应
+    assert.equal(out.permissionPendingList[1].toolName, null)
+    assert.equal(out.permissionPendingList[1].toolNameSource, null)
+    assert.deepEqual(out.permissionPendingList[1].suggestedDirs, [])
+  })
+
+  it('v1.12.6：markPermissionPending 记账这三个字段，同 permId 重发时就地更新', () => {
+    const d = boot()
+    const entry = activeEntry('child-A')
+    d.activeChildren.set('child-A', entry)
+    d.markPermissionPending({
+      childId: 'child-A', permId: 'tc#1', product: 'qoder', description: 'R',
+      toolName: 'bash', toolNameSource: 'title(TOOL_NAME_SLUGS)', suggestedDirs: ['/tmp/x'],
+    })
+    assert.equal(entry.permissionPending[0].toolName, 'bash')
+    assert.equal(entry.permissionPending[0].toolNameSource, 'title(TOOL_NAME_SLUGS)')
+    assert.deepEqual(entry.permissionPending[0].suggestedDirs, ['/tmp/x'])
+    // 外部子代理（无 activeChildren）同样记账
+    d.markPermissionPending({ childId: 'ext-1', permId: 'e#1', product: 'qoder', description: 'E', toolName: 'edit', suggestedDirs: ['/tmp/y'] })
+    assert.equal(d.externalPending.get('ext-1')[0].toolName, 'edit')
+    assert.deepEqual(d.externalPending.get('ext-1')[0].suggestedDirs, ['/tmp/y'])
+  })
+
+  it('v1.12.6：脏 suggestedDirs 不炸（非数组/含对象都按空处理或逐项丢弃）', () => {
+    const d = boot()
+    const entry = activeEntry('child-B')
+    d.activeChildren.set('child-B', entry)
+    d.markPermissionPending({ childId: 'child-B', permId: 'p#1', description: 'R', suggestedDirs: 'not-an-array' })
+    assert.deepEqual(entry.permissionPending[0].suggestedDirs, [])
+    d.markPermissionPending({ childId: 'child-B', permId: 'p#2', description: 'R2', suggestedDirs: [{ p: 1 }, '/ok', '  '] })
+    assert.deepEqual(entry.permissionPending[1].suggestedDirs, ['/ok'])
+  })
 })

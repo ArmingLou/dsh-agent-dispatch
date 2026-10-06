@@ -835,4 +835,232 @@ if (!c.includes('uiSubs')) throw new Error('v0.9.29: 持久化状态应有订阅
   if (r3.get('c-gone') !== 'ready') throw new Error(`v1.11.21: 会话不在册应为 ready，实际 ${r3.get('c-gone')}`)
 }
 
+// ── v1.12.1：工具名级会话授权断言 ──
+{
+  const ha = await import('./lib/host-approval.js')
+
+  // 纯函数三判据
+  if (!ha.isSandboxEscalation('escalate sandbox to full: x'))
+    throw new Error('v1.12.1: isSandboxEscalation 正则不匹配标准文案')
+  if (!ha.isSandboxEscalation(' escalate sandbox to full: x'))
+    throw new Error('v1.12.1: isSandboxEscalation 不匹配前导空白')
+  if (ha.isSandboxEscalation('tool requires approval'))
+    throw new Error('v1.12.1: isSandboxEscalation 误判非越权文案')
+  if (!ha.isAcpTwinApproval('product_submit', '[ACP qoder] x'))
+    throw new Error('v1.12.1: isAcpTwinApproval 不匹配 ACP 孪生')
+  if (!ha.isDisallowedAutoGrant('bash', 'escalate sandbox to read-write: x'))
+    throw new Error('v1.12.1: isDisallowedAutoGrant 不拦截沙箱越权')
+  if (!ha.isDisallowedAutoGrant('product_submit', '[ACP qoder] x'))
+    throw new Error('v1.12.1: isDisallowedAutoGrant 不拦截 ACP 孪生')
+
+  // toolGrantCovers 命中
+  const rules = new ha.HostApprovalRules()
+  rules.addToolGrant('root-1', 'bash')
+  if (!rules.toolGrantCovers('root-1', 'bash'))
+    throw new Error('v1.12.1: toolGrantCovers 对已授权工具名不命中')
+  if (rules.toolGrantCovers('root-1', 'write'))
+    throw new Error('v1.12.1: toolGrantCovers 对未授权工具名误命中')
+
+  // decide 工具名授权短路（零 paths 也命中）
+  const d1 = rules.decide({ sessionId: 'child-1', rootSessionId: 'root-1', paths: [], toolName: 'bash' })
+  if (!d1.allowed || d1.scope !== 'session-tool')
+    throw new Error(`v1.12.1: decide 工具名短路失败 allowed=${d1.allowed} scope=${d1.scope}`)
+
+  // 路径规则键一致性：写入 rootId → 子代理请求命中
+  rules.addSessionRule('root-1', ['/a/b'])
+  const d2 = rules.decide({ sessionId: 'child-1', rootSessionId: 'root-1', paths: ['/a/b/file.txt'], toolName: 'write' })
+  if (!d2.allowed || d2.scope !== 'session')
+    throw new Error(`v1.12.1: decide 路径规则键不一致 allowed=${d2.allowed} scope=${d2.scope}`)
+
+  // v1.12.5（用户裁定）：沙箱越权只跳「工具名档」，路径档照旧判定。
+  // 上面 root-1 键上同时有 bash 工具名授权与 /a/b 路径规则，正好一次验两面：
+  // 路径不覆盖 ⇒ 越权必须不放行；路径覆盖 ⇒ 越权必须放行且 scope 只能是 session。
+  const dEscNo = rules.decide({ sessionId: 'child-1', rootSessionId: 'root-1', paths: ['/elsewhere/x.txt'], toolName: 'bash', disallowToolGrant: true })
+  if (dEscNo.allowed)
+    throw new Error('v1.12.5: disallowToolGrant=true 时工具名短路仍然放行（越权吃了工具名档）')
+  const dEscYes = rules.decide({ sessionId: 'child-1', rootSessionId: 'root-1', paths: ['/a/b/file.txt'], toolName: 'bash', disallowToolGrant: true })
+  if (!dEscYes.allowed || dEscYes.scope !== 'session')
+    throw new Error(`v1.12.5: 越权应被会话路径规则放行，实际 allowed=${dEscYes.allowed} scope=${dEscYes.scope}`)
+
+  // v1.12.5 二次裁定（用户）：越权的路径级记忆只到本会话为止，落盘项目档不得替越权放行。
+  // 落盘写在 verify 自己的临时 DSH_HOME（见本文件 :45），不碰用户 ~/.dsh。
+  // 非越权用另一个根键（无会话规则、无工具名授权）⇒ 放行只可能来自项目档，用来守住
+  // 「别把正常路径的持久白名单一起关掉」。
+  rules.appendProjectRule({ cwd: '/home/v', paths: ['/proj/x.txt'] })
+  const dEscProj = rules.decide({ sessionId: 'child-1', rootSessionId: 'root-1', cwd: '/home/v', paths: ['/proj/x.txt'], toolName: 'bash', disallowToolGrant: true, sessionOnly: true })
+  if (dEscProj.allowed)
+    throw new Error(`v1.12.5: 越权被落盘项目档放行（二次裁定：只允许会话档）scope=${dEscProj.scope}`)
+  const dPlainProj = rules.decide({ sessionId: 'c-p', rootSessionId: 'r-p', cwd: '/home/v', paths: ['/proj/x.txt'], toolName: 'write' })
+  if (!dPlainProj.allowed || dPlainProj.scope !== 'project')
+    throw new Error(`v1.12.5: 非越权的项目档放行被误伤 allowed=${dPlainProj.allowed} scope=${dPlainProj.scope}`)
+
+  // resolveRootSessionId：只有委派子会话（origin:'subagent' / delegationDepth>0）才上溯
+  if (ha.resolveRootSessionId({ id: 'c1', header: { parentSession: 'r1', origin: 'subagent', delegationDepth: 1 } }) !== 'r1')
+    throw new Error('v1.12.1: resolveRootSessionId 不返回 parentSession')
+  if (ha.resolveRootSessionId({ id: 'r1', header: {} }) !== 'r1')
+    throw new Error('v1.12.1: resolveRootSessionId 对无 parentSession 不返回自身 id')
+  // v1.12.4 阻断：fork（只带 parentSession、无 origin/delegationDepth）是新的主会话，
+  // 绝不上溯到源会话——否则 fork 的授权写到源会话键上（跨会话静默放行 + 无 purge 路径）。
+  // 血统标记随宿主版本而变（DSH 运行时安装树 dsh-session@0.2.0-rc.2 落 isSeeded；插件开发
+  // 副本 0.1.0-rc.6 落 seedLength），判据一个都不读，所以两种形态都断言。
+  for (const marker of [{ seedLength: 9 }, { isSeeded: true }, {}]) {
+    if (ha.resolveRootSessionId({ id: 'fork-1', header: { parentSession: 'r1', ...marker } }) !== 'fork-1')
+      throw new Error('v1.12.4: fork 被误判为子会话，上溯到了源会话 ' + JSON.stringify(marker))
+    if (ha.isDelegatedSession({ id: 'f', header: { parentSession: 'r1', ...marker } }) !== false)
+      throw new Error('v1.12.4: isDelegatedSession 把 fork 判成委派子会话 ' + JSON.stringify(marker))
+  }
+  if (ha.isDelegatedSession({ id: 'c', header: { parentSession: 'r1', origin: 'subagent' } }) !== true)
+    throw new Error('v1.12.4: isDelegatedSession 漏判 origin=subagent')
+
+  // v1.12.2→v1.12.3：purgeSession(子会话) 不清根授权
+  rules.addToolGrant('root-2', 'bash')
+  rules.addSessionRule('root-2', ['/work/dir'])
+  rules.registerSessionRoot('child-x', 'root-2')
+  rules.purgeSession('child-x')
+  if (!rules.toolGrantCovers('root-2', 'bash'))
+    throw new Error('v1.12.3: purgeSession(子会话) 不应清根的工具名授权')
+  if (rules.sessionRules('root-2').length === 0)
+    throw new Error('v1.12.3: purgeSession(子会话) 不应清根的路径规则')
+  // purgeSession(根会话) 才清根授权
+  rules.purgeSession('root-2')
+  if (rules.toolGrantCovers('root-2', 'bash'))
+    throw new Error('v1.12.3: purgeSession(根会话) 未清除根的工具名授权')
+
+  // v1.12.3：resolveRootSessionId 链式上溯（孙代理共享授权）
+  const rules3 = new ha.HostApprovalRules()
+  rules3.addToolGrant('root-3', 'bash')
+  rules3.registerSessionRoot('child-3', 'root-3')
+  rules3.registerSessionRoot('grandchild-3', 'child-3')
+  const grandchild = { id: 'grandchild-3', header: { parentSession: 'child-3', origin: 'subagent', delegationDepth: 2 } }
+  const rootId3 = ha.resolveRootSessionId(grandchild, null, (sid) => rules3.sessionRootOf(sid))
+  if (rootId3 !== 'root-3')
+    throw new Error(`v1.12.3: resolveRootSessionId 孙代理链式上溯应为 root-3，实际 ${rootId3}`)
+  const d4 = rules3.decide({ sessionId: 'grandchild-3', rootSessionId: rootId3, paths: [], toolName: 'bash' })
+  if (!d4.allowed || d4.scope !== 'session-tool')
+    throw new Error(`v1.12.3: 孙代理应命中根授权 allowed=${d4.allowed} scope=${d4.scope}`)
+
+  // v1.12.2：decide 工具名短路 covered 为空数组
+  const rules2 = new ha.HostApprovalRules()
+  rules2.addToolGrant('root-3', 'bash')
+  const d3 = rules2.decide({ sessionId: 'c3', rootSessionId: 'root-3', paths: ['/x/y'], toolName: 'bash' })
+  if (d3.scope !== 'session-tool' || d3.covered.length !== 0)
+    throw new Error(`v1.12.2: decide 工具名短路 covered 应为空数组，实际 covered=${JSON.stringify(d3.covered)}`)
+}
+
+// ── v1.12.6：B1 判据分档 + U2 paths 三态 + U1/U2/U3 前端接线 ──
+{
+  const ha = await import('./lib/host-approval.js')
+  const dp = await import('./lib/dispatch.js')
+
+  // ① B1 的根因是「读取侧判据」被拿到「写入侧」用。两条判据必须可区分：
+  //    ACP 孪生 = 读取侧排除、写入侧不管（1.12.4 的落盘行为要保住）
+  if (ha.isSandboxEscalation('[ACP qoder] 请求权限：submit'))
+    throw new Error('v1.12.6 B1: isSandboxEscalation 把 ACP 孪生也算成越权（写侧会再次吞掉落盘）')
+  if (!ha.isDisallowedAutoGrant('product_submit', '[ACP qoder] x'))
+    throw new Error('v1.12.6: isDisallowedAutoGrant 不再是读取侧判据（ACP 孪生会吃工具名档）')
+
+  // ② validateDeclaredPaths 三态与丢弃口径（与 product-subagents 0.7.9 同构）
+  const absent = ha.validateDeclaredPaths(undefined)
+  if (absent.given || absent.declared.length || absent.dropped.length)
+    throw new Error('v1.12.6 U2: 未给 paths 必须是 given=false（老客户端零漂移）')
+  const emptyGiven = ha.validateDeclaredPaths([])
+  if (!emptyGiven.given || emptyGiven.declared.length !== 0)
+    throw new Error('v1.12.6 U2: 空数组必须 given=true（"只要工具名"是显式声明）')
+  const mixed = ha.validateDeclaredPaths(['/tmp/a/', 'rel', '/', 7, '', '/tmp/a', '/tmp/b\x00c', '/tmp/a//c'])
+  if (mixed.declared.join('|') !== '/tmp/a|/tmp/a/c')
+    throw new Error(`v1.12.6 U2: 声明归一/去重结果不符 ${JSON.stringify(mixed.declared)}`)
+  if (mixed.dropped.length !== 5)
+    throw new Error(`v1.12.6 U2: 非法声明应丢 5 条，实际 ${mixed.dropped.length}`)
+
+  // ③ expand=false ⇒ 不补父目录（用户声明的已经是目录）
+  const r6 = new ha.HostApprovalRules()
+  r6.addSessionRule('root-6', ['/tmp/dad-v6/alpha'], { expand: false })
+  if (r6.sessionRules('root-6').includes('/tmp/dad-v6'))
+    throw new Error('v1.12.6 U2: expand=false 仍补了父目录（/tmp/dad-v6/alpha ⇒ /tmp/dad-v6 放大）')
+  const d6 = r6.decide({ sessionId: 'root-6', rootSessionId: 'root-6', paths: ['/tmp/dad-v6/alpha/x.txt'] })
+  if (!d6.allowed) throw new Error('v1.12.6 U2: 声明目录下的路径没命中会话路径档')
+  const d6b = r6.decide({ sessionId: 'root-6', rootSessionId: 'root-6', paths: ['/tmp/dad-v6/beta/x.txt'] })
+  if (d6b.allowed) throw new Error('v1.12.6 U2: 声明目录外溢到兄弟目录')
+
+  // ④ dispatch 序列化必须把 U1/U2 需要的字段透出去（面板说实话的前提）
+  const ser = dp.serializePermissionPending([{
+    permId: 'a#1', product: 'qoder', toolName: 'Bash', toolNameSource: 'acp',
+    suggestedDirs: ['/tmp/x', '/tmp/x', 5], description: 'R', at: 1,
+  }])
+  const row6 = ser.permissionPendingList[0]
+  if (row6.toolName !== 'Bash' || row6.toolNameSource !== 'acp')
+    throw new Error('v1.12.6 U1: toolName/toolNameSource 没透传到 /agent-api/active')
+  if (row6.suggestedDirs.join('|') !== '/tmp/x')
+    throw new Error(`v1.12.6 U2: suggestedDirs 未清洗透传 ${JSON.stringify(row6.suggestedDirs)}`)
+  const bare = dp.serializePermissionPending([{ permId: 'b#2', description: 'R', at: 2 }])
+  const bareRow = bare.permissionPendingList[0]
+  if (bareRow.toolName !== null || bareRow.suggestedDirs.length !== 0)
+    throw new Error('v1.12.6 U1: 缺字段必须序列化成 null/[]（前端按此判三态文案）')
+
+  // ⑤ 前端接线（U1 说实话 / U2 弹框先行 / U3 可滚动）——字符串级存在性断言，
+  //    行为断言在 test/grant-dialog.test.js（那边真跑函数，这边只保证没被整块删掉）
+  const need = [
+    ['client', 'permGrantTip(a.permissionPending)', 'U1 授权卡改用真实记忆键文案'],
+    ['client', 'function permGrantTip(p) {', 'U1 三态文案函数'],
+    // 「将记住」三个字只允许出现在解析出工具名的那条分支上：转红实验③ 的变异
+    // （if (true) 兜底成 category/「同类工具」）字符串级就能看出，不该只靠用例。
+    ['client', 'if (key) return "（本会话将记住：" + key + "）";', 'U1 「将记住」只允许工具名档分支'],
+    ['client', 'function openGrantDialog(opts) {', 'U2 可编辑路径弹框'],
+    ['client', 'const sendDecision = (a, answer, label, paths) => {', 'U2 决策载荷带 paths'],
+    ['client', 'if (Array.isArray(paths)) payload.paths = paths;', 'U2 未声明时键必须整个缺席'],
+    ['client', 'const grantViaDialog = (scope) => async () => {', 'U2 宿主通道先弹框后 POST'],
+    ['client', 'if (!d) return "cancelled";', 'U2 取消 ⇒ 零 POST、不放行'],
+    ['client', '.ad-grant-body{flex:1 1 auto;min-height:0;overflow-y:auto', 'U3 弹框内容区可滚动'],
+    ['client', '.ad-grant-actions{flex:0 0 auto;position:sticky;bottom:0', 'U3 按钮行常驻可见'],
+    ['client', '.ad-grant-input{flex:0 0 auto;width:100%;box-sizing:border-box;min-height:96px;max-height:min(38vh,260px);overflow-y:auto', 'U3 目录列表独立滚动'],
+    ['host', 'const sandboxEscalated = !!approvalCtx && isSandboxEscalation(approvalCtx.reason)', 'B1 写侧判据收窄'],
+    ['host', 'const declared = validateDeclaredPaths(body && body.paths)', 'U2 端点接受并校验声明'],
+    ['host', "if (pathsGiven) payload.paths = body.paths", 'U2 决策事件按三态透传'],
+  ]
+  const idx = readFileSync(path.join(root, 'index.js'), 'utf8')
+  const clientSrc6 = readFileSync(path.join(root, 'lib/client.js'), 'utf8')
+  for (const [which, needle, why] of need) {
+    if (!(which === 'host' ? idx : clientSrc6).includes(needle))
+      throw new Error(`v1.12.6: ${why}——${which === 'host' ? 'index.js' : 'lib/client.js'} 里找不到 "${needle}"`)
+  }
+  if (clientSrc6.includes('a.permissionPending.category ? "（本会话将记住："'))
+    throw new Error('v1.12.6 U1: 假「将记住 category」文案仍在源码里')
+  if (idx.includes('pendingExcluded'))
+    throw new Error('v1.12.6 B1: 写侧仍在用含 ACP 孪生的排除判据（pendingExcluded 未清除）')
+
+  // ⑥ v1.12.6 G1：宿主侧「危险命令」排除门——与产品侧同一名单，位置必须在工具名短路之前。
+  //    顺序断言放这里（字符串级）：把门挪到工具名短路之后，这三条命令会先被工具名档放行，
+  //    而下游「已授权 bash + rm -rf ⇒ next()」的用例也会一起红（test/dangerous-command-gate.test.js）。
+  //    v1.12.6 第五轮（终审 Minor 2）：判定前先做**有界截断**（boundDangerText），锚点随调用点
+  //    一起更新；顺序语义一字未变，并额外钉住「截断早于判定」。
+  const boundAt = idx.indexOf('const dangerCmd = boundDangerText(ctxInfo.commandText)')
+  if (boundAt < 0) throw new Error('v1.12.6-5: index.js 里找不到危险命令门的判据文本截断点（被删/改名）')
+  const gateAt = idx.indexOf('const danger = dangerousCommandMatch(dangerCmd.text)')
+  if (gateAt < 0) throw new Error('v1.12.6 G1: index.js 里找不到危险命令门的调用点')
+  if (boundAt > gateAt) throw new Error('v1.12.6-5: 有界截断排在判定之后——超长 argsText 仍全量进判定（4MB ≈ 0.9s 阻塞宿主事件循环）')
+  const shortAt = idx.indexOf('if (!disallowToolGrant && ctxInfo.toolName && hostApproval.toolGrantCovers(')
+  if (shortAt < 0) throw new Error('v1.12.6 G1: index.js 里找不到工具名短路的调用点')
+  if (gateAt > shortAt) throw new Error('v1.12.6 G1: 危险命令门排在工具名短路之后——rm -rf/npm publish/git push 会被静默放行')
+  const twinAt = idx.indexOf("if (isAcpTwinApproval(ctxInfo.toolName, ctxInfo.reason)) return next()")
+  if (twinAt < 0 || twinAt > gateAt) throw new Error('v1.12.6 G1: ACP 孪生早退门的位置被改动（它必须仍排在危险命令门之前）')
+  if (!idx.includes("action: 'no-command-text-block'")) throw new Error('v1.12.6 G1: 保守策略（执行类解析不出命令文本）的留痕丢失')
+  const hostSrc6 = readFileSync(path.join(root, 'lib', 'host-approval.js'), 'utf8')
+  for (const needle of [
+    'export const DANGEROUS_COMMAND_RULES = [',
+    "{ id: 'rm -rf', match: (tokens) => isRecursiveForceRemove(tokens) },",
+    "{ id: 'npm publish', match: (tokens) => subCommandVerb(tokens, 'npm', 'publish') },",
+    "{ id: 'git push', match: (tokens) => subCommandVerb(tokens, 'git', 'push') },",
+    'export function dangerousCommandMatch(text) {',
+    'export function commandTextOf(args) {',
+    'export function isExecuteTool(toolName, args) {',
+  ]) {
+    if (!hostSrc6.includes(needle)) throw new Error(`v1.12.6 G1: lib/host-approval.js 里找不到 "${needle}"`)
+  }
+  // 名单必须只此一份（第二份实现必然与产品侧漂移）：定义 + 遍历处各一次
+  if ((hostSrc6.match(/DANGEROUS_COMMAND_RULES/g) || []).length < 2)
+    throw new Error('v1.12.6 G1: 危险命令名单不是单点常量（定义/引用缺失）')
+  if (!/与 product-subagents[^\n]*同一份/.test(hostSrc6))
+    throw new Error('v1.12.6 G1: 未声明名单来源与「需人工保持同步」')
+}
+
 console.log(`OK: ${PKG_NAME} v${pkg.version} 一致性链（无内置 Agent）+ ${tools.length} 工具 + /${commands.join('/')} 命令`)

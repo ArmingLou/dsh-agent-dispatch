@@ -32,7 +32,7 @@ import { SquadRegistry } from './lib/squad-registry.js'
 import { listSkills, skillToAgent, defaultSkillsRoot } from './lib/skill-import.js'
 import { readFabConfig, mergeFabConfig } from './lib/fab-config.js'
 import { renderRoster } from './lib/roster.js'
-import { HostApprovalRules, resolveApprovalContext } from './lib/host-approval.js'
+import { HostApprovalRules, resolveApprovalContext, resolveRootSessionId, isDisallowedAutoGrant, isSandboxEscalation, isAcpTwinApproval, isDelegatedSession, validateDeclaredPaths, dangerousCommandMatch, boundDangerText, MAX_DANGER_TEXT_CHARS, COMMAND_TOO_LONG_RULE } from './lib/host-approval.js'
 import { jsonSafe } from './lib/json-safe.js'
 
 export const name = '@kiligzzz/dsh-agent-dispatch'
@@ -106,6 +106,28 @@ export function apply(ctx, config = {}) {
   // 供下方 'approval/request' prepend 监听自动放行 + REST 写规则端点使用。
   const hostApproval = new HostApprovalRules(dataDir)
 
+  /**
+   * v1.12.4：审批放行/授权清理的留痕——console 之外再写一行决策日志。
+   *
+   * 沿用 v1.11.23 的理由（那条理由在这里同样成立，不是不适用）：DSH 的 stdout 是
+   * 终端 socket，console 只在终端闪一下，进程重启后不留痕迹。而「这次审批为什么被
+   * 自动放行（命中哪一档、哪个键）」「我的会话授权为什么没了（清了哪个键）」正是
+   * 事后排障要问的两件事——本轮的阻断与三个 Major 全都出在**键**上，只靠宿主
+   * approval/asked+decided 审计看不出写读键是否一致。
+   * 频次有界：一条 = 一次自动放行 / 一次真正清理到东西的 session dispose，
+   * 与既有 dispatch/result 行同量级。kind 用 'host-approval'，历史页按
+   * mergeDispatchHistory 的观测行规则剔除（同 'config'）。
+   *
+   * @param {string} message 面向人的中文说明
+   * @param {object} row 机器可读字段（sid/root/scope/tool 等）
+   */
+  const logApproval = (message, row) => {
+    console.log(`[dsh-agent-dispatch] ${message}`)
+    try {
+      dispatcher.logDiagnostic({ kind: 'host-approval', ok: true, message, ...row })
+    } catch { /* 留痕失败不影响审批判定本身 */ }
+  }
+
   // v1.4.1 执行级递归护栏（v1.5.0 重构）：宿主已删除 registerContinuableSetup，
   // 改为【全局 tools.guard】——按调用方 subagentDepth>=1 在【执行时】拒绝子代理调用
   // 任何"再起新代理 / 管理委派树"的工具。全局守卫天然覆盖所有插件层工具
@@ -163,7 +185,21 @@ export function apply(ctx, config = {}) {
       const sid = session?.id ?? (typeof session === 'string' ? session : null)
       if (sid) {
         dispatcher.purgeParent(sid)
-        hostApproval.purgeSession(sid)
+        // v1.12.2：同时清理根会话 id 的工具名授权（子会话销毁时通过 registerSessionRoot 反查根 id）
+        const purged = hostApproval.purgeSession(sid)
+        // v1.12.4：清理结果落盘留痕——「授权为什么没了」必须能事后回溯。
+        // 什么都没清到就不写行，避免日志被无意义的 dispose 淹没。
+        if (purged.hadRules || purged.hadGrants || purged.childMappings > 0) {
+          logApproval(
+            `purgeSession(${purged.isRoot ? '根会话' : '子会话 root=' + purged.rootId} sid=${sid}): ` +
+            `toolGrants=${purged.hadGrants} sessionRules=${purged.hadRules} childMappings=${purged.childMappings}`,
+            {
+              action: 'purge', sid, rootId: purged.rootId, isRoot: purged.isRoot,
+              hadRules: purged.hadRules, hadGrants: purged.hadGrants,
+              childMappings: purged.childMappings,
+            },
+          )
+        }
       }
     })
   } catch (err) {
@@ -314,17 +350,148 @@ export function apply(ctx, config = {}) {
         const sessionId = session?.id
         if (!sessionId) return next()
         ctxInfo = resolveApprovalContext({ session, callId: req.callId, toolName: req.toolName, reason: req.reason })
+        // 解析根会话 id：同一主代理会话内所有子代理共享工具名授权
+        const rootSessionId = resolveRootSessionId(session, dispatcher, (sid) => hostApproval.sessionRootOf(sid))
+        // 注册映射：purgeSession 时可从子会话 id 反查根 id 清除 #toolGrants
+        // v1.12.4：只对**委派子会话**登记。fork 的 header 只有 parentSession（宿主
+        // fork 不设 origin/delegationDepth），它自身就是根；若把 fork→源会话
+        // 登记进 #sessionRoots，fork 派出的子代理会经链式上溯回到源会话——
+        // 阻断 1 换个入口重新打开，且源会话 dispose 后再写下的键再无 purge 路径。
+        if (isDelegatedSession(session)) hostApproval.registerSessionRoot(sessionId, rootSessionId)
         // 暂存上下文供 REST 端点查询/写规则（服务端重取路径，不信任客户端）
         if (req.callId && ctxInfo) {
-          hostApproval.pushPendingContext(req.callId, { ...ctxInfo, sessionId })
+          hostApproval.pushPendingContext(req.callId, { ...ctxInfo, sessionId, rootSessionId })
         }
-        // 解析不出路径的请求不参与规则匹配，直接放行到交互层
+        // 排除门按档位拆分（v1.12.5 用户裁定 + 二次裁定）：
+        //   ACP 孪生 → 本插件一档都不判，直接交回宿主与琥珀球（v1.11.4 语义完全不变）；
+        //   沙箱越权 → 禁用「工具名级」短路**与「落盘项目级」白名单**，只保留会话路径档。
+        // 越权因此重新享有路径级记忆，但记忆范围是本次主代理会话：同一路径点过一次
+        // 「总是允许」后不再反复弹窗，换个会话仍要问（v1.12.5 二次裁定）。
+        // 写入侧从来没被关掉（pushPendingContext 在上面、排除门之前就已暂存上下文，
+        // 客户端蓝球对 next() 委托的请求照样渲染按钮并 POST 规则）——1.12.x 的回归
+        // 只出在读取侧：一刀切 return next() 让写在根会话键上的路径规则永远读不到。
+        if (isAcpTwinApproval(ctxInfo.toolName, ctxInfo.reason)) return next()
+        // v1.12.6 危险命令排除门（用户裁决）：`rm -rf` / `npm publish` / `pnpm publish` /
+        // `yarn publish` / `git push` **在任何档位下都必须走交互授权**——工具名档、
+        // 会话路径档、落盘项目档一律不判。等价写法（`sudo`/`bash -c`/`xargs`/`git -C`…）
+        // 同属一类，判据在 lib/host-approval.js 的 DANGEROUS_COMMAND_RULES（覆盖边界与
+        // 残留边界都写在它的注释里）。
+        // 位置是刻意的：**早于下面所有档位判定**（工具名短路在第 400 行附近），
+        // 把它挪到工具名短路之后，这些命令就会先被工具名档静默放行（有用例做顺序哨兵）。
+        // **两个来源都要查**：① `commandText`（command/cmd/script 键）；② `argsText`
+        // （args 里所有字符串值）——自定义执行工具 `{shell: 'rm -rf …'}` 的工具名与参数键
+        // 都不在各自的名单里，只看 ① 是一次静默放行（终审阻断的最后一格）。
+        // 名单与 product-subagents 的 lib/dangerous-commands.js 同源，单点常量在
+        // lib/host-approval.js 的 DANGEROUS_COMMAND_RULES，改动需两边同步。
+        // v1.12.6 第五轮（终审 Minor 2）：判据文本**有界截断**（MAX_DANGER_TEXT_CHARS=256KB）。
+        // 这门是**线性于文本长度**的同步判定，跑在每次审批的热路径上；`argsText` 是 args 里
+        // 所有字符串值的拼接（`write` 的 content / `edit` 的 new_string 动辄几 MB），
+        // 终审实测 4MB ⇒ 889ms 阻塞宿主事件循环。截断只影响**判定用**的文本：
+        // 下面「执行类解析不出命令文本 ⇒ 不自动放行」仍按**完整** ctxInfo.commandText 判。
+        // 取舍（超长参数只检查前 256KB）写在 boundDangerText 的 JSDoc 与 CHANGELOG 里。
+        // v1.12.6 第六轮（终审 Minor 3）两侧口径**分开**：`commandText` 是**真正的 shell
+        // 正文**（command/cmd/commandLine/script 这五个键），超长不是常态 ⇒ **超限即保守
+        // 转交互**（门名 `command-too-long`，与下面「命中危险命令」同一个方向：判不出不是
+        // 放行）；`argsText` 里含 `write` 的正文、大正文是常态 ⇒ **保持截断不动**。
+        const dangerCmd = boundDangerText(ctxInfo.commandText)
+        const dangerArgs = boundDangerText(ctxInfo.argsText)
+        if (dangerCmd.omitted > 0 || dangerArgs.omitted > 0) {
+          logApproval(
+            `宿主审批危险命令门：判据文本超长已截断（只检查前 ${MAX_DANGER_TEXT_CHARS} 字符）: ` +
+            `tool=${ctxInfo.toolName ?? '?'} session=${sessionId} root=${rootSessionId} ` +
+            `commandOmitted=${dangerCmd.omitted} argsOmitted=${dangerArgs.omitted}`,
+            {
+              action: 'danger-text-truncated', tool: ctxInfo.toolName ?? null,
+              sessionId, rootSessionId, maxChars: MAX_DANGER_TEXT_CHARS,
+              commandOmitted: dangerCmd.omitted, argsOmitted: dangerArgs.omitted,
+            },
+          )
+        }
+        // `commandText` 超限 ⇒ 后段根本没扫过，判不出**不等于**放行 ⇒ 与危险命令命中同路
+        // （留痕带门名、暂存上下文带 dangerRule，客户端据此说明「每次都问、不可记忆」）。
+        if (dangerCmd.omitted > 0) {
+          const tooLong = {
+            rule: COMMAND_TOO_LONG_RULE,
+            segment: `commandText 超长（${ctxInfo.commandText.length} 字符 > ${MAX_DANGER_TEXT_CHARS}）`,
+          }
+          if (req.callId) {
+            hostApproval.pushPendingContext(req.callId, { ...ctxInfo, sessionId, rootSessionId, dangerRule: tooLong.rule })
+          }
+          logApproval(
+            `宿主审批不自动放行（${COMMAND_TOO_LONG_RULE}：执行类命令正文超过有界判定的上限）: ` +
+            `tool=${ctxInfo.toolName ?? '?'} session=${sessionId} root=${rootSessionId} ` +
+            `commandText=${ctxInfo.commandText.length} > ${MAX_DANGER_TEXT_CHARS}`,
+            {
+              action: 'danger-command-block', rule: tooLong.rule, tool: ctxInfo.toolName ?? null,
+              sessionId, rootSessionId, segment: tooLong.segment,
+            },
+          )
+          return next()
+        }
+        const danger = dangerousCommandMatch(dangerCmd.text) || dangerousCommandMatch(dangerArgs.text)
+        if (danger) {
+          // v1.12.6（终审 M3）让 UI 说得出「每次都会问、不可记忆」：写侧一字未动（用户点
+          // 「总是允许」照样写规则），但读取侧这道门排在最前 ⇒ 这三条命令永远读不到刚写的
+          // 规则。不在客户端标明就等于让用户以为已经授权、然后反复被问。
+          // 暂存上下文在上面（门前）已写入——写侧依赖它，位置不能挪；这里按同一 callId
+          // **覆盖**一份带门名的（peekPendingContext 读到的是这一份）。
+          if (req.callId) {
+            hostApproval.pushPendingContext(req.callId, { ...ctxInfo, sessionId, rootSessionId, dangerRule: danger.rule })
+          }
+          logApproval(
+            `宿主审批不自动放行（危险命令排除门命中 ${danger.rule}）: ` +
+            `tool=${ctxInfo.toolName ?? '?'} session=${sessionId} root=${rootSessionId} ` +
+            `segment=${JSON.stringify(danger.segment)}`,
+            {
+              action: 'danger-command-block', rule: danger.rule, tool: ctxInfo.toolName ?? null,
+              sessionId, rootSessionId, segment: danger.segment,
+            },
+          )
+          return next()
+        }
+        // 保守策略（用户裁决）：执行类调用**命令文本解析不出来**时也不自动放行——
+        // 解析不出就无法断言它不是 `rm -rf`，宁可交互。非执行类不受此条影响。
+        if (ctxInfo.execLikely && !ctxInfo.commandText.trim()) {
+          logApproval(
+            `宿主审批不自动放行（执行类调用但命令文本解析不出）: ` +
+            `tool=${ctxInfo.toolName ?? '?'} session=${sessionId} root=${rootSessionId} callFound=${ctxInfo.callFound}`,
+            {
+              action: 'no-command-text-block', tool: ctxInfo.toolName ?? null,
+              sessionId, rootSessionId, callFound: ctxInfo.callFound,
+            },
+          )
+          return next()
+        }
+        const disallowToolGrant = isDisallowedAutoGrant(ctxInfo.toolName, ctxInfo.reason)
+        // 优先短路：工具名授权（不依赖 paths，即使解析不出路径也能命中）——越权不走这一档
+        if (!disallowToolGrant && ctxInfo.toolName && hostApproval.toolGrantCovers(rootSessionId, ctxInfo.toolName)) {
+          logApproval(
+            `宿主审批自动放行（本会话工具授权命中）: ` +
+            `tool=${ctxInfo.toolName} scope=session-tool root=${rootSessionId} session=${sessionId}`,
+            { action: 'auto-grant', scope: 'session-tool', tool: ctxInfo.toolName, rootSessionId, sessionId },
+          )
+          return Promise.resolve('allowed-once')
+        }
+        // 路径规则：解析不出路径的请求不参与路径规则匹配，直接放行到交互层
         if (ctxInfo.paths.length === 0) return next()
-        const hit = hostApproval.decide({ sessionId, cwd: ctxInfo.cwd, paths: ctxInfo.paths })
+        // 两个开关同源（都是「被排除的越权请求」），但在 decide 里各管一档：
+        // disallowToolGrant 关工具名档，sessionOnly 关落盘项目档。
+        const hit = hostApproval.decide({ sessionId, rootSessionId, cwd: ctxInfo.cwd, paths: ctxInfo.paths, toolName: ctxInfo.toolName, disallowToolGrant, sessionOnly: disallowToolGrant })
         if (hit.allowed) {
-          console.log(
-            `[dsh-agent-dispatch] 宿主审批自动放行（${hit.scope === 'session' ? '本会话' : '项目'}规则命中）: ` +
-            `tool=${ctxInfo.toolName ?? '?'} session=${sessionId} paths=${ctxInfo.paths.join(', ')}`
+          // v1.12.4：这里的 scope 只可能是 'session'（会话路径规则）或 'project'（项目规则）——
+          // 'session-tool' 档在上面已短路（越权请求根本不走那一档），永远到不了这里，故不再列进文案
+          // （v1.12.2 m2 是死文案）。
+          // v1.12.5 二次裁定：越权请求到这里只可能是 'session'——落盘项目档也被 sessionOnly 跳过了。
+          // 留痕**不带 paths 数组**（用户裁决：单行要精炼）：完整路径既撑爆日志又没有排查价值，
+          // 要看具体是哪几个路径，按 sessionId + callId 回宿主会话记录查。
+          logApproval(
+            `宿主审批自动放行（${hit.scope === 'session' ? '本会话路径规则' : '项目规则'}命中）: ` +
+            `tool=${ctxInfo.toolName ?? '?'} scope=${hit.scope} session=${sessionId} ` +
+            `root=${rootSessionId} pathCount=${ctxInfo.paths.length}`,
+            {
+              action: 'auto-grant', scope: hit.scope, tool: ctxInfo.toolName ?? null,
+              rootSessionId, sessionId, pathCount: ctxInfo.paths.length,
+            },
           )
           return Promise.resolve('allowed-once')
         }
@@ -1602,7 +1769,9 @@ export function apply(ctx, config = {}) {
       const r = merged[i]
       // v1.11.12：kind:'config' 是「配置项被产品拒绝」的观测行，不是一次委派——
       // 只留档供 grep/排障，不参与 result 配对，也不进历史页卡片。
-      if (r.kind === 'config') { merged[i] = null; continue }
+      // v1.12.4：'host-approval'（审批放行/授权清理）与 'plugin-warn'（降级留痕）
+      // 同属观测行——它们没有 childId，落到历史页会变成一排「状态未知」的假卡片。
+      if (r.kind === 'config' || r.kind === 'host-approval' || r.kind === 'plugin-warn') { merged[i] = null; continue }
       if (r.kind === 'result') {
         if (r.childId && pending.has(r.childId)) {
           const j = pending.get(r.childId)
@@ -1838,7 +2007,7 @@ export function apply(ctx, config = {}) {
           }
           case '/agent-api/permission-decision': {
             // v1.9.0：授权球按钮决策 → 转发 product-subagents（双通道竞速）
-            // body: { childId, permId?, answer: 'allow-once'|'allow-session'|'allow-always'|'deny' }
+            // body: { childId, permId?, answer: 'allow-once'|'allow-session'|'allow-always'|'deny', paths?: string[] }
             // v1.11.14(A)：permId 精确决议某一条；缺省（老 client）时由
             // product-subagents 按 FIFO 摘最早一条，不会丢请求。
             const answer = body && body.answer
@@ -1847,9 +2016,20 @@ export function apply(ctx, config = {}) {
               return send(res, 400, { ok: false, error: 'permission-decision 需要 childId 与合法 answer' })
             }
             const permId = typeof body.permId === 'string' && body.permId.trim() ? body.permId.trim() : null
+            // v1.12.6（U2 契约，与 product-subagents 0.7.9 对齐）：「可编辑路径」弹框
+            // 确认后可以把**用户声明的目录**一起带过来。三态与宿主侧同口径：
+            //   · 非数组（老 client / 没给）⇒ 完全不进载荷 ⇒ 产品侧沿用其自动分析；
+            //   · 给了且非空 ⇒ 产品侧只写路径档；
+            //   · 给了且为空数组 ⇒ 产品侧只写工具名档。
+            // 本插件**不**在这里校验或改写：产品侧 planGrantWrites 是这条链的
+            // 单一判定点（0.7.9 lib/permission-rules.js），两侧各判一次必然漂移。
+            const pathsGiven = Array.isArray(body && body.paths)
             try {
-              ctx.emit('product-subagents/permission-decision', { childId: target, permId, answer })
+              const payload = { childId: target, permId, answer }
+              if (pathsGiven) payload.paths = body.paths
+              ctx.emit('product-subagents/permission-decision', payload)
               out = { forwarded: true, answer, permId }
+              if (pathsGiven) out.pathsCount = body.paths.length
             } catch (err) {
               return send(res, 409, { ok: false, error: err.message })
             }
@@ -1857,7 +2037,22 @@ export function apply(ctx, config = {}) {
           }
           case '/agent-api/host-approval-rule': {
             // v1.10.0：宿主审批分档规则写入（服务端重取路径，不信任客户端）
-            // body: { scope: 'session'|'project', sessionId, callId?, cwd? }
+            // v1.12.0：新增工具名级会话授权（scope=session 时按根会话+工具名授权，
+            //   同一主会话内所有子代理共享，不再因路径不同重复弹窗）。
+            // v1.12.5（二次裁定）：scope=project 且暂存上下文是**沙箱越权** ⇒ 不落盘，
+            //   降级写会话路径规则，响应如实回 scope='session' + projectSuppressed。
+            // v1.12.6 B1：上面那条的判据收窄回 isSandboxEscalation（1.12.5 误用了含
+            //   ACP 孪生的 isDisallowedAutoGrant，把 ACP 孪生原有的项目档落盘一起吞了）。
+            // v1.12.6 U2：新增可选 body.paths ——「可编辑路径」弹框里用户确认的目录声明。
+            //   三态与 product-subagents 0.7.9 planGrantWrites 同口径（两侧必须对齐）：
+            //     · 未给（非数组）⇒ 老客户端 ⇒ 完全沿用服务端自动分析，行为逐字不变；
+            //     · 给了且校验后非空 ⇒ **只写路径档**（用户声明的已是目录，不补父目录，
+            //       也不写工具名档）；
+            //     · 给了且为空（[] 或全部被校验丢弃）⇒ **只写工具名档**，一条路径都不写。
+            //   声明只在 callId 反查到审批上下文时才被接受，否则 400：拿不到 reason
+            //   就判不出这条是不是越权，不能盲落盘（「不信任客户端」= 接受但必须校验 +
+            //   必须挂在一次真实审批上，授权主体是用户本人）。
+            // body: { scope: 'session'|'project', sessionId, callId?, cwd?, toolName?, paths? }
             const scope = body && body.scope
             const sid = body && body.sessionId
             if (!sid || !['session', 'project'].includes(scope)) {
@@ -1867,44 +2062,159 @@ export function apply(ctx, config = {}) {
             let approvalCtx = null
             const callId = body && body.callId
             if (callId) {
-              // 找到对应 session：审批请求的 agent 绑定 session
-              // 客户端可能传 callId 但无直接 session 引用——
-              // 审批请求来自主会话（宿主审批），sessionId 已知
-              // 尝试从 dispatcher 活跃子代理反查 session
-              // 但主代理审批请求的 session 就是宿主的主会话——
-              // 这里走最简路径：通过 dispatcher 已有 session 引用
-              // 先试从 dispatcher 的 child 反查
-              let session = null
-              for (const [, entry] of dispatcher.activeChildren.entries()) {
-                if (entry?.parentSessionId === sid || entry?.childId === sid) {
-                  session = entry?._parentSession ?? null
-                  break
-                }
-              }
-              // 兜底：直接从宿主取——但宿主 session 不通过 dispatcher 暴露
-              // 实际场景：审批请求在 approval/request handler 里已解析出完整上下文，
-              // 客户端 POST 本端点时不再需要 session（路径已在 handler 解析并暂存）
-              // 方案：approval/request handler 把解析结果暂存到内存 Map；
-              // 客户端可能先 GET context（peek）展示路径后再 POST rule（pop）——
-              // POST 用 pop 取走即删（单次消费），与 GET 的 peek 互不干扰
               approvalCtx = hostApproval.popPendingContext(callId)
             }
             // 优先用暂存上下文（approval/request handler 已解析），否则用 body 中的 cwd
-            const paths = approvalCtx?.paths ?? []
+            // 注意：自动分析的路径只能来自 callId 反查——无 callId ⇒ approvalCtx 为 null
+            // ⇒ 自动路径恒为 []。这一点决定了下面 scope==='session' 分支的真实语义。
+            const autoPaths = approvalCtx?.paths ?? []
             const cwd = approvalCtx?.cwd ?? (body && body.cwd) ?? null
-            if (paths.length === 0) {
-              return send(res, 400, { ok: false, error: '无法解析请求路径（可能无 callId 或工具调用记录未落盘）' })
+            // v1.12.3：服务端自行解析根会话 id，不轻信客户端传来的 sessionId
+            // （无 callId 时客户端可能传子会话 id → 工具名授权写到子会话键 → 永不命中）
+            let rootSessionId = approvalCtx?.rootSessionId ?? null
+            if (!rootSessionId) {
+              // 无暂存上下文 → 从 sessionId 解析。这里拿不到宿主 session 对象
+              // （宿主不暴露会话查询），只能给一个 header 为空的壳子：
+              // 解析结果要么是 sid 自身，要么是经 #sessionRoots 链上去的根 id
+              // （该映射只在 approval/request 见到真实 header 时按委派判据登记）。
+              const lookupSession = { id: sid, header: {} }
+              rootSessionId = resolveRootSessionId(lookupSession, dispatcher, (s) => hostApproval.sessionRootOf(s))
             }
+            const toolName = body?.toolName || approvalCtx?.toolName || null
+            // v1.12.6 U2：客户端声明的目录（逐条服务端校验，非法丢弃；未给 = 自动分析）
+            const declared = validateDeclaredPaths(body && body.paths)
+            const useDeclared = declared.given
+            // v1.12.6 第五轮（终审 M-B）：**给了路径但一条都不合法** ≠ **本来就空**。
+            // 两者天然可分：真删空时 `dropped === []`（客户端 `collect()` 只收勾选行的非空行），
+            // 而「全非法」必然带 dropped（至少一条 `非绝对路径`/`根目录`/空串…）。
+            // 改前两者走同一条路 ⇒ 落到「路径声明为空 ⇒ 只写工具名档」⇒ **静默放大**：
+            // 用户以为自己授权了 `./x.txt`，实际拿到的是**整个工具**（终审端点级原始输出：
+            // `POST paths:['./x.txt']` → 200 + `toolGrant(read)` ⇒ 随后 read `/etc/passwd`
+            // 直接 `allowed-once`）。放大方向是「少弹、且弹框里看不出来」，必须拒。
+            // 这里**不写任何档**（会话档、落盘档、工具名档都不写）并回 400 说清原因。
+            if (useDeclared && declared.declared.length === 0 && declared.dropped.length > 0) {
+              logApproval(
+                `宿主审批规则：路径声明全部非法 ⇒ 拒写任何规则（既不写路径档，也不退化成工具名档）: ` +
+                `tool=${toolName ?? '未解析出'} session=${sid} requested=${declared.dropped.length} ` +
+                `reasons=${JSON.stringify([...new Set(declared.dropped.map((d) => d.reason))])}`,
+                {
+                  action: 'rule-rejected-all-paths-dropped', tool: toolName ?? null,
+                  sessionId: sid, droppedCount: declared.dropped.length,
+                  reasons: [...new Set(declared.dropped.map((d) => d.reason))],
+                },
+              )
+              return send(res, 400, {
+                ok: false,
+                error: 'paths 里没有一条可用的绝对路径（全部被校验丢弃）：本次不写任何规则'
+                  + '——写成工具名档会把授权放大到整个工具，而用户以为只授权了那几条路径',
+                dropped: declared.dropped,
+              })
+            }
+            if (useDeclared && !approvalCtx) {
+              return send(res, 400, {
+                ok: false,
+                error: '带 paths 声明的写入必须带能反查到审批上下文的 callId：'
+                  + '没有上下文就判不出这条请求是不是沙箱越权，不能盲落盘',
+              })
+            }
+            const paths = useDeclared ? declared.declared : autoPaths
+            // 用户声明的是目录，不再 expandPathsWithParents（会把 /tmp/newproj 放大成 /tmp）
+            const expand = !useDeclared
+            // v1.12.5 二次裁定 + v1.12.6 B1 收窄：**只有沙箱越权**不得写落盘项目白名单。
+            // 判据是 isSandboxEscalation(approvalCtx.reason) 单独一条，**不是**
+            // isDisallowedAutoGrant（那是读取侧「工具名档不适用」的判据，含 ACP 孪生）。
+            // 1.12.5 误用后者的后果：ACP 孪生点「总是允许(项目)」也被降级成会话档、
+            // allowlist.json 根本不创建——ACP 的既有落盘行为被顺带改掉，而用户口径是
+            // 「ACP 完全绕过、不要动它」，且 CHANGELOG 自述写的是「判为越权时不落盘」。
+            // 这里没有「判不出是不是越权却照样落盘」的漏口：能走到落盘的两条路
+            // （自动路径 / 用户声明）都要求 approvalCtx 存在，reason 就在里面。
+            const sandboxEscalated = !!approvalCtx && isSandboxEscalation(approvalCtx.reason)
+            // v1.12.3 根会话确认门（原样保留）：rootSessionId===sid 且无暂存上下文时，
+            // 无法确认 sid 是不是真正的根 → 拒写工具名授权（防写到非根键永不命中）
+            const isConfirmedRoot = rootSessionId !== sid || !!approvalCtx?.rootSessionId
             let writeResult
-            if (scope === 'session') {
-              writeResult = hostApproval.addSessionRule(sid, paths)
+            let toolOnly = false
+            if (useDeclared && paths.length === 0) {
+              // 弹框里**真删空**（`paths: []`，`dropped === []`）⇒ 「只要工具名」（用户明确定的
+              // 语义）。v1.12.6 第五轮（终审 M-B）之后，**「给了但全非法」到不了这里** ——
+              // 它在上面就 400 了；走到这里只可能是客户端如实报了空声明。
+              if (toolName && isConfirmedRoot) writeResult = hostApproval.addToolGrant(rootSessionId, toolName)
+              if (!writeResult) {
+                return send(res, 400, {
+                  ok: false,
+                  error: '路径已全部删空 ⇒ 本次只写工具名档，但工具名档写不出去'
+                    + `（toolName=${toolName ?? '未解析出'}${isConfirmedRoot ? '' : '，且无法确认根会话 id'}）`,
+                })
+              }
+              toolOnly = true
+              logApproval(
+                `宿主审批规则：路径声明为空 ⇒ 只写工具名档: ` +
+                `tool=${toolName} scope=session root=${rootSessionId} session=${sid} dropped=${declared.dropped.length}`,
+                {
+                  action: 'rule-tool-only', scope: 'session', tool: toolName, rootSessionId, sessionId: sid,
+                  requested: (body && Array.isArray(body.paths) ? body.paths.length : 0), droppedCount: declared.dropped.length,
+                },
+              )
+            } else if (scope === 'session') {
+              if (useDeclared) {
+                // 用户声明了目录 ⇒ 只写路径档（契约「paths 与 tools 互斥」）
+                writeResult = hostApproval.addSessionRule(rootSessionId, paths, { expand: false })
+              } else {
+                // 工具名级授权：写入根会话 + 工具名（v1.12.3 根会话确认门见上）
+                // v1.12.4：删掉 v1.12.3 那句「降级为路径级」的空 else-if 分支——它是死代码：
+                // 走到这里必然无 callId ⇒ paths 为 [] ⇒ 下面的路径规则写入也不会执行，
+                // 真实行为是「什么都不写，落到下面返回 400」。
+                if (toolName && isConfirmedRoot) {
+                  writeResult = hostApproval.addToolGrant(rootSessionId, toolName)
+                }
+                // 路径规则：有路径时仍写入路径规则（兼容旧按钮与路径级精细授权）
+                // v1.12.1：路径规则也写入 rootSessionId 键（与 decide 读取一致）
+                if (paths.length > 0) {
+                  const pathResult = hostApproval.addSessionRule(rootSessionId, paths)
+                  if (!toolName) writeResult = pathResult
+                }
+                if (!writeResult) {
+                  return send(res, 400, {
+                    ok: false,
+                    error: '未写入任何规则：无法解析请求路径（需要 callId 且工具调用记录已落盘），'
+                      + '且无法确认根会话 id（无 callId 时不写工具名授权，避免写到非根键永不命中）',
+                  })
+                }
+              }
             } else {
-              writeResult = hostApproval.appendProjectRule({ cwd, paths, note: '用户在授权球点击总是允许(项目)' })
+              if (paths.length === 0) {
+                return send(res, 400, { ok: false, error: '无法解析请求路径（可能无 callId 或工具调用记录未落盘）' })
+              }
+              if (sandboxEscalated) {
+                // 越权点「总是允许(项目)」不落盘，降级为会话路径规则（v1.12.5 二次裁定）。
+                // 这里的判据只可能是沙箱越权（B1 收窄后），日志才敢直接写「越权」；
+                // 1.12.5 用含 ACP 孪生的判据时，ACP 场景会打出「越权」字样误导排障。
+                // 客户端 1.12.6 起会在弹框里如实说明越权只到会话为止，但响应仍必须
+                // ① 如实回 scope='session' + projectSuppressed，② 留痕写明降级。
+                writeResult = hostApproval.addSessionRule(rootSessionId, paths, { expand })
+                logApproval(
+                  `宿主审批规则降级落会话档（沙箱越权请求不得写项目白名单，判据 isSandboxEscalation）: ` +
+                  `tool=${toolName ?? '?'} scope=session root=${rootSessionId} session=${sid} pathCount=${paths.length}`,
+                  { action: 'rule-downgraded', scope: 'session', tool: toolName ?? null, rootSessionId, sessionId: sid, pathCount: paths.length },
+                )
+              } else {
+                writeResult = hostApproval.appendProjectRule({ cwd, paths, expand, note: '用户在授权球点击总是允许(项目)' })
+              }
             }
             if (!writeResult.ok) {
               return send(res, 400, { ok: false, error: writeResult.error || '写入规则失败' })
             }
-            out = { written: true, scope, paths, count: writeResult.count }
+            // 实际生效档位：越权的项目档被降级、删空路径的项目档只落到工具名会话档——
+            // 两种情况都不能照着用户点的标签回 'project'
+            const downgraded = scope === 'project' && (sandboxEscalated || toolOnly)
+            out = {
+              written: true,
+              scope: downgraded ? 'session' : scope,
+              paths, toolName, rootSessionId, count: writeResult.count,
+              ...(sandboxEscalated && scope === 'project' ? { projectSuppressed: true } : {}),
+              ...(toolOnly && scope === 'project' ? { toolOnly: true } : {}),
+              ...(useDeclared ? { pathsSource: 'user', dropped: declared.dropped } : {}),
+            }
             break
           }
           default:
@@ -2041,9 +2351,10 @@ export function apply(ctx, config = {}) {
         // 让后续 POST host-approval-rule 仍能 pop 到同一上下文（v1.10.1 修复）
         let approvalCtx = callId ? hostApproval.peekPendingContext(callId) : null
         if (!approvalCtx) {
-          // 暂存已消费（客户端先 POST rule 再 GET context 的场景）
-          // 返回空上下文
-          approvalCtx = { toolName: null, paths: [], reason: null, cwd: null, callId: callId || null, callFound: false }
+          approvalCtx = {
+            toolName: null, paths: [], structuredPaths: [], inferredPaths: [],
+            reason: null, cwd: null, callId: callId || null, callFound: false, rootSessionId: null,
+          }
         }
         return send(res, 200, { ok: true, ...approvalCtx })
       }

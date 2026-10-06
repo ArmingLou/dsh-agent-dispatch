@@ -1,3 +1,1793 @@
+## 1.12.6（2026-10-06）
+**两件事一起交付：① 修终审阻断项 B1（写侧落盘判据被写宽，误吞 ACP 孪生的项目档落盘）+ M1/m1/m2；② 新的「可编辑路径」授权弹框（U2）、面板「说实话」（U1）、弹框可滚动（U3）。**
+1.12.5 从未发布，本轮连同它一起作为 1.12.6 交付；**部署态仍是 1.12.4**，本轮未部署、未重启宿主、未动 `~/.dsh`。
+最终基线：`node --test test/*.test.js` → `# tests 551 / # pass 551 / # fail 0 / # skipped 0`，退出码 0；`node verify.mjs` 退出码 0。
+（本节主体交付时的基线是 497；定稿轮按独立终审二审意见收口后增至 509；**第四轮**再收口终审三审的
+1 阻断 + 2 Major + 6 Minor 后增至 518；**第五轮**收口终审四审的 3 Major + 3 Minor 并并入一条
+用户新裁定（相对路径按工作区目录补齐）后增至 531；**第六轮**（收尾）再收口终审五审的 1 Major
+（9 个同族包装器）+ 4 Minor 后增至 538；**第七轮**（收尾）再收口终审六审的 1 阻断
+（短选项大小写折叠 ⇒ 同形开关吃掉真程序名）+ 结构性兜底 + 2 Minor + 设计裁定第 10 条后增至 **546**，
+见文末「第七轮」；**第八轮**再收口独立终审七审的 2 阻断（**欠吃**方向：已登记包装器漏登记真实
+取值选项 + macOS 同族包装器整类漏登记）+ 1 测试盲区（M2）后增至 **551**，见文末「第八轮」。）
+
+### 与 dsh-plugin-product-subagents 0.7.9 的契约（两侧必须同口径）
+- `product-subagents/permission-pending` 事件载荷新增 `suggestedDirs: string[]`——产品侧
+  `suggestedDirs()` 算出的**目录**候选，是「可编辑路径」弹框的预填值。
+- `product-subagents/permission-decision` 接受可选 `paths: string[]`，三态：
+  **未给**（非数组）⇒ 产品侧沿用其自动分析；**给了且非空** ⇒ 只写路径档；
+  **给了且空数组** ⇒ 只写工具名档。`paths` 与工具名档**互斥**（非空声明就不再写工具名档）。
+- 本插件在琥珀通道**只透传、不校验、不改写**（`index.js:1928-1941`）：这条链的单一判定点是
+  产品侧 `planGrantWrites`（0.7.9 `lib/permission-rules.js`），两侧各判一次必然漂移。
+  宿主通道（蓝球）反过来**必须**服务端校验，因为那是本插件自己写的规则文件（见 U2）。
+- 载荷最小化：`toolName` / `toolNameSource` / `suggestedDirs` 由
+  `serializePermissionPending`（`lib/dispatch.js:446-457`）与 `markPermissionPending`
+  （`:1525-1537`）记账透传；面板**不回显完整 paths 原文**（路径属敏感信息，U1 用例钉住）。
+
+### 阻断项 B1（终审）：写侧落盘抑制的判据收窄回「只认沙箱越权」
+- **根因**：1.12.5 把写入侧的抑制判据写成了 `isDisallowedAutoGrant`（= 沙箱越权 **或** ACP 孪生）。
+  那条判据是**读取侧**「不得吃工具名档」用的；拿它管落盘，ACP 孪生点「总是允许(项目)」也被
+  降级成会话档，`allowlist.json` 根本不创建——**与 1.12.5 自己写的「ACP 孪生一字未动」矛盾**，
+  也超出用户口径（只要求越权受限，ACP 是「完全绕过、不要动它」）。终审实测：写侧通道零测试覆盖。
+- **修法（方案 a：判据分档，读取侧一字未动）**：`index.js:2014`
+  改前 `const pendingExcluded = !!approvalCtx && isDisallowedAutoGrant(approvalCtx.toolName, approvalCtx.reason)`
+  改后 `const sandboxEscalated = !!approvalCtx && isSandboxEscalation(approvalCtx.reason)`；
+  读取侧 `index.js:373` 的孪生早退门与 `:375` 的 `disallowToolGrant` 保持原样 ⇒
+  孪生的项目档落盘恢复 1.12.4 行为，越权的抑制照旧。
+  标识符改名（`pendingExcluded` → `sandboxEscalated`）是让**变量名参与文档**：
+  写侧判据从此只能读作「是不是越权」。`verify.mjs:1028` 加了「源码里不得再出现
+  `pendingExcluded`」的反向断言。
+- **同源的 Minor**：降级留痕的文案此前在 ACP 场景也会打出「越权」字样（误导排障）。
+  `index.js:2069-2079` 现在只在真越权时打印，并把判据写进日志
+  （`沙箱越权请求不得写项目白名单，判据 isSandboxEscalation`）。
+- `lib/host-approval.js:326-342` 的 `isDisallowedAutoGrant` JSDoc 改为**明写它只管读取侧**，
+  并记下这次误用的后果，防止后来人再拿它管落盘。
+- **CHANGELOG 自述更正**：1.12.5 那节的三处失真已就地订正（`:18-29` 的落盘判据、
+  `:58-64` 的「写入侧同理用同一份判据」、`:132-137` 的 `isDisallowedAutoGrant` 语义），
+  并把「客户端文案对越权不精确」那条已知局限标为「1.12.6 已处理」；
+  另补回 1.12.4 那节丢掉的分节标题。
+
+### Major M1：路径级记忆的粒度是**目录**，接受并写清（不是漏口）
+- 用户定的统一模型：「把文件路径提取为上一级目录，指定路径往后的一切工具调用都放行」。
+  机制是 `expandPathsWithParents`（`lib/host-approval.js:91`）补**直接父目录** +
+  `pathAllowed` 按目录前缀匹配（`:164`）。1.12.5 的实现注释没讲清，容易被后来人当漏口"修掉"。
+- 本轮把语义写进三处文档（`lib/host-approval.js:44-58` 头注释、`:106-120` 函数注释、
+  `index.js:2004` 与 `:2041-2042` 的「用户声明不补父目录」注释），并用
+  `test/host-approval-endpoint.test.js` 的 M1 describe 钉死：
+  同目录兄弟文件不弹、子目录不弹、**换目录仍弹**（不外溢到兄弟目录）。
+- 与之相对：用户在「可编辑路径」弹框里**自己声明**的目录已经是目录，
+  再以 `expand:false` 写规则（`lib/host-approval.js:537`、`:676`）——
+  对目录再取父目录会把「放行 `/tmp/newproj`」放大成「放行 `/tmp`」。
+
+### Major G1：宿主侧「危险命令」排除门（用户裁决：这三条在任何档位下都必须问）
+- **缺口**：产品侧 `dsh-plugin-product-subagents` 有这道门（`lib/dangerous-commands.js:79-83`
+  + `lib/index.js:219-223`，0.7.9 起），**本仓库一条都没有**——全仓 grep
+  `rm -rf` / `npm publish` / `git push` 零命中。用户口径是「这三条在任何档位下都必须走
+  交互授权」，把「本会话授权过一次 Bash」当成此后所有 bash 请求免弹，等于让
+  `rm -rf`、`npm publish`、`git push` 一起被静默放行。
+- **实现**：名单是**单点常量** `DANGEROUS_COMMAND_RULES`（`lib/host-approval.js:432-519`），
+  **与 product-subagents 侧同一名单、需人工保持同步**（文件头注释里写明来源与同步要求；
+  两侧通道不同——那边是 ACP `toolCall.kind`，这边是宿主 `tool/call` 的 `name`+`arguments`——
+  故判据实现各留一份、口径逐条对齐）。命令文本取自 `resolveApprovalContext`
+  的同一条反查链路（`resolveApprovalContext → findToolCallRecord → commandTextOf`，
+  `lib/host-approval.js:296`、`:389`、`:522`），与路径提取**同源**，不另造第二份解析。
+- **位置**：`index.js:375-403`，**早于工具名短路与**所有路径/项目档判定。
+  把它挪到工具名短路之后，这三条会先被工具名档放行（有用例做顺序哨兵）。
+- **覆盖边界（诚实声明，与产品侧逐条对齐）**：
+  - 覆盖 `rm -rf` / `rm -fr` / `rm -r -f` / `rm -f -R` / `rm --recursive --force`
+    （必须**同时**具备递归与强制；`rm -r`、`rm -f` 单旗帜不触发）、`npm publish`、`git push`
+    （含前置全局选项：`npm --silent publish`、`git --no-pager push`）；
+  - 按 `;` `|` `||` `&` `&&` 与换行**分段**，只判每段**开头**那条命令，引号内不切分 ⇒
+    `echo "git push"`、`grep "git push" f`、`# rm -rf` 都不算危险；
+  - 命令名与子命令动词按小写比对（`RM -RF x` 照样命中）；前导环境变量赋值会被跳过；
+  - ~~**不覆盖**：`sudo rm -rf` / `command rm -rf` / `env rm -rf` 等包装、
+    `bash -c 'rm -rf …'` / `xargs rm` 等间接调用、`git -C <dir> push` 这类
+    「全局选项带值」把动词挤到第三个 token 之后的写法、`pnpm publish`/`yarn publish`。~~
+    ⚠️ **这一条已作废**：它是 1.12.6 中间轮（同一轮 Major G1）的记录，上面这几条
+    已在随后「定稿轮 → 🔴 阻断：危险命令门被等价写法绕过」全部收口，
+    第四轮又把同族残留（取值选项大小写、`-exec`、`busybox`、裸解释器读 stdin 等）一并收口。
+    保留原文仅供对照，**不要**当现行覆盖边界读——现行边界见文件头注释
+    （`lib/host-approval.js` 的 `DANGEROUS_COMMAND_RULES` 上方）与「第四轮」一节。
+- **保守策略**：执行类调用（工具名属执行类 slug，或参数里带 shell 正文）但**命令文本
+  解析不出来**时也不自动放行（`index.js:395-403`），日志 `action: 'no-command-text-block'`
+  注明原因；非执行类工具不受影响。命中门留痕 `action: 'danger-command-block'` + `rule` + `segment`。
+- **既有两道门一字未动**：越权（`isSandboxEscalation`）与 ACP 孪生（`isAcpTwinApproval`）
+  的判据、顺序、档位拆分保持现状（新门排在孪生早退门之后、工具名短路之前）。
+
+### Minor m1：CI 从不跑测试，且用例可以静默消失
+- 改前 `.github/workflows/ci.yml` 只有一步 `node verify.mjs`，而 `verify.mjs` 全是
+  字符串/纯函数断言——**一个用例都不执行**。终审 FG3 实测：把某个用例包成
+  `if (false) it(...)`，`node --test` 仍报 `# tests 399 / # pass 399 / # fail 0` 退出码 0。
+- 改后（`ci.yml:19-46`）：先跑 `node --test --test-reporter=tap test/*.test.js` 并传播退出码，
+  再从 TAP 汇总里取 `# tests` 条数与 `MIN_TESTS`（**497**，v1.12.6 收尾时随新增用例上抬：
+  471 → 483 → 497）比对，少一条就红——
+  删用例、包 `if(false)`、加 `.skip` 三条路都过不了 CI。取不到计数也红（reporter 变了 ⇒ 守卫失效要显式处理）。
+
+### Minor m2：一条用例的名字与事实相反
+- 旧名「越权 + **只写路径规则**（POST 不带 toolName）」，但它断言的真实行为是
+  **工具名档照写**——`index.js:1992` 的 `toolName = body?.toolName || approvalCtx?.toolName`
+  会按 `callId` 从工具调用记录把工具名补出来。名字与注释都在教人错误的模型。
+- 改名 `越权 + POST 不带 toolName：服务端从工具调用记录**补出**工具名（v1.12.6 m2 改名）`
+  并加断言 `json.toolName === 'bash'`（响应必须如实回显）；
+  另新增一条真正「补不出工具名」的覆盖（工具调用记录 `name: ''`）
+  `服务端**补不出**工具名时才是「只写路径规则」那一档`，钉住那一档只有路径规则、没有工具名放行。
+
+### U1：授权卡「说实话」——不再拿 `category` 当记忆键
+- 旧文案 `（本会话将记住：<permissionPending.category>）`，而 `category` 只是 title 的 slug
+  （qoder 场景下是一长串命令文本），**不是记忆键**——这句话是在骗用户。
+- 改后三态如实（`lib/client.js:694-702` `permGrantTip`，接线在 `:3686`）：
+  解析得出工具名 ⇒ 真实键 `product:tool`（`toolGrantKeyOf` `:643`，小写归一，
+  与产品侧 0.7.9 `toolGrantKey` 同构，跨产品不串号）；只有路径/建议目录 ⇒
+  「本会话将按路径记住（目录级）」；两者皆无 ⇒ 「本次仅放行一次，不会记住：下次仍会询问」。
+- 数据源补齐：`lib/dispatch.js:446-457` / `:1525-1537` 透出
+  `toolName` / `toolNameSource` / `suggestedDirs`（缺省 `null` / `null` / `[]`）。
+
+### U2：「可编辑路径」授权弹框——**点确认才生效**
+- 本会话允许 / 当前项目允许两类按钮不再即时生效：先弹可编辑目录框
+  （`lib/client.js:719` `openGrantDialog`），预填 `suggestedDirs`（无则从 `paths` 词法取父目录，
+  `dirsOfPaths` `:664`），一行一个目录；用户可增删改，**删空即「只要工具名档」**——
+  提示语实时写明（含真实记忆键），只读末行显示当前工具名（守卫用例 `test/grant-dialog.test.js:249`：解析不出就如实说解析不出）。
+  取消 / Esc / 点遮罩 ⇒ `resolve(null)` ⇒ **零 POST、不放行、不移除条目**。
+- 琥珀通道：`sendDecision(a, answer, label, paths)`（`:3627`，`if (Array.isArray(paths)) payload.paths = paths`）
+  → `POST /agent-api/permission-decision`（`index.js:1928-1941`，按三态透传，回显 `pathsCount`）。
+- 宿主通道：`grantViaDialog(scope)`（`:4035-4059`）→ `POST /agent-api/host-approval-rule`
+  带 `paths` 声明。服务端**只校验不改写**（`lib/host-approval.js:124` `validateDeclaredPaths`）：
+  逐条丢非字符串 / 空串 / 含 NUL / 含换行 / 非绝对路径 / 根目录（`/` 进授权集＝任意路径免弹），
+  词法归一 + 保序去重，响应披露 `pathsSource:'user'` 与被丢条目及原因（`index.js:2097`）。
+  三态落地：非空 ⇒ `addSessionRule(..., {expand:false})` 只写路径档（`index.js:2040-2044`）；
+  空（或被丢光）⇒ 只写工具名档并留痕 `action:'rule-tool-only'`（`:2020-2038`）；
+  带声明却反查不到 `callId` 上下文 ⇒ **400 且不落盘**——拿不到 reason 就判不出是不是越权
+  （`:1996-1999`）。项目档 + 空声明 ⇒ `scope:'session'` + `toolOnly:true`，不落盘。
+- 顺带修掉越权按钮的谎话（1.12.5 记录的「已知局限」）：`:4025-4030` 起，
+  越权请求不再渲染「总是允许该工具」，标签改成「本会话总是允许(路径)」，
+  tooltip 不再出现「同类工具所有路径均放行」，项目档 tooltip 明说「只降级写本会话路径规则，不落盘」；
+  弹框顶部再补一句档位说明（越权 ⇒ 只到本会话、换会话仍会问）。
+  无 `callId` 的条目仍走 `legacySessionPost` / `legacyProjectPost`（`:4063` / `:4077`，
+  载荷与 1.12.5 **逐字一致**，不变量⑦）。
+- 弹框挂在 `document.body` 而不是面板内容区：面板每 3s 轮询重建 `popBody`，
+  挂在里面会被吞掉；`grantDialogOpen` 闩（`:704`）保证同一时刻只有一个，
+  第二个直接 `resolve(null)`，不给上一个留下无人管的遮罩。
+
+### U3：弹框必须能滚，不许撑破视口
+- `lib/client.js:288-298`：遮罩 `position:fixed;inset:0;overflow:auto;overscroll-behavior:contain`；
+  面板 `max-height:min(80vh,calc(100vh - 24px))` + `max-width:calc(100vw - 24px)` + `overflow:hidden`；
+  内容区 `flex:1 1 auto;min-height:0;overflow-y:auto`（由它承担滚动）；
+  目录列表自身 `max-height:min(38vh,260px);overflow-y:auto`（几十条目录时独立滚动）；
+  按钮行 `flex:0 0 auto;position:sticky;bottom:0`（内容再长也常驻可见）。
+- `test/grant-dialog.test.js` 的 U3 describe 逐条断言这些契约，并断言 DOM 结构
+  （遮罩→面板→标题/说明/内容区/操作行）与滚轮不链到页面；
+  `test/fab-panel-layout.test.js` 的既有布局守卫（`pop.appendChild(frag)` 原子渲染等）一并跑通——
+  弹框里的局部变量因此命名成 `dlg` 而不是 `pop`，避免撞那条「不许边建边挂」的反向断言。
+
+### 不变量（不得回归，逐条命名自测）
+`test/invariants-1-12-6.test.js`（16 例）+ `test/grant-dialog.test.js`「不变量⑤」（4 例）：
+① 越权读取侧：`decide` 两开关的组合真值表（`disallowToolGrant` 只关工具名档、
+   `sessionOnly` 只关落盘项目档、会话路径档照旧、都不覆盖时必不放行）；
+② ACP 孪生：即使会话路径规则**覆盖得到**仍 `next()`，且早退门源码位置排在档位判据之前；
+   写侧判据单条 `isSandboxEscalation`（B1 复发即红）；
+③ auto-review / hook「ask」**有意不排除**（用户裁定，不许顺手收紧）：这类 reason 判据为 false、
+   照常吃工具名档、照样落盘；读取侧 `return next()` 的早退门**恰好三道**（`!sessionId` /
+   `isAcpTwinApproval` / `paths.length === 0`），多出第四道即红；
+④ fork 判据真值表 + 端点侧 `rootSessionId`（fork ⇒ 自身、委派子会话 ⇒ 上溯到根）；
+⑤ 工具名档跨产品隔离：`qoder:bash` ≠ `deveco:bash`、大小写/空白归一、缺 product 退化成裸工具名、
+   键构造在源码里只有一份实现且不含 `category`/`paths`；
+⑥ `decide` / `appendProjectRule` 单一调用点（`index.js` 各 1 处、`addToolGrant` 恰 2 处、
+   浏览器半 0 处、其余模块 0 个第二写者）；
+⑦ 非越权落盘逐字不变：信封 `{version:1,rules}`、两空格缩进、条目键序
+   `cwd→paths→grantedAt→note`、主代理条目不带 `product`、同 `(cwd,paths)` 幂等合并、
+   落盘后**新会话**同路径仍命中且留痕 `scope=project`。
+
+### 测试
+- 新增 `test/grant-dialog.test.js`（49 例）：从 `lib/client.js` 里**抽出真代码执行**
+  （`new Function` + 手搓 FakeEl DOM），覆盖 U1 三态、目录预填互转、弹框确认/取消/Esc/遮罩/闩、
+  蓝球 `grantViaDialog` 载荷（取消 ⇒ 零 POST）、琥珀 `sendDecision` 三态、U3 布局契约。
+- 新增 `test/dangerous-command-gate.test.js`（14 例）：G1 危险命令门两层断言——
+  判据层（名单与产品侧逐字对齐、`rm -rf` 等价写法、单旗帜不触发、分段只判段首、
+  三条误伤守卫、前导环境变量、命令文本取值、执行类判据）+
+  监听器层（真跑 `index.js` 的 approval/request handler：已授权 bash 下三条命令一律 `next()`、
+  普通命令与 heredoc 照旧放行、保守策略「执行类解析不出命令文本也不放行」、
+  **门的顺序哨兵**「必须早于工具名短路与路径/项目档判定」、既有两道门不受影响）。
+- 新增 `test/invariants-1-12-6.test.js`（16 例，见上）。
+- `test/host-approval-endpoint.test.js` 新增 15 例 + 改名 1 例：B1 两条（孪生落盘与 1.12.4
+  逐字等价 / 越权仍不落盘且 sha256 不变）、M1 一条、U2 `body.paths` 三态 8 条、
+  U2 契约透传 3 条、m2 新增 1 条。**落盘断言全部走 `boot()` 注入的临时 `DSH_HOME`**，不碰 `~/.dsh`。
+- `test/permission-pending.test.js` 新增 3 例：三字段透传（缺省 `null/null/[]`）、
+  `markPermissionPending` 记账与同 permId 重发就地更新、脏 `suggestedDirs` 不炸。
+- 修改的既有用例（**没有放宽任何断言**）：
+  - `test/perm-fab-jump.test.js:298`「决策按钮不冒泡到行」——锚点从
+    `indexOf('const mkBtn = (label, answer, cls, tip) => {')` 换成
+    `search(/const mkBtn = \(label, answer, cls, tip(?:, grant)?\) => \{/)` 并加「锚点丢失即红」的显式失败。
+    原因：U2 给琥珀 `mkBtn` 加了第 5 个参数 `grant`，旧锚点 `indexOf` 返回 -1 ⇒ 切片为空 ⇒ 假过。
+    本条钉的是按钮的 `stopPropagation`，不是它的参数表。
+  - `test/host-approval-endpoint.test.js:312` 改名（见 m2），断言由「只写路径规则」改为
+    「补出工具名 ⇒ 响应如实回显 `json.toolName === 'bash'`」。
+  - `test/fab-panel-layout.test.js` 头部注释同步按钮新文案；所有 DOM 计数守卫未动、仍绿。
+- `verify.mjs:950-1030` 新增 v1.12.6 块：判据可区分性、`validateDeclaredPaths` 三态与
+  丢弃口径（混合输入应丢 5 条）、`expand:false` 不补父目录且不外溢到兄弟目录、
+  序列化透传与缺省、13 条前端/宿主接线字符串断言，外加两条反向断言
+  （假「将记住 category」文案不得存在；`pendingExcluded` 不得再出现）。
+  另补一条「`if (key) return "（本会话将记住：" + key + "）"` 必须逐字存在」——
+  转红实验③ 一开始只让用例红、verify 全绿，这条把语义补进了字符串层。
+
+### 变异转红（逐字节恢复自证）
+基线 497 例全绿 / `verify.mjs` 退出码 0。变异前把原文件复制到仓外留副本并记录 md5，
+恢复后 `cmp` + md5 + sha256 三证逐字节一致（下表 ①②③④ 的读数写在 **471 基线时点**，
+语义与替换关系不变、`fail` 是叶子用例数而非套件数；⑤⑥⑦ 是本轮收尾新做的）：
+
+| 变异 | 转红的具名用例 | `node --test` | `node verify.mjs` |
+|---|---|---|---|
+| ⑤ **危险命令门挪到工具名短路之后**（G1 顺序哨兵） | G1「门的顺序：必须在工具名短路与所有路径/项目档判定**之前**」+「已授权 bash ⇒ 三条命令仍一律 next()」+「保守策略…」 | `# tests 14 / # pass 11 / # fail 3`，退出码 **1** | 退出码 **1**（`v1.12.6 G1: 危险命令门排在工具名短路之后`） |
+| ⑥ **确认按钮不再发勾选结果**（`paths: d.paths` → 预填数组，等价于「空 paths ⇒ 工具名档」那条契约被绕过） | 「删空确认 ⇒ paths:[] 原样发出（契约：空数组＝只要工具名档）」「U4 全链路：在弹框里勾上推测项，它才作为 paths 元素发出」 | `# tests 49 / # pass 47 / # fail 2`（`grant-dialog`），退出码 **1** | 退出码 **0**（靠用例，字符串层看不出） |
+| ⑦ **面板回到假承诺**（`permGrantTip` 兜底成 `"（本会话将记住：" + (p.category \|\| "同类工具") + "）"`） | 「工具名与路径都没有 ⇒ 直说只放行一次、什么都不记」「旧文案（拿 category 当记忆键）已从源码消失」「不变量⑤ / 缺 product ⇒ 退化为裸工具名」 | `# tests 49 / # pass 46 / # fail 3`（`grant-dialog`），退出码 **1** | 退出码 **0**（该变异不落在 verify 的字符串锚点上，由用例兜住） |
+| ⑧ 写侧判据改回含孪生的 `isDisallowedAutoGrant`（B1 回归） | 「B1 / ACP 孪生 POST scope=project ⇒ allowlist.json 被创建…」「不变量② / 写入侧：落盘抑制的判据是 isSandboxEscalation 单独一条」 | `# tests 52 / # pass 50 / # fail 2`，退出码 **1** | 退出码 **1**（`B1 写侧判据收窄` 字符串守卫） |
+| ⑨ **保守策略关掉**（`if (ctxInfo.execLikely && !ctxInfo.commandText.trim())` → `if (false)`） | G1「保守策略：执行类调用解析不出命令文本 ⇒ 也不自动放行（非执行类不受影响）」 | `# tests 14 / # pass 13 / # fail 1`，退出码 **1** | 退出码 **0**（`action: 'no-command-text-block'` 字符串仍在 ⇒ 靠用例） |
+| 恢复后 | — | `# tests 497 / # pass 497 / # fail 0`，退出码 **0** | 退出码 **0** |
+
+恢复自证：`index.js` md5 `825a71ee049bcbc6987afad9a965ca18`
+（sha256 `7fa7577bb8d8a98bce7b71978cebfcdc4e3bd1499826ba871c6d1cca159768aa`）、
+`lib/client.js` md5 `4bd36aecddc97031a0ea9fe6b3f74f26`；五处破坏-恢复后都与破坏前副本 `cmp` 一致。
+
+**同一基线时点（471）的既有四条变异读数**（替换语义与 `fail` 口径不变，原表保留以防失忆——
+它们当时红在 469/467 上，恢复后同为 471 全绿）：
+
+| 变异 | 转红的具名用例 | `node --test` | `node verify.mjs` |
+|---|---|---|---|
+| ①' 写侧判据改回含孪生的 `isDisallowedAutoGrant` | 「B1 / ACP 孪生 POST scope=project ⇒ allowlist.json 被创建…」；「不变量② / 写入侧：落盘抑制的判据是 isSandboxEscalation 单独一条」 | `# pass 469 / # fail 2`，退出码 **1** | 退出码 **1**（`B1 写侧判据收窄` 字符串守卫） |
+| ②' 用户删空仍写路径（`index.js` 退回 `autoPaths`） | U2 三态 4 条：「声明为空数组 ⇒ 只写工具名档」「空声明 + scope=project」「非法声明逐条丢弃…全非法」「越权 + 删空声明…（不变量①）」 | `# pass 467 / # fail 4`，退出码 **1** | 退出码 **0**（端点分支不在 verify 覆盖内 ⇒ 靠 m1 的 CI 用例守卫） |
+| ③' 解析不出工具名仍说「将记住」 | 「只有路径 / 只有建议目录 ⇒ 明说按路径记住」「工具名与路径都没有 ⇒ 直说只放行一次」「旧文案已从源码消失」「不变量⑤ / 缺 product ⇒ 退化为裸工具名」 | `# pass 467 / # fail 4`，退出码 **1** | 退出码 **1**（新增的那条逐字断言） |
+| ④' 弹框绕过确认直接生效（`grantViaDialog` 不弹框、用预填直接 POST） | 「U2 宿主通道 / 取消弹框 ⇒ 不 POST、不放行、不移除条目（转红实验④的靶子）」「删空确认 ⇒ paths:[] 原样发出」 | `# pass 469 / # fail 2`，退出码 **1** | 退出码 **0**（字符串守卫全在 ⇒ 靠用例） |
+
+上表 ①②③④ 的 `index.js` md5 是 `3f87df688dee3e133973e02b7ae8ccf1`、`lib/client.js` 是
+`ae326a47035b94761dc86da5804478b1`（**471 基线时点**，本轮 G1 改动前）；本轮 ⑤⑥⑦ 的
+md5 见上（**497 基线时点**，即最终冻结版本）。
+
+### 未做 / 边界（如实披露）
+- 未部署、未重启宿主、未动 `~/.dsh`、未 `npm pack`、未 `git add`/`commit`。
+- 契约另一侧（product-subagents 0.7.9）不在本仓，本轮只保证**本插件**按口径收发；
+  产品侧的 `planGrantWrites` 判定以其自己的冻结为准。
+- `#pendingContexts` 单调增长的既有设计债（1.12.4 已披露）仍未碰。
+- 越权请求**可以**被写下工具名授权（无 `callId` 的老载荷、以及显式删空声明都会写），
+  但读取侧那一档对越权永远不生效（不变量①）——这是档位模型的选择，不是漏口。
+- auto-review / hook「ask」继续共享工具名档（③，用户裁定保持现状）。
+- **G1 危险命令门的覆盖边界**（定稿轮已大幅收口，见下方「定稿轮」小节）：包装/等价写法
+  （`sudo`/`command`/`env`/`nohup`/`nice`/`time`/`timeout`/`stdbuf`/`xargs`、basename、
+  `bash -c '<body>'` 解 2 层、`git -C/-c`、`npm --prefix`、`pnpm`/`yarn publish`、自定义
+  执行工具的 `{shell:…}`）**现已全部命中**；仍不覆盖的只剩静态不可判定的形态
+  （`python -c 'os.system(…)'`、脚本/构建目标、`$( … )` 命令替换、变量间接、argv 拆词数组）。
+- **G1 门的名单需人工与 product-subagents 同步**：两侧通道不同（ACP `toolCall.kind` vs
+  宿主 `tool/call` 的 `name`+`arguments`），无法共用一份代码，只能共用同一份**口径**；
+  任何一侧改名单都要同时改另一侧（`lib/host-approval.js` 文件头已写明）。
+
+### 收尾（上一个实现者被打断，磁盘上留了半成品；本轮补齐并冻结）
+- `test/grant-dialog.test.js` 有一处**语法错误**（`it(` 块里 `const r = build({` 被截断，
+  `const seen = {}` 直接跟着 `escalation: false,`）⇒ 整个文件 `node --check` 失败、
+  49 条用例**一条都没跑**，而 `node --test` 只报顶层 `not ok`。
+  已补回 `const r = build({`。教训：语法错误让「新增测试」看起来存在、实际零覆盖。
+- `lib/client.js` 的 `openGrantDialog` 把 `hint`（实时提示）与 `toolLine`（只读工具名行）
+  **造出来却没挂进 DOM** ⇒ U2/U4 一大片用例红在「弹框内 .ad-grant-hint 应恰好 1 个，实际 0」。
+  已 `body.appendChild(hint)`（在「+ 添加目录」之后）与 `body.appendChild(toolLine)`（在其后），
+  与用例断言的「两组 + 添加按钮 + 提示 + 只读工具行」结构一致。
+- `dirsOfPaths` 曾增补无扩展名**文件**判据（`FILE_NO_EXT_RE`）：`/home/dev/.ssh/id_ed25519`
+  这类没有 `.ext` 的名字按文件取父目录。**该判据已在定稿轮被替换**（见「定稿轮 · Major 2」）：
+  它按「名字里带 `-`/`_`/数字」猜文件，把 `.ssh`、`my-project`、`notes_2024` 这些**目录**也
+  判成文件、取到父目录；且旧注释「原样落盘等于放过整个 `~/.ssh`」与服务端 `pathAllowed`
+  的真实语义相反。现在只认「带扩展名（首字符不能是点）」+ 显式文件白名单 `FILE_FORM_RE`。
+- `.ad-grant-input` 类名与 CSS 对齐（路径输入区/目录列表的自重限高可滚契约，`verify.mjs` 有逐字断言）。
+- `test/grant-dialog.test.js` 两处**用例自身的**过期期望已改准：`/etc/passwd` 在纯词法口径下
+  是目录（取不到「它是文件」的证据），期望值从 `/etc` 改为 `/etc/passwd`——用例不该断言
+  实现不可能知道的事。
+- `test/host-approval-endpoint.test.js` 新增 `bashCall` 夹具并修两处「声明 bash、却给 write
+  参数体」的拼接夹具（`irreducible`：G1 的保守策略会先拦下它们，断言就跑到错误的层上去了）；
+  `test/invariants-1-12-6.test.js` 同样加 `bashCall`。
+- `test/tool-grant-session.test.js`：handler 注入表补 `dangerousCommandMatch`（漏项会被
+  handler 自己的 try/catch 吞成 `next()`，表现为「①⑤⑧⑨⑫ 一起红」），并**新增
+  `handlerNameDrift()` 硬守卫**——handler 体出现未注入的闭包名就直接报名字，
+  这类静默假红不再靠人肉对齐；①⑤ 两条用例补上真实的 `tool/call` 记录。
+- `verify.mjs` 新增 G1 块（门的位置/顺序、保守策略留痕、名单单点常量与同步声明）。
+- **冻结包重打**（上一版 `/tmp/dsh-agent-dispatch-1.12.6-freeze.tar.gz` 打于 10:20，
+  早于 `dispatch.js`/`client.js` 的后续改动 ⇒ 已过期）。
+- **冻结凭据**（最终）：`tar -czf /tmp/dsh-agent-dispatch-1.12.6-freeze.tar.gz
+  --exclude=node_modules --exclude=.git .` → 75 个成员 /
+  md5 `cd33f1acda8681e5bab89badba0813d7`
+  （sha256 `f758586c7d8df29bddcad96a8c7244fba817aa6b18da80951dcd17ba8ad75a7d`）/
+  2 604 369 字节；解包后 `diff -r -x node_modules -x .git` 与仓库**零差异**
+  （`DIFF_EXIT=0`、0 行输出）。
+  关键文件 md5：`index.js` `825a71ee049bcbc6987afad9a965ca18`、
+  `lib/host-approval.js` `889f3ffcd712f88a96ce254d0ab0992d`、
+  `lib/client.js` `4bd36aecddc97031a0ea9fe6b3f74f26`、
+  `lib/dispatch.js` `c415c59b661e437a666a1606dd23a7db`、
+  `package.json` `e1bd0bb661aa5ad0c1a84a978234bb36`、
+  `verify.mjs` `3f768b55932c7da38971fda0c7919194`、
+  `.github/workflows/ci.yml` `48d246be82bfc326c309dc0a0945cade`、
+  `test/dangerous-command-gate.test.js` `73552e5eb14aec2da8b6d79feca3deb6`、
+  `test/grant-dialog.test.js` `ff8f279d01bf334b516062a526f6ee91`。
+  **自指说明**：`CHANGELOG.md` 自身的 md5 无法写进它自己（写进去就变了），
+  所以本文件不在上表里；以冻结包的 md5 为准（CI 由 `git status` 与冻结协议核对）。
+  冻结时刻 `2026-10-06 10:57 CST`，此后不再触碰。
+
+### 定稿轮（独立终审二审：1 阻断 + 3 Major + 若干 Minor 的收口）
+**上面那包已作废**：独立只读终审判定「修复后交付」，同时抓到 1 个阻断 + 3 个 Major + 若干
+Minor，本轮逐条收口后**重打冻结包**（凭据见本节末）。版本仍是 **1.12.6**（从未发布，不跳号）。
+
+#### 🔴 阻断：危险命令门被「等价写法 / 包装写法」绕过（已收口）
+- **缺口（终审探针实测）**：已授权 `bash` 时下列写法仍被静默放行（`res==='allowed-once'`）：
+  `sudo rm -rf /tmp/x`、`command rm -rf`、`env rm -rf`、`nohup`/`nice`/`time rm -rf`、
+  `/bin/rm -rf`、`bash -c "rm -rf …"`、`sh -c '…'`、`echo x | xargs rm -rf`、
+  `git -C /tmp push`、`git -c k=v push`、`npm --prefix /tmp publish`、`pnpm publish`、
+  `yarn publish`，以及**自定义执行工具**（工具名非执行类 slug + `{shell:'rm -rf …'}`）。
+  根因：`isRecursiveForceRemove` 要求 `tokens[0]` 字面等于 `rm`、`subCommandVerb` 要求动词是
+  **第一个**非选项 token、`execLikely` 只认 `EXECUTE_TOOL_SLUGS` 与 5 个参数键。
+- **修法（`lib/host-approval.js:386-720` 区段整体收口；用户裁定：等价写法同属一类）**：
+  ① **透明包装**：`sudo`/`command`/`env`/`nohup`/`nice`/`time`/`timeout`/`stdbuf`/`xargs`
+  逐层剥掉，连同各自的**取值选项**与 `timeout` 的数值时长（`sudo -u root rm …`、
+  `nice -n 10 rm …`、`timeout 5 rm …`），可叠加；前导赋值 `FOO=1 cmd` 一并跳过。
+  ② **程序名按 basename 比对**（`/bin/rm`、`./rm`、`/usr/bin/env`）。
+  ③ **解一层 shell 包装**：`sh|bash|zsh|dash|ksh -c '<body>'`（单/双引号、`-lc` 组合短选项）
+  把 body 再喂给同一份规则；**递归上限 2 层**（`MAX_SHELL_UNWRAP_DEPTH`），第 3 层起按
+  `SHELL_DEPTH_RULE='shell-nesting'`（**可疑**）保守转交互 —— 不做无限展开、不做完整 shell 解析器。
+  ④ **动词判定跳过该命令自己的取值选项**：`git -C <dir> push`、`git -c k=v push`、
+  `npm --prefix <p> publish`（`--opt=value` 单 token 不吃下一个）。
+  ⑤ **`pnpm publish` / `yarn publish` 与 npm 同语义，纳入名单**（用户裁定；名单从 3 条变 5 条，
+  仍是单点常量 `DANGEROUS_COMMAND_RULES`，需与 product-subagents 人工同步）。
+  ⑥ **自定义执行工具**：`resolveApprovalContext` 新增 `argsText`（`argsTextOf` = args 里**所有
+  字符串值**换行拼起来），门判据变成
+  `dangerousCommandMatch(ctxInfo.commandText) || dangerousCommandMatch(ctxInfo.argsText)`
+  —— 只看前者时 `{shell: 'rm -rf …'}` 是静默放行。
+- **残留边界（刻意的，静态不可判定；已写进源码注释与验收用例）**：
+  `python -c 'os.system("rm -rf")'`、把命令写进脚本/构建目标再执行（`make deploy`；
+  注意 `bash deploy.sh` **已在第四轮按 `SHELL_STDIN_RULE` 保守转交互**——那是「判不出它要执行
+  什么」而不是放行）、`sh -c "$(curl …)"`、变量间接（`S=rm; $S -rf x`）、`eval`、
+  **argv 拆词形态**（`{argv:['rm','-rf','/']}`：按值分别判、不拼回一条命令）、
+  **`argsTextOf` 的 4 层递归上限**（`depth > 4` 即不再下探：嵌套 5 层以上的自定义工具参数里的
+  字符串整体不可见——第四轮按终审 Minor 就地登记，此前只写在函数注释里、未进本节）。
+  这些要么需要真正的 shell 解析器 + 变量求值 + 读脚本文件，要么超出用户名单范围；
+  判不出的方向不在这里兜底，而是由既有的保守策略（执行类解析不出正文 ⇒ 不自动放行）接手。
+- **已知多弹一次（安全方向，用户裁定不修，只登记）**：heredoc 正文里出现 `rm -rf`
+  （`cat <<'EOF' … rm -rf /tmp/x … EOF`）会被判危险；`write`/`edit` 的正文参数里出现这三条
+  命令同理（`argsTextOf` 扫所有字符串值）。
+  **触发条件第四轮按实测口径写精确**（登记成立、行为不变）：`argsTextOf` 把「每条字符串值」
+  用换行拼接，判定只看**每段/每行的开头** ⇒ 只有危险命令位于行首/段首才会多弹一次：
+  `content='rm -rf /tmp/x'` 或带换行前缀（`…\nrm -rf /tmp/x`）会 `next()`，
+  而 `content='see git push docs'` 照旧放行。补了一条**说明性用例**钉住现状，不为它改判定。
+- **误伤守卫（全部保持不命中）**：`echo "git push"`、`grep "git push" f`、`# rm -rf`、
+  `git commit -m "git push"`、`git log --grep push`、`npm run publish`、`pnpm run publish`、
+  `rm -r`、`rm -f`、`rm /tmp/x`、`ls -la`、`echo hi`、`sudo ls -la`、`xargs echo hi`、
+  `bash -c "echo hi"`、`timeout 5 npm run build`、`env grep "git push" f`、`command -v rm`、
+  `nice -n 10 ls`、`echorm -rf`、`rmdir -rf /tmp/x`。
+- `test/tool-grant-session.test.js` 的 handler 注入表**无需改动**：新判据全部落在
+  `resolveApprovalContext` 返回的 `ctxInfo.argsText` 上，handler 体的闭包引用没有新增
+  （`handlerNameDrift()` 硬守卫仍绿）。
+
+#### 🟠 Major 1：CI 用例守卫对 `.skip` 盲（已收口）
+- 终审实测：`it.skip(...)` 之后 `# tests 497 / # skipped 1`，只比 `# tests` 的守卫**照样绿**
+  —— pass 悄悄少一条，没有任何信号。
+  （第四轮按实测口径补正：`t.skip()` / `it.skip()` **会**进 `# tests`、**不进** `# pass`，
+  `# skipped` 单独计数；真正拦住第二个 skip 的是下面的 `# pass` 下限。ci.yml 里原先那句
+  「skipped 不进 tests 计数」写反了，第四轮已改准。）
+- 修法（`.github/workflows/ci.yml:19-73`）：守卫改为三件事一起断言
+  ① `# pass >= MIN_TESTS - SKIPPED_ALLOWED`（下限 `floor`）；
+  ② `# cancelled == 0`；③ `# todo == 0`。`# tests` 下限保留为第二道（总数被削减也红）。
+- **K（`SKIPPED_ALLOWED`）的来源就地登记在 ci.yml 注释里，当前 1，只有一条准跳**：
+  `test/host-0.2-compat.test.js:334-340`（用例起于 334，`t.skip` 在 340）——它硬编码
+  `/Users/arming/.nvm/.../dsh-util-values/lib/index.js`，macOS 开发机可解析、ubuntu-latest
+  必然解析不到 ⇒ CI 上固定少 1 条 pass。除它之外新增任何 skip 都会让 CI 红。
+- 守卫逻辑本身用四组 TAP 夹具离线验过：CI 常态（pass 508/skipped 1）**绿**；
+  多加一个 skip（pass 507/skipped 2）**红**；`cancelled 1` **红**；`todo 1` **红**；
+  删掉一个用例（`# tests 508`）**红**。另有源码级用例
+  （`test/invariants-1-12-6.test.js` 的「CI 用例守卫」describe）钉住这几行，把它改回
+  「只比 `# tests`」会先红。
+
+#### 🟠 Major 2：弹框目录预填把「像文件的目录名」放大到父目录（已收口）
+- 终审逐字复算：`FILE_NO_EXT_RE` 的 `[-_]`/`\d` 分支 + `hasExt` 把 `.ssh` 当扩展名
+  ⇒ `/home/dev/.ssh → /home/dev`、`/tmp/notes_2024 → /tmp`、`/home/dev/my-project → /home/dev`。
+  这些预填**默认勾选**，而服务端 `validateDeclaredPaths` 只做词法校验（不 stat）、
+  声明非空即 `expand:false` 原样落盘 ⇒ 手快确认一次可把整份家目录/上级目录写进会话授权。
+- 修法（`lib/client.js:679-722`）：**只有明确是「文件形态」时才取父目录** ——
+  末段带扩展名（`EXT_NAME_RE`，**首字符不能是 `.`**，故 `.ssh` 不再被当扩展名），
+  或命中显式文件白名单 `FILE_FORM_RE`（`id_*` 私钥/公钥、`known_hosts`、`authorized_keys`、
+  `Makefile`/`Dockerfile`、`.gitconfig`/`.gitignore`/`.gitattributes`/`.gitmodules`
+  （**裸 `.git` 已从名单剔除**，见「第四轮 · M2」）、
+  `.npmrc`/`.nvmrc`/`.env`/`.bashrc`/`.bash_profile`/`.zshrc`/`.profile`/`.editorconfig`/
+  `.dockerignore`）；**其余一律原样当目录**（`.github` 刻意不在名单里：它是目录）。
+- **错误注释一并订正**（`lib/client.js:679-698`）：旧注释说「`/home/dev/.ssh/id_ed25519`
+  原样落盘等于放过整个 `~/.ssh`」——不成立。`pathAllowed`（`lib/host-approval.js:180`）只对
+  **无扩展名尾巴**的规则做目录前缀匹配；那条规则匹配的是它自己（及其下），**不会**放开
+  `~/.ssh` 里的别的文件。注释改成按服务端语义写。反向提醒也写进去了：`.ssh` 这种点开头的
+  **目录名**会被 `pathAllowed` 当扩展名尾巴（`.ssh` 命中 `/\.[A-Za-z0-9]{1,8}$/`）⇒ 该规则
+  只精确匹配它自己——这是既有命中语义（本次不动），但预填**绝不能**因此把它放大成父目录。
+- 验收：`['/a/b/my-project']`、`['/home/dev/.ssh']`、`['/tmp/notes_2024']`、`['/a/b/.github']`
+  全部原样；`['/a/b/x.txt'] → ['/a/b']`、`['/home/dev/.ssh/id_ed25519'] → ['/home/dev/.ssh']`、
+  `['/home/dev/.gitconfig'] → ['/home/dev']`、`['/a/b/Makefile'] → ['/a/b']` 照旧取父目录。
+
+#### 🟠 Major 3：门命中后 UI 无任何提示 = 静默陷阱（已收口）
+- 现场：用户在这三条命令上点「总是允许(会话/项目)」照样写规则（写侧一字未动），但读取侧
+  那道门排在最前（`index.js` 的 `if (danger) return next()` 早于所有档位判定）⇒ 规则**永不生效**，
+  用户却以为已授权、反复被问。
+- 修法：门命中时把门名补进暂存上下文（`index.js:374-393`，同一 `callId` **覆盖**一份
+  `{...ctxInfo, sessionId, rootSessionId, dangerRule}`；首次 `pushPendingContext` 的位置不动，
+  因为写侧依赖它在门前落好），经 `GET /agent-api/host-approval-context` 原样回传，
+  客户端落到条目上（`lib/client.js` 的 `item.dangerRule = d.dangerRule`）并**两处写明**
+  文案「该命令每次都会询问，不可记忆（命中危险命令门：<rule>）」：
+  蓝球条目 `.ha-danger`（`lib/client.js:4090-4100` 附近）与授权弹框 `.ad-grant-danger`
+  （`openGrantDialog`，含 `grantViaDialog` 把 `item.dangerRule` 透传给弹框）。
+  没命中门的请求**不带**这个标记（否则是谎报「每次都问」）。
+- 验收：新增用例钉住「门命中 ⇒ GET context 带 `dangerRule: 'rm -rf'`、普通命令不带」，
+  以及「弹框有 `.ad-grant-danger` 文案、无 dangerRule 时不出现、蓝球那一行同款文案」。
+
+#### 🟡 Minor（本轮一并处理）
+- **保守策略补一类**：工具名不在 `EXECUTE_TOOL_SLUGS`、参数键也不在 `COMMAND_ARG_KEYS`
+  （如 `{shell:…}`）时，过去既不判危险也不保守拦截 ⇒ 工具名档直放。按阻断项 ⑥ 收口
+  （对 args 所有字符串值跑一次匹配），并补了监听器层用例：先把 `custom_shell` 授权到根会话键，
+  普通正文 `{shell:'echo hi'}` 仍走工具名档放行，`{shell:'rm -rf /tmp/x'}` 必须 `next()`。
+- **heredoc 正文误报**：如实登记（见上），补一条**说明性用例**，判定不改。
+- **`门序` 哨兵**：源码字符串断言（`index.js` 的调用点 + `verify.mjs` 的位置比较）**保留**，
+  但**行为哨兵为主** —— 监听器层用例（已授权 bash ⇒ 15 条等价写法全部 `next()`、零 `auto-grant`）
+  才是真防线；源码哨兵只是补充，不再当唯一防线。
+
+#### 测试与转红（定稿轮）
+- 用例数 497 → **509**（新增 12 条：判据层 5 + 监听器层 3 + 弹框/预填 3 + CI 守卫 2 …按文件分布见下）。
+- `node --test test/*.test.js` → `# tests 509 / # pass 509 / # fail 0 / # cancelled 0 / # skipped 0 / # todo 0`，退出码 0。
+- `node verify.mjs` → 退出码 0（v1.12.6 一致性链 + 11 工具）。
+- **转红①**：把包装/等价写法收口改回原样（`matchSegment` 不再剥包装 + shell 解包装短路）
+  ⇒ `test/dangerous-command-gate.test.js` 新增用例成片转红（`sudo rm -rf …`、`bash -c …`、
+  `xargs rm -rf`、`git -C … push`、`pnpm publish` 等），逐字节恢复后 `cmp` 全等 + 变异标记 grep 归零。
+- **转红②**：把预填判据改回「像文件就算文件」（`/\.[A-Za-z0-9]{1,8}$/ || /[-_]|\d/`）
+  ⇒ `dirsOfPaths(['/home/dev/.ssh'])`、`['/a/b/my-project']`、`['/tmp/notes_2024']` 三条转红，
+  恢复后同上自证。
+
+#### 定稿轮冻结凭据（自指说明同上一节）
+- 协议：`tar -czf /tmp/dsh-agent-dispatch-1.12.6-freeze.tar.gz --exclude=node_modules --exclude=.git .`
+  —— 在**本节写入之后**执行，故包内 `CHANGELOG.md` 与本文件逐字节一致。
+- 包自身的**成员数 / 字节数 / md5 / sha256**，以及解包后
+  `diff -r -x node_modules -x .git` 的结果，由交付报告给出（把包自己的 md5 写进包内会改变它
+  自己，构造上不可能自含）。
+- 冻结时刻 `2026-10-06 11:15 CST`，此后不再触碰本工作区。
+- **逐文件 md5（冻结时点）**：`index.js` `abb8decddc6276b1b690e6b096e5670e`、
+  `lib/host-approval.js` `9a1f0fd31fcbb907ea43d2211be34997`、
+  `lib/client.js` `995f601c21d702ca314ff94ba504f1bb`、
+  `lib/dispatch.js` `c415c59b661e437a666a1606dd23a7db`、
+  `package.json` `e1bd0bb661aa5ad0c1a84a978234bb36`、
+  `verify.mjs` `3f768b55932c7da38971fda0c7919194`、
+  `.github/workflows/ci.yml` `941364297fc75664248187be2f9c4809`、
+  `test/dangerous-command-gate.test.js` `888e8e000047d884ac8c03aed17cd149`、
+  `test/grant-dialog.test.js` `4e8848d5ca680ddfe4c13c653529fc27`、
+  `test/invariants-1-12-6.test.js` `cf884056eef37bba1f14098a1a96dbff`。
+  `CHANGELOG.md` 自身的 md5 不在表里（自指），以交付报告为准。
+- 仍然：未部署、未重启宿主、未动 `~/.dsh`、未 `git add`/`commit`、未切 ref。
+
+### 第四轮（独立终审三审：1 阻断 + 2 Major + 6 Minor 的收口）
+**上面两包（10:57 与 11:15）都已作废**：终审把上一轮的探针**逐字节原样复跑**，确认 17 条原漏口
+全部转交互、12 条 `auto-grant` 无一来自危险命令、16 条误伤守卫全绿；但同一族里又抓到
+1 个阻断 + 2 个 Major + 6 个 Minor。本轮逐条收口后**再次重打冻结包**（凭据见本节末）。
+版本仍是 **1.12.6**（从未发布，不跳号）。
+
+#### 🔴 阻断 B1：取值选项表里的大写条目永远匹配不上 ⇒ 三条等价写法仍静默放行（已收口）
+- **现象（终审真跑真实 handler，前置＝把 `bash` 授权到根会话键 `R`）**：
+  `pnpm -C /tmp publish`、`npm -C /tmp publish`、`sudo -C 3 rm -rf /tmp/x` 全部
+  `next=false res=allowed-once gateRule=null`（被静默放行）。对照：`pnpm --dir /tmp publish`、
+  `sudo -u root rm -rf …`、连写形态 `sudo -C3 …` / `pnpm -C/tmp …` 都拦得住。
+- **根因**：两张取值选项表（`WRAPPER_VALUE_OPTIONS` / `PROGRAM_VALUE_OPTIONS`）存的是**大小写
+  原样**的值，查表前却把 token `toLowerCase()`（`valueOpts.has(t.toLowerCase())` 与
+  `subCommandVerb` 里的同一处）⇒ `'-C' !== '-c'`、`'-S' !== '-s'` ⇒ 该选项**吃掉的那个取值**
+  （`/tmp`、`3`）被当成程序名 ⇒ `basenameOf(tokens[0])` 不再是 `rm`/`pnpm` ⇒ 整段不命中。
+  **旁证**：`git` 那张表同时写了 `'-c'` 与 `'-C'` 两个拼写，所以 `git -C /tmp push` 恰好幸存
+  —— 这个坑被局部绕开过，却从未被修掉。
+- **修法**：新增 `const lowerSet = (arr) => new Set(arr.map((s) => s.toLowerCase()))`；
+  `WRAPPER_VALUE_OPTIONS`（`sudo` 的 `-C`、`env` 的 `-C`/`-S` …）与 `PROGRAM_VALUE_OPTIONS`
+  （`git`/`npm`/`pnpm`/`yarn`）**全部**用它包住；删掉 `git` 表里冗余的 `-C` 拼写；
+  表头注释写明「**表内一律小写**，新增拼写必须写小写」。
+- **验收**（四条同时进判据层 `probes` 表与监听器层探针表）：
+  `pnpm -C /tmp publish → 'pnpm publish'`、`npm -C /tmp publish → 'npm publish'`、
+  `sudo -C 3 rm -rf /tmp/x → 'rm -rf'`、`env -S 'ls; rm -rf /x' → 'rm -rf'`。
+- **转红①**：把 `lowerSet` 改回 `new Set(arr)` ⇒ 四条全部转红（判据层 + 监听器层）。
+
+#### 🟠 Major M1：7 种**未声明**的等价写法仍静默放行（已收口）
+- **现象（监听器层原始输出）**：`busybox rm -rf /tmp/x`、`printf 'rm -rf /x' | bash`、
+  `bash <<< 'rm -rf /x'`、`yarn npm publish`、`find /tmp -exec rm -rf {} +`、
+  `bash -c'rm -rf /x'`、`sh -c"rm -rf /x"` 全部 `next=false res=allowed-once`；
+  纯函数层另见 `toybox`/`coreutils rm -rf`、`/bin/bash <<< …`、
+  `bash -c "bash -c \"rm -rf /x\""`。**声明比对**：本节上方「残留边界」与源码注释里那几条
+  （`python -c`、脚本/`make`、`$(curl)`、变量间接、`eval`、argv 数组）**一条都盖不住它们**。
+- 逐条修法（`lib/host-approval.js`）：
+  1. **多调用二进制**：`TRANSPARENT_WRAPPERS` 增补 `busybox` / `toybox` / `coreutils`
+     （`busybox rm -rf x` 里程序名在**后一个** token 上，`basenameOf` 那类推法救不了）；
+  2. **裸解释器读 stdin**：段首是 `sh|bash|zsh|dash|ksh` 却**没有 `-c`** ⇒ 新增门名
+     `SHELL_STDIN_RULE = 'shell-stdin'`（**可疑**，保守转交互）。裸解释器读 stdin
+     （`printf '…' | bash`、`bash <<< '…'`）或执行脚本文件（`bash deploy.sh`），
+     正文静态不可判定——与 shell 深度上限同一原则：判不出不是放行；
+  3. **`-c` 与正文粘连**：`shellBodyIndex` 改为返回 `{at, inline}`，把标志 token 里
+     紧跟在 `c` 之后的残段（`-c'rm` → `'rm`）拼回正文再判（改前正文首词被吞 ⇒ MISS）；
+  4. **反斜杠转义引号**：新增 `unescapeQuoted`（只解 `\"` / `\'`），`basenameOf` 与
+     `stripOuterQuotes` 都先解转义再剥引号（改前 `\"rm` 被切成 `"rm` ≠ `rm`、外层引号也剥不掉
+     ⇒ 两层嵌套整段漏判，**不是**深度上限问题）；
+  5. **`yarn npm publish`**：`subCommandVerb` 里 yarn 的 `npm` 子命令再看下一个非选项 token
+     （`yarn npm run publish` 仍不命中——那里动词是 `run`）；
+  6. **`find … -exec <危险程序>`**：新增 `execSubcommandIndex`（认 `-exec`/`-execdir`/`-ok`/
+     `-okdir`），把其后的子命令再喂给同一份规则。**不新增名单条目**——危险**命令**名单仍是
+     单点常量 `DANGEROUS_COMMAND_RULES`（5 条），`-exec` 只是同一命令的另一条调用路径，
+     命中仍报原规则名（`rm -rf`），所以「与 product-subagents 同一份名单」的不变式不被破坏。
+- **验收**：上表 7 条 + 深度 3 的嵌套（转义写法同样按 `shell-nesting`）全部进判据层与监听器层；
+  16 条误伤守卫（`echo "git push"`、`git commit -m "git push"`、`git log --grep push`、
+  `npm/pnpm run publish`、`rm -r`、`rm -f`、`ls -la`、`echo hi`、`sudo ls -la`、`xargs echo hi`、
+  `bash -c "echo hi"`、`timeout 5 npm run build`、`command -v rm` …）保持全绿，
+  另补 `find -exec ls`、`find -exec echo rm -rf`、`yarn npm install`、`yarn npm run publish`。
+- **转红②**：把 `-c` 粘连的 `inline` 收口改回去 ⇒ `bash -c'rm -rf /x'` 用例转红
+  （判据层 + 监听器层）。
+
+#### 🟠 Major M2：弹框预填把**必然是目录**的 `.git` 当文件，放大到父目录（已收口）
+- **现象**：`FILE_FORM_RE` 里写的是 `\.git(?:config|ignore|attributes|modules|keep)?` ——
+  **可选组**让裸 `.git` 也进白名单 ⇒ `dirsOfPaths(['/repo/.git']) === ['/repo']`（期望原样）、
+  `['/repo/.git/'] === ['/repo']`。这些预填**默认勾选**，用户点一次确认就把整个项目根写进会话授权
+  —— 正是上一轮 M2 要防的方向。同一段注释还刚好以「`.github` 刻意不在名单里：它是目录」为由排除
+  `.github`，`.git` 与它同属目录却处理相反。
+- **修法**：① 该组改成**必选** `\.git(?:config|ignore|attributes|modules|keep)`（裸 `.git` 立即
+  回到「原样当目录」）；② **不再**往白名单加「可能是目录」的名字；③ 注释里写明白名单取舍原则：
+  **只收录「作为名字时必然是文件」的形态，凡是可能同时是目录名的一律原样**。
+  更彻底的「服务端 `statSync` 回 `isDir`、白名单只做无 stat 时的兜底」本轮**不做**，
+  登记为后续项（写在 `lib/client.js` 的 `dirsOfPaths` 注释里）。
+- **验收**：`dirsOfPaths(['/repo/.git']) === ['/repo/.git']`、`['/repo/.git/'] === ['/repo/.git']`；
+  `['/repo/.gitignore'] → ['/repo']`、`['/repo/.gitattributes'] → ['/repo']` 照旧；
+  `['/repo/.git/config']` 原样（白名单按**末段**比对，`config` 可能是目录名 ⇒ 方向只会更窄）。
+- **转红③**：把可选组加回去 ⇒ 用例转红。
+
+#### 🟡 Minor（本轮一并处理，逐条）
+1. **透明包装 8 跳用尽后是静默放行**（旧 `unwrapTransparentWrappers` 到顶就 `break` 返回残余
+   token，规则表只认段首程序名 ⇒ `sudo`×9 + `rm -rf` 全部 MISS）。改为
+   `{tokens, exhausted}` 返回结构 + `MAX_WRAPPER_UNWRAP_HOPS = 8` + 新门名
+   `WRAPPER_DEPTH_RULE = 'wrapper-nesting'`：**跳数用尽且段首仍是包装器（后面还有东西）**
+   ⇒ **可疑**转交互，与 shell 深度上限原则对齐；只剩包装器自己（`sudo`×9 后面什么都没有）
+   仍不命中（没有可执行的命令，不发假警报）。
+2. **`argsTextOf` 的 4 层递归上限**（`depth > 4`）此前只写在函数注释里 ⇒ 已登记进本节
+   （「残留边界」清单）与 CHANGELOG 的总体边界。
+3. **`ci.yml` 的机制描述与实测不符**：旧注释写「skipped 不进 tests 计数」——实测
+   `t.skip()`/`it.skip()` **会**进 `# tests`、**不进** `# pass`（`# tests 4 / # pass 2 / # skipped 2`）。
+   守卫本身正确（真正拦住第二个 skip 的是 `# pass` 下限），但错注释会误导后人 ⇒ 已改成正确表述。
+4. **`lib/host-approval.js` 注释举例错误**：把 `{argv:['rm','-rf','/']}` 说成 `argsTextOf` 要救的
+   那一格，而该形态实测判不出来（登记为残留是对的，注释动机自相矛盾）⇒ 例子换成
+   `{shell: 'rm -rf /tmp/x'}`，并把 argv 形态显式写成「**不在**这一格能救的范围」。
+5. **CHANGELOG 里已被推翻的「不覆盖」清单**（`sudo rm -rf`/`command rm -rf`/`bash -c`/`xargs rm`/
+   `git -C push`/`pnpm publish`/`yarn publish`）与定稿轮矛盾 ⇒ 已在原地标注 **已作废**（保留原文对照）。
+6. **尾斜杠被先剥掉再套文件判据** ⇒ `/a/b/foo.d/` 被放大到 `/a/b`。改为「原始串以分隔符结尾
+   ⇒ 直接当目录原样保留」（`/a/b/foo.d/ → ['/a/b/foo.d']`；`/a/b/foo.d → ['/a/b']` 照旧）。
+7. **`write`/`edit` 的「多弹一次」触发条件比文档更窄**（实测只有危险命令位于**行/段首**才触发：
+   `content='see git push docs'` 照旧放行，`content='rm -rf /tmp/x'` 或含换行前缀才 `next()`）
+   ⇒ 注释与 CHANGELOG 都按实测口径写精确，**不改行为**。
+8. **`~` 未展开的路径原样进预填**（`~/.ssh/id_rsa → ~/.ssh`，落成一条可能永不命中的**目录前缀**
+   规则）⇒ 预填阶段对**非绝对路径**（`~…`、`./…`、相对路径）一律原样保留、不推父目录
+   （`~/.ssh/id_rsa → ['~/.ssh/id_rsa']`：只精确匹配它自己那一条，严格更窄）。
+
+#### 测试与转红（第四轮）
+- 用例数 509 → **518**（+9：判据层 6 条 —— `shell-stdin`、`-c` 粘连、转义引号、`-exec`、
+  `yarn npm`、`wrapper-nesting`；弹框预填 3 条 —— 裸 `.git`、尾斜杠、非绝对路径）。
+  `.github/workflows/ci.yml` 的 `MIN_TESTS` 同步 509 → **518**（并注明第四轮的来源）。
+- `node --test test/*.test.js` → `# tests 518 / # pass 518 / # fail 0 / # cancelled 0 / # skipped 0 / # todo 0`，退出码 0。
+- `node verify.mjs` → 退出码 0（v1.12.6 一致性链 + 11 工具）。
+- **转红①（B1）**：`lowerSet` 改回 `new Set(arr)` ⇒ 四条取值选项用例全红
+  （`pnpm -C /tmp publish → null`、`npm -C /tmp publish → null`、`sudo -C 3 rm -rf /tmp/x → null`、
+  `env -S 'ls; rm -rf /x' → null`），**恢复后 `cmp` 逐字节全等 + md5 回到变异前记录的基线 + 变异标记 grep 计数 0**。
+- **转红②（M1-③）**：`inline` 收口改回 `''` ⇒ `bash -c'rm -rf /x'` 判据层与监听器层一起红；恢复自证同上。
+- **转红③（M2）**：`FILE_FORM_RE` 的 `.git` 可选组加回去 ⇒ `dirsOfPaths(['/repo/.git'])`
+  实测 `['/repo'] ≠ ['/repo/.git']` 红；恢复自证同上。
+  三次变异都遵守「先记录基线 md5 + 先复制 pristine 副本，再动原文件」，避免恢复动作本身把
+  破坏写回交付状态（假绿）。
+
+#### 第四轮冻结凭据（自指说明同前）
+- 协议：`tar -czf /tmp/dsh-agent-dispatch-1.12.6-freeze.tar.gz --exclude=node_modules --exclude=.git .`
+  —— 在**本节写入之后**执行，故包内 `CHANGELOG.md` 与本文件逐字节一致。
+- 包自身的**成员数 / 字节数 / md5 / sha256**，以及解包后
+  `diff -r -x node_modules -x .git` 的结果，由交付报告给出（把包自己的 md5 写进包内会改变它
+  自己，构造上不可能自含）。
+- **逐文件 md5（第四轮冻结时点）**：`index.js` `abb8decddc6276b1b690e6b096e5670e`（本轮未动）、
+  `lib/host-approval.js` `73bdbf0720664b629a12d2cc566f4664`、
+  `lib/client.js` `2950680af8a5b4ace70573f173c9d3db`、
+  `lib/dispatch.js` `c415c59b661e437a666a1606dd23a7db`（未动）、
+  `package.json` `e1bd0bb661aa5ad0c1a84a978234bb36`（未动，版本仍是 1.12.6）、
+  `verify.mjs` `3f768b55932c7da38971fda0c7919194`（未动）、
+  `.github/workflows/ci.yml` `b1e13a422d6116e4bfc2136ebeea0fe7`、
+  `test/dangerous-command-gate.test.js` `197e0a693204b0e6e8da1a5a830e56cb`、
+  `test/grant-dialog.test.js` `4e5de48700109273f24ae6e0ac7151a5`、
+  `test/invariants-1-12-6.test.js` `cf884056eef37bba1f14098a1a96dbff`（未动）。
+  `CHANGELOG.md` 自身的 md5 不在表里（自指），以交付报告为准。
+- 冻结时刻见交付报告；此后不再触碰本工作区。
+- 仍然：未部署、未重启宿主、未动 `~/.dsh`、未 `git add`/`commit`、未切 ref、版本保持 1.12.6。
+
+### 第五轮（独立终审四审：3 Major + 3 Minor 的收口 + 一条用户新裁定）
+**上面三包（10:57 / 11:15 / 11:40）都已作废**：终审确认上一轮修的 B1/M1/M2 与 6 个 Minor
+全部真修好、既有断言未被放松（删除的 `assert`/`it` 行均为 0）、3 项变异转红与自报逐字一致；
+但同一族里又抓到 3 个 Major（M-A/M-B 必修，M-C 半修半登记）+ 3 个 Minor。
+本轮逐条收口后**再次重打冻结包**（凭据见本节末）。版本仍是 **1.12.6**（从未发布，不跳号）。
+
+#### 🟠 M-A（必修）：`execSubcommandIndex` 的下标 0 盲区 ⇒ multi-exec 静默放行（已收口）
+- **现象（终审实测）**：`find /tmp -exec echo {} \; -exec rm -rf {} +` ⇒ 判据层 **MISS**、
+  监听器层 `res="allowed-once" nextCalled=false`（**静默放行**）；单独的 `-exec rm -rf {} +`
+  （段首就是 `-exec`）同样 MISS；而只有一个 `-exec` 且不在段首的 `find … -exec rm -rf {} +` 命中。
+- **根因**：`execSubcommandIndex` 写的是 `for (let i = 1; …)`。`splitSubCommands` 会把 `;` 切成
+  子段，而 `;` 正是 `-exec … {} \;` 的终止符 ⇒ 第二段是 `" -exec rm -rf {} +"`（**段首就是
+  `-exec`**），下标 0 永不参与识别。
+- **修法**：`lib/host-approval.js:672` 起始下标 `1` → **`0`**（并把「为什么必须是 0」写进 JSDoc）。
+  从 0 起扫只会**多**识别「段首就是 `-exec`」的写法，不会让任何原本命中的写法失效。
+- **验收**：判据层与监听器层各补一条 multi-exec 用例（覆盖 `find /tmp -exec echo {} \; -exec rm -rf {} +`
+  与段首 `-exec rm -rf {} +`，另配 `-exec ls {} +` / `find . -exec grep -l foo {} +` 守卫）。
+- **转红①**：把 `i` 改回 `1` ⇒ 两条 `-exec` 用例与监听器层探针一起转红（见本节末）。
+
+#### 🟠 M-B（必修）：非绝对路径被丢弃后**静默退化成工具名档** ⇒ 授权放大到整个工具（已收口）
+- **现象（终审端点级原始输出）**：`POST paths:['./x.txt']` → `HTTP 200
+  {"paths":[],"toolName":"read","pathsSource":"user","dropped":[{"reason":"非绝对路径"}]}`
+  \+ 日志「路径声明为空 ⇒ 只写工具名档」⇒ 随后对**完全另一个文件** `/etc/passwd` 的 read
+  变成 `allowed-once`（**放大到整个工具**）。绝对路径对照不放大。
+- **5 跳证据链**：`extractToolPathGroups({file_path:'src/index.ts'})` 原样留相对路径
+  （`lib/host-approval.js:252-253`）→ 客户端 `dirsOfPaths` 非绝对原样（`lib/client.js:734-737`）
+  → 该组**默认勾选**（`lib/client.js:929-934`）→ 服务端丢弃（`lib/host-approval.js:144-148`）
+  → `index.js:2066-2076` 落 `addToolGrant`。
+- **服务端修法（第二道防线）**：`index.js:2059-2108` 区分「**给了路径但一条都不合法**」与
+  「**本来就空**」——两者天然可分（真删空时 `dropped === []`，全非法必然带 `dropped`）：
+  前者 **不写任何档（会话档 / 落盘档 / 工具名档都不写）并回 400** + 逐条 `dropped` 原因；
+  后者保持「只写工具名档」的既有语义（**弹框删空 ⇒ 工具档**这条不变式未被触碰）。
+  新增日志动作 `rule-rejected-all-paths-dropped`（排障要能区分「声明被整体拒绝」与「用户没声明」）。
+- **客户端修法（上游正解，用户裁定，见下一节）**：预填阶段就把**相对路径按工作区目录
+  `cwd` 拼成绝对路径**再进编辑框；拼不出来的（`~` 未展开 / 没拿到 cwd）**原样显示但强制
+  不勾选**，并在该行下给一条可读提示（`⚠ 非绝对路径：…服务端只认绝对路径，会把它丢弃 ⇒
+  这条不会写入规则`），用户改成绝对路径后提示自动收起。**默认勾选一条注定被服务端丢弃的
+  路径**这条链路（M-B 的入口）从此不存在。
+- **验收**：端点层 4 条 —— ① `paths:['./x.txt']` ⇒ 400 且**没有任何规则被写入**（会话档与
+  落盘档都不得出现，尤其不得 `toolGrant`），且随后对 `/etc/passwd` 的 read **仍然弹窗**；
+  ② `paths:[]`（真删空，`dropped:[]`）⇒ 仍只写工具名档（既有行为，必须保持）；
+  ③ `paths:['/abs/a.txt']` ⇒ 正常只写路径档（换目录仍弹）；④ 混合声明 ⇒ 200 且只写合法那条。
+  弹框层 3 条 —— 非绝对路径强制不勾选 + 行下提示 + 不随确认发出；`cwd` 缺失时文案说清是缺 cwd；
+  改成绝对路径后提示收起且可勾选。
+
+#### 🟠 M-B 附：用户新裁定 —— 相对路径先用工作区目录拼成绝对路径（本轮并入）
+- 用户原话（paraphrase）：「相对路径，自动用工作区目录拼写完整再放入编辑区吧。」
+- 实现：`lib/client.js` 新增 `resolveAgainstCwd(rel, cwd)`（纯词法：拼 cwd + 相对段、丢 `.` 段、
+  消 `..` 段、折叠重复分隔符）与 `dirsOfPaths(paths, cwd)` 的第二参数；`cwd` 来源是
+  `GET /agent-api/host-approval-context` 已回传的 `resolveApprovalContext().cwd`，宿主通道
+  （蓝球）已接线（`item.cwd`）；琥珀通道透传 `p.cwd`（产品侧当前不透传该字段 ⇒ 等价于原样，
+  走降级分支），且用新增的 `absolutizeDirs`（**只补绝对化、不套文件形态**）避免把产品侧
+  已经目录化的「名字像文件的目录」再取一次父目录。
+- **两条不猜（返回 null ⇒ 降级）**：`~` 开头（宿主与服务端都不展开它，猜错方向是把授权挪到
+  **别的**目录）、`cwd` 缺失或自身不是绝对路径。
+- **既有断言改动（逐条，理由=本裁定推翻了第四轮的做法）**：
+  `test/grant-dialog.test.js` 的用例 `Minor（第四轮终审）：非绝对路径…原样保留，不推父目录`
+  已**重写**为 `第五轮（用户裁定）：非绝对路径**按 cwd 拼成绝对路径**再进编辑框`，其中
+  4 条断言逐条换向：`dirsOfPaths(['./x.txt']) === ['./x.txt']` → `dirsOfPaths(['./x.txt'], '/proj') === ['/proj']`；
+  `['sub/dir/a.txt'] === ['sub/dir/a.txt']` → `['sub/dir/a.txt'], '/proj') === ['/proj/sub/dir']`；
+  `['~/.ssh/id_rsa'] === ['~/.ssh/id_rsa']`（无 cwd）→ 保留但**加 cwd 仍原样**（`~` 降级，两条都断）；
+  `['~/.ssh/id_rsa.pub']` 同上。**绝对路径那 3 条（`/a/b/x.txt`、`C:\a\b\x.txt`、`/repo/.git`）一字未动**，
+  并新增 `cwd` 缺失 / `cwd` 非绝对 / 盘符路径不套 cwd 的对照。
+  另：`test/grant-dialog.test.js` 的源码接线断言 `…dirsOfPaths(p.paths)` 锚点随调用点更新为
+  `…? absolutizeDirs(p.suggestedDirs, amberCwd) : dirsOfPaths(p.paths, amberCwd)`（语义未放宽）。
+  删除的 `assert` / `it` 行数为 **0**（只换向、只追加）。
+
+#### 🟠 M-C（半修半登记）：残留清单未声明完整 + 口径冲突
+- **现象（监听器层静默放行）**：`source script.sh`、`. script.sh`、`doas rm -rf /tmp/x`、
+  `setsid rm -rf /tmp/x`、`./deploy.sh`；判据层另有 `chroot`/`ionice`/`taskset`/`watch`/`parallel`/
+  `npx`/`yarn dlx`/`docker run … rm -rf` MISS。
+- **① 同族包装器补齐**（`lib/host-approval.js:512-521`）：`TRANSPARENT_WRAPPERS` 追加
+  `doas` / `setsid` / `chroot` / `ionice` / `taskset`；配套补 3 张表 ——
+  `WRAPPER_VALUE_OPTIONS` 增 `doas`/`ionice`/`taskset` 的**取值选项**（`-u root`、`-c 3`、
+  `-c 0-3`…），并新增 `WRAPPER_POSITIONAL_ARGS = { chroot: 1 }`：`chroot NEWROOT COMMAND…`
+  的第一个**位置参数是新根**，不跳过它真程序名就变成 `/mnt` ⇒ 仍然静默放行。
+  加进这张表只会**多**弹（同一份规则判被包装的命令），不会少弹。
+- **② `source` / `.` 与 `shell-stdin` 同原则**：新增门名 `SHELL_SOURCE_RULE = 'shell-source'`
+  （**可疑**档，保守转交互）。`source deploy.sh` / `. deploy.sh` 与 `bash deploy.sh` **同义**
+  （在当前 shell 里读脚本文件执行，正文静态不可判定），改前后者已转交互、前者却放行 ——
+  **口径冲突**就此消除。守卫：**不带参数**的 `source` / `.`（什么都不执行）、
+  `command -v source`（`-v` 是查询开关，剥掉 `command` 后只剩 `['source']`）、
+  文本里"提到"（`echo source x.sh`）一律不命中。
+- **③ 已知不覆盖（本轮声明，逐条对应实测）**：下列写法**判据层与监听器层都不命中**
+  （判不出来 ≠ 放行，读取侧的保守策略与工具名档照旧各自生效）：
+  | 写法 | 为什么不做静态判定 |
+  |---|---|
+  | `npx rm -rf /tmp/x` | `npx` 先解析包名再执行，命令正文不在命令行里 |
+  | `yarn dlx rm -rf /tmp/x` | 同上（dlx 会联网取包） |
+  | `docker run -v /:/h ubuntu rm -rf /tmp/x` | 真命令在**容器镜像内**，宿主侧静态不可见 |
+  | `parallel rm -rf /tmp/x` | 参数按块展开后再执行，需要理解 GNU parallel 的模板语法 |
+  | `watch rm -rf /tmp/x` | 周期性执行，语义由 watch 自己重建命令 |
+  | `./deploy.sh`（脚本文件直执行） | 与 `make deploy` 同类：要读文件才知道正文（`bash deploy.sh` 已按 shell-stdin 转交互，因为解释器在段首） |
+  | 危险命令出现在第 **256KB 附近及之后** | 判据文本有界截断的取舍：切点是**字符下标上的硬切**（起点落在 262136 仍命中、262141/262143 被切残 ⇒ MISS），见 Minor 2；`commandText` 一侧自第六轮起超限即保守转交互 |
+  | `su --version` / 裸 `su`（无 `-c`） | 第六轮新登记：交互登录 shell ⇒ 按 `su-shell` 保守转交互（**多弹一次**，与 `bash --version` 同族，不加豁免） |
+- **验收**：判据层 + 监听器层各一条用例覆盖 `source`/`.`/`doas`/`setsid`/`chroot`/`ionice`/`taskset`
+  （含取值/位置参数与误伤守卫）；CHANGELOG 清单与上表逐条对应。
+
+#### 🟡 Minor（本轮一并处理，逐条）
+1. **`dirsOfPaths(['C:\\'])` → `['C:']`**：尾分隔符分支原先只挡字面 `/`，绕过了 `parentDirOf`
+   的盘根守卫。新增 `ROOT_LIKE_RE = /^(?:[a-zA-Z]:)?[/\\]*$/`，在 `dirsOfPaths` / `absolutizeDirs`
+   / `resolveAgainstCwd` 三处统一「盘根不参与」（`C:\`、`C:`、`//` 一律丢）。服务端本来也会按
+   「根目录」丢弃它，但空预填 + 用户点确认拿 400 正是 M-B 的触发路径之一，预填阶段就不该出现。
+2. **热路径性能**：`dangerousCommandMatch(argsText)` 实测 0.1MB=25ms / 1MB=268ms / **4MB=889ms**
+   （同步阻塞宿主事件循环）。新增 `MAX_DANGER_TEXT_CHARS = 256 * 1024` 与 `boundDangerText()`，
+   `index.js:386-401` 在**判定前**截断（`commandText` 与 `argsText` 各一次），超限时落一条
+   `danger-text-truncated` 留痕（含截掉的字符数）；`resolveApprovalContext` 返回的原文**不动**
+   （下面的「执行类解析不出命令文本 ⇒ 不自动放行」仍按**完整** `commandText` 判）。
+   **取舍（明写）**：超长参数只检查前 256KB ⇒ 第 256KB 之后才首次出现的危险命令不再自动转交互。
+   另一条路（超限即保守转交互）被否掉：argsText 含 `write` 的正文，大正文是**常态**，
+   那条路会让每次大写入都强制弹框。真正的解法是「按段有界扫描/流式词法扫描」，本轮不做。
+3. **`shell-stdin` 的代价**：`bash deploy.sh` / `bash --version` / `bash --help` / `sh ./install.sh` /
+   `sh -n script.sh` / `zsh -l` 会**多弹一次**（安全方向）。**本轮不加豁免**；终审建议的
+   「只给纯 `--version` / `-V` / `--help` 开一个窄口子」登记为**后续可选优化**，
+   要做必须单独一轮 + 转红实验（放行面只对「解释器 + 单个纯信息开关」）。
+4. **`test/tool-grant-session.test.js` 的注入表**：handler 体新增闭包引用
+   （`boundDangerText` / `MAX_DANGER_TEXT_CHARS`）⇒ `CLOSURE_NAMES` 与 `compileHandler` 的
+   注入实参同步登记。`handlerNameDrift()` 硬守卫**未被放宽**（它当场报出了这次漏登记，
+   顺带发现「注释里写 `O(...)` 会被它当成函数调用」这个假阳性来源，已改成中文表述）。
+5. **`verify.mjs` 的顺序哨兵**随调用点更新（`dangerousCommandMatch(ctxInfo.commandText)` →
+   `dangerousCommandMatch(dangerCmd.text)`），并**新增**一条「截断必须早于判定」的字符串断言。
+
+#### 测试与转红（第五轮）
+- 用例数 518 → **531**（+13：判据层/监听器层 +5、端点层 +4、弹框预填 +4）。
+  `.github/workflows/ci.yml` 的 `MIN_TESTS` 同步 518 → **531**（来源已写进注释）。
+- `node --test test/*.test.js` → `# tests 531 / # pass 531 / # fail 0 / # cancelled 0 / # skipped 0 / # todo 0`，退出码 0。
+- `node verify.mjs` → 退出码 0（v1.12.6 一致性链 + 11 工具）。
+- `node --check`：`index.js` / `lib/host-approval.js` / `lib/client.js` / 三个测试文件全过。
+- **转红①（M-A）**：`execSubcommandIndex` 起始下标改回 `1` ⇒ `find … \; -exec rm -rf {} +` 与
+  段首 `-exec rm -rf {} +` 两条用例转红（判据层实际返回 `null`）。
+- **转红②（M-B）**：去掉 400 分支 ⇒ 端点用例 M-B① 转红（`200 ≠ 400`，且 `read /etc/passwd`
+  随后 `allowed-once` = 放大复现）。
+- **转红③（M-C②）**：去掉 `source`/`.` 的保守判定 ⇒ `source script.sh` / `. script.sh` 两条
+  用例转红（判据层 `null`、监听器层 `allowed-once`）。
+- **转红④（用户裁定）**：把「按 cwd 解析」改回「原样保留」⇒ `dirsOfPaths(['./x.txt'], '/proj')`
+  实测 `['./x.txt'] ≠ ['/proj']` 转红。
+  四次变异都遵守「**先记录基线 md5 → 先复制 pristine 副本 → 再动原文件**」，避免恢复动作本身
+  把破坏写回交付状态（假绿）；恢复自证 = `cmp` 逐字节 + md5 回基线 + `MUT-` 标记 grep 计数 0 + 复跑全绿。
+  （第七轮 m4 口径勘误：这里的「grep 计数 0」应读作「**源码文件**里计数 0」——
+  `lib/`、`test/`、`index.js`、`verify.mjs` 一律为 0；**全仓**有 6 处命中，全部在
+  `CHANGELOG.md` 自身（历轮把变异标记 `MUT-R6-1` / `MUT-M4R` 之类写进文档）。）
+
+#### 第五轮冻结凭据（自指说明同前）
+- 协议：`tar -czf /tmp/dsh-agent-dispatch-1.12.6-freeze.tar.gz --exclude=node_modules --exclude=.git .`
+  —— 在**本节写入之后**执行，故包内 `CHANGELOG.md` 与本文件逐字节一致。
+- 包自身的**成员数 / 字节数 / md5 / sha256**、解包后 `diff -r -x node_modules -x .git` 的结果
+  由交付报告给出（把包自己的 md5 写进包内会改变它自己，构造上不可能自含）。
+- **逐文件 md5 全表（第五轮冻结时点，65 个文件；不含 `CHANGELOG.md` 自身）**：
+
+```text
+  `.github/workflows/ci.yml` `7140db8c46c0dd7044c8a599f8131e8c`
+  `.gitignore` `fc9d54f7afb97c0d762a0dc93ec64ff8`
+  `.qoder/settings.local.json` `b0b9282667dcaade2d18528a237cd76d`
+  `LICENSE` `6cc0f1157ee6fec2c6fc4f612fa0bce0`
+  `README.en.md` `aa34e20873f8a77c9beb6e1c01a9577c`
+  `README.md` `ed9bf09567fb14fc0882a116ba1d62aa`
+  `cordis.patch.yml` `6344d499f05d66b13910d41f3310bb09`
+  `docs/screenshots/agents.png` `6a30c4c3fea4b4599c6fc22856f02353`
+  `docs/screenshots/fab-done.png` `f3c73094c4ea09c96884991b5ae0248b`
+  `docs/screenshots/fab-idle-1.png` `28043676b9a6086d267648c75dc9ee33`
+  `docs/screenshots/fab-idle-2.png` `48ab4b13a0dbd5061ebb1238422c7444`
+  `docs/screenshots/fab-running.png` `17efd4ab12a948d6ff0492d525e99c6b`
+  `docs/screenshots/history.png` `d89bfde07f90548ad00a49dbe920181a`
+  `docs/screenshots/overview.png` `6ba0684ec70bfabf3af13440e59be7a5`
+  `docs/screenshots/popup-agents-squads.png` `43994906eb5bc31018eff73ff5226812`
+  `docs/screenshots/popup-running.png` `5435027f217509c88f9efd843a54682c`
+  `docs/screenshots/popup-settings.png` `10697535447b3d3a5a27ac5bda5a385b`
+  `docs/screenshots/squads.png` `acb125e19badaa3d37ef97c5eeac36e4`
+  `index.js` `700dfc8f9bcce5da78f5f4e06da66aad`
+  `kiligzzz-dsh-agent-dispatch-1.11.21.tgz` `abee2cabce1248a9f857c7ed19852296`
+  `kiligzzz-dsh-agent-dispatch-1.11.22.tgz` `962754751a70c7c375cce68265488a37`
+  `kiligzzz-dsh-agent-dispatch-1.11.23.tgz` `609fb395e941ff25e317ce89c1d30d5d`
+  `kiligzzz-dsh-agent-dispatch-1.11.24.tgz` `22e7e7fadfe7fc383b06ac92e9b40d7b`
+  `lib/agents.js` `cc09bf96e6ad363e18b3ee85e10dd509`
+  `lib/client.js` `f23b9de5254ad9b4834e701ba074471f`
+  `lib/defaults.js` `f29387cda5012a199e9678e17390d81a`
+  `lib/dispatch.js` `c415c59b661e437a666a1606dd23a7db`
+  `lib/fab-config.js` `e68aaf76cf31904164b3e7ee97ef842b`
+  `lib/health.js` `7a2d06235e40a61facf742ff8dd8e82a`
+  `lib/host-approval.js` `26d629ce030892a5c9d029c555260bf5`
+  `lib/json-safe.js` `cb39c2aeb84952a416aa8ae02c9cd43b`
+  `lib/roster.js` `d9ee0131ac9ad2be8ef3e1c4485ca771`
+  `lib/skill-import.js` `05fbcecfdcd795d5f0921de159f6e345`
+  `lib/squad-registry.js` `16efbdc7adbbc655a80aa40766b6d4d4`
+  `lib/squads.js` `03cd42b9a961d4b17e5cd40601756ffb`
+  `package.json` `e1bd0bb661aa5ad0c1a84a978234bb36`
+  `test-p1p2-smoke.mjs` `bb9b72c42f1509e63186153f199a6f31`
+  `test/acp-config-fallback.test.js` `3961d7af0d3e310db4740a0f9c037c48`
+  `test/acp-twin.test.js` `e7bc1a55cb9331e668963525faf4a55e`
+  `test/agent-api-catalog.test.js` `4e8d5c3f8c62e91a6e40f6a9ec93117f`
+  `test/agent-api-harness.js` `7b48c19983cc6244cd44bfd8e448a178`
+  `test/childid-continuation.test.js` `b1ec780a6529fd841dfd27154ecf0916`
+  `test/client-form-logic.test.js` `109e524ef93378bbf0c9b791b963ddc5`
+  `test/dangerous-command-gate.test.js` `8a3e716041248cb619051d5ae34d98fa`
+  `test/dedup.test.js` `e93881ba9677de3351c54a29a9ebc243`
+  `test/fab-panel-layout.test.js` `378f9de86246e67bf01fa02fb3034882`
+  `test/failover-claim-race.test.js` `735e23e878a2f1e191a766a3aea2570f`
+  `test/failover-notify.test.js` `542597bd87c1cedde09bbe7a3d8fb2f0`
+  `test/failover-settlement.test.js` `c23fe799487e6bde3d198c04a40ca047`
+  `test/failover.test.js` `07030770e5af9067f538a0c4ab99feff`
+  `test/grant-dialog.test.js` `24d56e81abcc0037847fb13647737c5a`
+  `test/helpers/failover-host.js` `f725f9052a4b54cd66c171d6338048c0`
+  `test/host-0.2-compat.test.js` `e2d46d0cebf92864d746434997a9be04`
+  `test/host-approval-endpoint.test.js` `013bddf8f80f5bb0d9e91ad50d5838e9`
+  `test/host-approval.test.js` `72779f38918a1e163406884105d334c9`
+  `test/interrupt-no-failover.test.js` `bef2189f6bcd2a817f05b7556b744fec`
+  `test/invariants-1-12-6.test.js` `cf884056eef37bba1f14098a1a96dbff`
+  `test/perm-fab-jump.test.js` `ceb1e12feae9a0b23efecbbc17f0c412`
+  `test/permission-pending.test.js` `83dc18eb17551f07b1dcaf47c04e3039`
+  `test/plugin-diagnostic-log.test.js` `cda1a98981d674b32111ca808765a77b`
+  `test/roster-section.test.js` `1553c426468cd1b82ad425a6f7a542f0`
+  `test/route-validation.test.js` `5d0497e815613ced7611d9db07911687`
+  `test/session-source-v4.test.js` `87156b4abd7dbe3f9f336da6b288daea`
+  `test/tool-grant-session.test.js` `6ee4f33f2d3ad193e2cc55b23d06578f`
+  `verify.mjs` `345e3e8fb876f443f9c9c5ddc060ac49`
+  ```
+- `CHANGELOG.md` 自身的 md5 不在表里（自指）：表列的是**写入本节之前**其余 65 个文件的状态，
+  本节写入后立刻执行上面的打包协议，故包内这些文件与本表逐字节对应，以交付报告给出的
+  包 md5 为最终凭据。
+- 冻结时刻见交付报告；此后不再触碰本工作区。
+- 仍然：未部署、未重启宿主、未动 `~/.dsh`、未 `git add`/`commit`、未切 ref、版本保持 1.12.6。
+
+### 第六轮（收尾轮：1 Major「9 个同族包装器」+ 4 Minor 的收口）
+**先查现场再动手**：本轮开工前逐文件比对「工作区 vs 第五轮冻结包解包副本」——
+`diff -r -x node_modules -x .git` 输出 0 行、逐文件 md5 清单 66 个文件全等，
+即上一个执行者**没有**留下半成品（现场 = 冻结包原样），本轮在此基础上继续。
+版本仍 **1.12.6**（从未发布，不跳号）；未部署、未重启宿主、未动 `~/.dsh`。
+
+#### 🟠 M-D（必修）：9 个同族包装器仍静默放行，且「已知不覆盖」清单未登记
+- **现象（判据层 + 监听器层，逐条实测）**：`unshare -m rm -rf /x`、`nsenter -t 1 -m rm -rf /x`、
+  `strace -f rm -rf /x`、`firejail rm -rf /x`、`systemd-run --user rm -rf /x`、
+  `su root -c "rm -rf /x"`、`runuser -u root -- rm -rf /x`、`setarch x86_64 rm -rf /x`、
+  `prlimit rm -rf /x` 改前**全部 MISS** ⇒ 监听器层在「已授权 bash」下全部 `allowed-once`。
+- **根因**：`TRANSPARENT_WRAPPERS` 只补过 `doas`/`setsid`/`chroot`/`ionice`/`taskset`；
+  这 9 个既不在该表、也不在 `DANGEROUS_COMMAND_RULES`。它们与 `setsid` 同族
+  （换身份/环境/跟踪器跑**同一条**命令），**词法可判定**。
+- **修法**（`lib/host-approval.js`）：
+  · `TRANSPARENT_WRAPPERS` 追加这 9 个；`SU_WRAPPERS` 单列 `su`/`runuser`（见下）。
+  · `WRAPPER_VALUE_OPTIONS` 按**各自真实 CLI 语义**（man 页）补取值选项，**只列「吃掉下一个
+    token」的**：nsenter `-t/--target -N/--net-socket -G/--setgid -S/--setuid`
+    （`-m/-u/-i/-n/-p/-U/-C/-T/-r/-w/-W` 是 `[=file]` 可选附着形态，不列）、
+    unshare `-R/--root -w/--wd -S/--setuid -G/--setgid --map-user/--map-users/--map-group/
+    --map-groups --owner --propagation --setgroups -l/--load-interp --monotonic --boottime
+    --whitelist-env`（`-r` 是 `--map-root-user` **开关**、`-R` 才取值）、
+    strace `-e -E -p -u -b -I -P -a -o -s` + 长选项（`-f/-F/-D/-c/-C/-k/-n/-N/-q/-t/-T/-v/-x/-y`
+    全是开关）、firejail **一个都不列**（它的取值选项全是 `--opt=value` 形态，不吃下一个 token）、
+    systemd-run `-u/--unit -p/--property -E/--setenv -H/--host -M/--machine --description --slice
+    --service-type --uid --gid --nice --working-directory --on-* --path-property --socket-property
+    --timer-property`（`--user` 是**开关**，正是验收用例里那条）、
+    su/runuser `-c/--command -g/--group -G/--supp-group -s/--shell -w/--whitelist-environment
+    --session-command`（runuser 另有 `-u/--user`）、setarch `-p/--pid`、prlimit `-o/--output -p/--pid`
+    —— 用户清单里的 `prlimit --pid/-n` 按 man 页真实语义修正为 **`--pid/-o`**：`-n` 是
+    `--nofile[=limits]` 的**可选附着**形态，`-n 1024` 那个 `1024` 是位置参数、不会被 `-n` 吃掉
+    （列成取值选项反而会把真程序名吃掉 ⇒ 漏判）。
+  · `WRAPPER_POSITIONAL_ARGS` 的值改成**候选数组**：`{ chroot: [1], setarch: [1, 0] }` ——
+    `setarch [arch] [options] [program …]` 的 `arch` 自 util-linux 2.33 起**可选**
+    （man 页例子 `setarch --addr-no-randomize mytestprog` 的第一个位置参数就是程序名，
+    而 `setarch ppc32 rpmbuild …` 里是 arch），词法上分不出是哪种 ⇒ 两个候选**都判一遍**
+    （**并集**，只多弹不少弹：`setarch x86_64 rm -rf /x` 与 `setarch -R rm -rf /x` 都命中）。
+  · **`su` / `runuser` 单列**（`SU_WRAPPERS`）：`-c '<正文>'` 的正文经空白切分只剩半个词
+    （`su root -c "rm -rf /x"` → `-c`、`"rm`、`-rf`、`/x"`），通用剥壳无论把 `-c` 当开关还是当
+    取值选项都会把正文拼坏 ⇒ 剥壳循环**一见它们就原样交回**，由新的 `matchSuShell` 判：
+    有 `-c`/`--command`/`--session-command` ⇒ **按 `shell -c` 同原则**解析正文再喂给**同一份规则**
+    （递归深度同一把尺子，用尽按 `SHELL_DEPTH_RULE`）；没有 `-c` ⇒ 剥掉自身选项与可选用户名
+    （`runuser` 的 `-u` 与位置参数用户名**互斥**）后继续判，**什么都不剩**（`su`、`su - root`、
+    `su --version`）＝ 交互登录 shell ⇒ 新门名 `SU_SHELL_RULE = 'su-shell'`（**可疑**档，
+    保守转交互），与 `shell-stdin` / `shell-source` 同一原则。
+  · **附带修一处误伤**：`command -v su` / `command -V su` / `command -p -v su` 是 `command`
+    内建的**查询**开关（打印路径，**不执行**）。改前靠 `source` 分支 `tokens.length > 1` 的
+    副作用侥幸挡住，而 `su` 的「只剩它自己 ⇒ 可疑」必须在同形下成立，两者剥壳后
+    **长得一模一样** ⇒ 新增 `isCommandQuery()` 在**原文层**把查询形态认出来（只豁免这两个开关）。
+    ⚠️ **第七轮 m2 文档精度（把边界写准，免得被当少弹重开）**：这是**整段豁免** ——
+    一旦段首是 `command` 且紧跟（可隔一个 `-p`）`-v`/`-V`，**整段**都不判，不只豁免
+    `su`/`source` 那两条。**连带被放过的形态**（实测全部 MISS）：
+    `command -v rm -rf /x`、`command -v env rm -rf /x`、`command -v busybox rm -rf /x`、
+    `command -v sudo rm -rf /x`、`command -v su rm -rf /x`、`command -V busybox rm -rf /x`、
+    `command -p -v env rm -rf /x`。语义上这是**正确**的（POSIX：`command -v` 只打印路径、
+    **从不执行**它的操作数），属刻意边界而不是漏判。**跨段不受影响**：
+    `command -v su; rm -rf /x` 仍命中 `rm -rf`、`command -v rm; git push` 仍命中 `git push`
+    （`splitSubCommands` 先按 `;`/`|`/换行分段，再逐段判）。
+- **验收**：判据层 + 监听器层各覆盖 9 条验收命令 + 各自的取值/位置参数变体 + 叠加与嵌套
+  （`sudo su root -c …`、`bash -c "su … -c …"`、`find /tmp -exec su root -c … +`、
+  `unshare -m npm publish`、`strace -f git push`）；误伤守卫判据层 24 条 / 监听器层 22 条
+  全 MISS / 全 `allowed-once`。
+
+#### 🟡 Minor（本轮一并处理，逐条）
+1. **B1 反向断言空转（终审已独立证实）**：`test/invariants-1-12-6.test.js` 的
+   `/scope === 'project'[\s\S]{0,1200}isDisallowedAutoGrant/` 窗口从
+   `case '/agent-api/host-approval-rule'` 起算只有 1200 字符，而 `scope === 'project'` 的三处
+   出现点在 **+9413 / +9679 / +9766**，`isDisallowedAutoGrant` 只在 +426 / +4860 ⇒ **正则永不匹配**、
+   `=== false` 恒真（守卫名不副实）。**二选一里选「锚定到项目档分支整体」**（不删，因为这条
+   性质仍值得守、`test/host-approval-endpoint.test.js` 只守行为层）：切出**整个端点体**
+   （`case '/agent-api/host-approval-rule'` → `'/agent-api/active'`，实测 10178 字符）、
+   **去掉注释**（窗口里那 2 次提及**都在注释里**，不去注释照样恒真）、再查标识符；并加两条
+   **正向锚**（写侧判据那一行 + `appendProjectRule(`）证明窗口没跑空 —— 否则锚点一改名，
+   这条又会退化成空转断言。
+2. **截断边界描述不精确**：`boundDangerText` 是**字符下标上的硬切**，不是「切在命令边界上」
+   ⇒ 危险命令**起点**在 262136（上限 - 8）时仍完整命中，在 262141 / 262143 会被切残
+   （`rm -rf` 只剩 `r`）⇒ MISS。声明从「第 256KB 之后不判」改成「**第 256KB 附近及之后**不判」，
+   `boundDangerText` 的 JSDoc 与 `DANGEROUS_COMMAND_RULES` 的覆盖边界注释都写明取舍；
+   新增一条用例把边界钉死（上限 - 8 命中 / 上限 - 3 MISS / 不超限不截）。
+3. **`commandText` 超限改为保守转交互**：`commandText` 是**真正的 shell 正文**
+   （`command`/`cmd`/`commandLine`/`commandline`/`script` 五个键），超长不是常态 ⇒ 超限即按新门名
+   `COMMAND_TOO_LONG_RULE = 'command-too-long'` 保守转交互（**同一位置**：危险门内、早于工具名
+   短路与一切档位；留痕 `action: 'danger-command-block'` + 暂存上下文带 `dangerRule`，
+   UI 因此说得出「每次都问、不可记忆」）。**`argsText` 保持截断不动**（含 `write` 的正文，
+   大正文是常态），并有对照用例钉住这条口径差。handler 体新增闭包引用
+   `COMMAND_TOO_LONG_RULE` ⇒ 按既有硬规矩在 `test/tool-grant-session.test.js` 的
+   `CLOSURE_NAMES` / `compileHandler` 注入表登记（漏登记 = ReferenceError 被 handler 的
+   try/catch 吞掉 ⇒ 退化成放行）。
+4. **`resolveAgainstCwd` 加绝对路径前置**（`lib/client.js`）：`rel` 本身已是绝对路径（含盘符形态）
+   ⇒ 直接返回（盘根仍按 `ROOT_LIKE_RE` 丢弃），**不再拼 cwd**。两个调用点都有 `ABS_PATH_RE`
+   前置 ⇒ 这条路径**当前不可达**，属潜在 wart（会拼出 `"C:/base/C:/win/x.txt"`）；
+   harness（`buildGrantModule`）把 `resolveAgainstCwd` 一并导出后直接断言，含「相对路径行为
+   一字未动」的对照。
+
+#### 只登记、不改（本轮口径）
+- `bash deploy.sh` / `bash --version` / `source ~/.zshrc` / `source --version` 多弹一次是**刻意保守
+  设计**，**不加豁免**；同理第六轮新登记的 `su --version` / 裸 `su`（无 `-c`）按 `su-shell` 多弹一次、
+  `su root -c "bash --version"` 继承内层 `shell-stdin` 的保守误报 —— 同一个家族、同一把尺子。
+- `npx` / `yarn dlx` / `docker run` / `parallel` / `watch` / `./deploy.sh` / 超 256KB 之后的
+  `argsText` 仍是明确不判定的边界，保持现状（清单见第五轮 M-C③）。
+
+#### 测试与转红（第六轮）
+- 用例数 531 → **538**（+7：判据层 3、监听器层 3、弹框 1）。`.github/workflows/ci.yml` 的
+  `MIN_TESTS` 同步 531 → **538**（来源已写进注释）；`SKIPPED_ALLOWED` 不变（1）。
+- `node --test test/*.test.js` → `# tests 538 / # pass 538 / # fail 0 / # cancelled 0 / # skipped 0 / # todo 0`，退出码 0。
+- `node verify.mjs` → 退出码 0（v1.12.6 一致性链 + 11 工具）；`node --check` 覆盖
+  `index.js` / `lib/host-approval.js` / `lib/client.js` / 三个改过的测试文件，全过。
+- **转红①（M-D）**：把 9 个包装器从 `TRANSPARENT_WRAPPERS` 去掉（标记 `MUT-R6-1`）⇒
+  `test/dangerous-command-gate.test.js` 实测 `# pass 37 / # fail 2`、EXIT=1，红点原文：
+  「unshare -m rm -rf /tmp/x 判定不对」「unshare -m rm -rf /x 被静默放行了（用户裁决：必须走交互授权）」。
+- **转红②（Minor 3）**：去掉 `commandText` 超限分支（标记 `MUT-R6-2`）⇒ 同文件实测
+  `# pass 37 / # fail 2`、EXIT=1，红点原文：「超长 commandText 必须交回交互层（不是自动放行）」
+  （日志实测走了「宿主审批自动放行（本会话工具授权命中）」）+ 顺序哨兵「commandText 超长的保守门调用点丢失」。
+- 两次变异都遵守「**先记基线 md5 → 先复制 pristine 副本 → 再动原文件**」（避免恢复动作把破坏写回
+  交付状态）；恢复自证 = `cmp` 逐字节 + md5 回基线（`lib/host-approval.js` `a290b9f21b9cba4b1e2200b0c72e4472`、
+  `index.js` `32dac461bbedf1784b4047629d0b3c41`）+ `MUT-` 标记 grep 计数 0 + 复跑全绿（538/538/0）。
+- **被改动的既有断言（逐条，理由）**：
+  · `test/invariants-1-12-6.test.js` 的写入侧反向断言 —— **改法本身是本轮 Minor 1 的交付内容**
+    （旧写法恒真），不是"顺手放松"：新写法比旧写法**更严**（去注释后查标识符 + 两条正向锚）。
+  · `test/tool-grant-session.test.js` 的 `CLOSURE_NAMES` / `compileHandler` 注入表 —— 纯**追加**
+    一个闭包引用 `COMMAND_TOO_LONG_RULE`（handler 体新增引用必须登记，硬守卫 `handlerNameDrift()`
+    只抓"被调用"的标识符，常量得手工登记）。
+  · `test/grant-dialog.test.js` 的 `buildGrantModule` 返回值 —— 纯**追加** `resolveAgainstCwd`
+    （为了能直接断言这个原本不可达的路径），不涉及既有断言。
+  · 其余既有用例**一行未动**：`test/dangerous-command-gate.test.js` 的「门的顺序」哨兵只**追加**
+    三条关于新门位置的断言；旧锚点（`const danger = dangerousCommandMatch(dangerCmd.text)`）
+    刻意保留原样（新门写成**独立早退分支**，不并进 `danger` 计算）。
+  · **删除的 `assert` / `it` 行数为 0**，无 `skip` / `only`，没有放宽任何判据。
+
+#### 第六轮冻结凭据（自指说明同前）
+- 协议：`tar -czf /tmp/dsh-agent-dispatch-1.12.6-freeze.tar.gz --exclude=node_modules --exclude=.git .`
+  —— 在**本节写入之后**执行，故包内 `CHANGELOG.md` 与本文件逐字节一致。
+- 包自身的**成员数 / 字节数 / md5** 与解包后 `diff -r -x node_modules -x .git` 的结果
+  由交付报告给出（把包自己的 md5 写进包内会改变它自己，构造上不可能自含）。
+- **逐文件 md5 全表（第六轮冻结时点，65 个文件；不含 `CHANGELOG.md` 自身）**：
+
+```text
+  `.github/workflows/ci.yml` `975e35ff299ac9e1e0e236ff27fd3f77`
+  `.gitignore` `fc9d54f7afb97c0d762a0dc93ec64ff8`
+  `.qoder/settings.local.json` `b0b9282667dcaade2d18528a237cd76d`
+  `LICENSE` `6cc0f1157ee6fec2c6fc4f612fa0bce0`
+  `README.en.md` `aa34e20873f8a77c9beb6e1c01a9577c`
+  `README.md` `ed9bf09567fb14fc0882a116ba1d62aa`
+  `cordis.patch.yml` `6344d499f05d66b13910d41f3310bb09`
+  `docs/screenshots/agents.png` `6a30c4c3fea4b4599c6fc22856f02353`
+  `docs/screenshots/fab-done.png` `f3c73094c4ea09c96884991b5ae0248b`
+  `docs/screenshots/fab-idle-1.png` `28043676b9a6086d267648c75dc9ee33`
+  `docs/screenshots/fab-idle-2.png` `48ab4b13a0dbd5061ebb1238422c7444`
+  `docs/screenshots/fab-running.png` `17efd4ab12a948d6ff0492d525e99c6b`
+  `docs/screenshots/history.png` `d89bfde07f90548ad00a49dbe920181a`
+  `docs/screenshots/overview.png` `6ba0684ec70bfabf3af13440e59be7a5`
+  `docs/screenshots/popup-agents-squads.png` `43994906eb5bc31018eff73ff5226812`
+  `docs/screenshots/popup-running.png` `5435027f217509c88f9efd843a54682c`
+  `docs/screenshots/popup-settings.png` `10697535447b3d3a5a27ac5bda5a385b`
+  `docs/screenshots/squads.png` `acb125e19badaa3d37ef97c5eeac36e4`
+  `index.js` `32dac461bbedf1784b4047629d0b3c41`
+  `kiligzzz-dsh-agent-dispatch-1.11.21.tgz` `abee2cabce1248a9f857c7ed19852296`
+  `kiligzzz-dsh-agent-dispatch-1.11.22.tgz` `962754751a70c7c375cce68265488a37`
+  `kiligzzz-dsh-agent-dispatch-1.11.23.tgz` `609fb395e941ff25e317ce89c1d30d5d`
+  `kiligzzz-dsh-agent-dispatch-1.11.24.tgz` `22e7e7fadfe7fc383b06ac92e9b40d7b`
+  `lib/agents.js` `cc09bf96e6ad363e18b3ee85e10dd509`
+  `lib/client.js` `6078d0815f36cd495bf2804fbb04417e`
+  `lib/defaults.js` `f29387cda5012a199e9678e17390d81a`
+  `lib/dispatch.js` `c415c59b661e437a666a1606dd23a7db`
+  `lib/fab-config.js` `e68aaf76cf31904164b3e7ee97ef842b`
+  `lib/health.js` `7a2d06235e40a61facf742ff8dd8e82a`
+  `lib/host-approval.js` `a290b9f21b9cba4b1e2200b0c72e4472`
+  `lib/json-safe.js` `cb39c2aeb84952a416aa8ae02c9cd43b`
+  `lib/roster.js` `d9ee0131ac9ad2be8ef3e1c4485ca771`
+  `lib/skill-import.js` `05fbcecfdcd795d5f0921de159f6e345`
+  `lib/squad-registry.js` `16efbdc7adbbc655a80aa40766b6d4d4`
+  `lib/squads.js` `03cd42b9a961d4b17e5cd40601756ffb`
+  `package.json` `e1bd0bb661aa5ad0c1a84a978234bb36`
+  `test-p1p2-smoke.mjs` `bb9b72c42f1509e63186153f199a6f31`
+  `test/acp-config-fallback.test.js` `3961d7af0d3e310db4740a0f9c037c48`
+  `test/acp-twin.test.js` `e7bc1a55cb9331e668963525faf4a55e`
+  `test/agent-api-catalog.test.js` `4e8d5c3f8c62e91a6e40f6a9ec93117f`
+  `test/agent-api-harness.js` `7b48c19983cc6244cd44bfd8e448a178`
+  `test/childid-continuation.test.js` `b1ec780a6529fd841dfd27154ecf0916`
+  `test/client-form-logic.test.js` `109e524ef93378bbf0c9b791b963ddc5`
+  `test/dangerous-command-gate.test.js` `bb3b9209a14ce74d223d1be13c8a8e20`
+  `test/dedup.test.js` `e93881ba9677de3351c54a29a9ebc243`
+  `test/fab-panel-layout.test.js` `378f9de86246e67bf01fa02fb3034882`
+  `test/failover-claim-race.test.js` `735e23e878a2f1e191a766a3aea2570f`
+  `test/failover-notify.test.js` `542597bd87c1cedde09bbe7a3d8fb2f0`
+  `test/failover-settlement.test.js` `c23fe799487e6bde3d198c04a40ca047`
+  `test/failover.test.js` `07030770e5af9067f538a0c4ab99feff`
+  `test/grant-dialog.test.js` `9c602287549e6042fa52c11a10d1184e`
+  `test/helpers/failover-host.js` `f725f9052a4b54cd66c171d6338048c0`
+  `test/host-0.2-compat.test.js` `e2d46d0cebf92864d746434997a9be04`
+  `test/host-approval-endpoint.test.js` `013bddf8f80f5bb0d9e91ad50d5838e9`
+  `test/host-approval.test.js` `72779f38918a1e163406884105d334c9`
+  `test/interrupt-no-failover.test.js` `bef2189f6bcd2a817f05b7556b744fec`
+  `test/invariants-1-12-6.test.js` `4c30eab81d893985e1f1dc1bc829a734`
+  `test/perm-fab-jump.test.js` `ceb1e12feae9a0b23efecbbc17f0c412`
+  `test/permission-pending.test.js` `83dc18eb17551f07b1dcaf47c04e3039`
+  `test/plugin-diagnostic-log.test.js` `cda1a98981d674b32111ca808765a77b`
+  `test/roster-section.test.js` `1553c426468cd1b82ad425a6f7a542f0`
+  `test/route-validation.test.js` `5d0497e815613ced7611d9db07911687`
+  `test/session-source-v4.test.js` `87156b4abd7dbe3f9f336da6b288daea`
+  `test/tool-grant-session.test.js` `a841561b509b16fde275beeef328ed55`
+  `verify.mjs` `345e3e8fb876f443f9c9c5ddc060ac49`
+```
+- `CHANGELOG.md` 自身的 md5 不在表里（自指）：表列的是**写入本节之前**其余 65 个文件的状态，
+  本节写入后立刻执行上面的打包协议，故包内这些文件与本表逐字节对应。
+- 冻结时刻见交付报告；此后不再触碰本工作区。
+- 仍然：未部署、未重启宿主、未动 `~/.dsh`、未 `git add`/`commit`、未切 ref、版本保持 1.12.6。
+
+### 第七轮（收尾轮：1 阻断「短选项大小写折叠 ⇒ 同形开关吃掉真程序名」+ 结构性兜底 + 2 Minor + 设计裁定第 10 条）
+
+#### 🔴 阻断 A：大小写折叠 ⇒ 4 组「开关 + 程序名」形态被静默放行
+- **现象（终审判据层 + 监听器层双证，全部是**会真正执行 `rm -rf /x`** 的合法 CLI）**：
+  `unshare -r rm -rf /x`、`unshare -m -r rm -rf /x`、`nsenter -n rm -rf /x`、
+  `nsenter -t 1 -n rm -rf /x`、`strace -A rm -rf /x`、`systemd-run -P rm -rf /x`、
+  `systemd-run --user -P rm -rf /x` ⇒ 判据层 `null`、监听器层 `allowed-once`（**静默放行**）。
+- **根因**：取值选项表**造表与查表都做了小写归一**（原 `lowerSet` + 三处 `toLowerCase()`），
+  把按**真实大小写**登记的大写短选项与它的**小写同形开关**混成同一个键：
+  | 表内登记（真实大小写） | 被误命中的小写同形 | 小写那条的真实语义 |
+  |---|---|---|
+  | `unshare -R dir`（`--root`，取值） | `-r` | `--map-root-user`，**开关** |
+  | `nsenter -N fd`（`--net-socket`，取值） | `-n` | `--net`，**开关** |
+  | `strace -a column`（`--columns`，取值） | `-A` | `--output-append-mode`，**开关** |
+  | `systemd-run -p prop`（`--property`，取值） | `-P` | `--pipe`，**开关** |
+  | `xargs -L n`（`--max-lines`，取值） | `-l` | `-l[max-lines]`，**可选附着**（不吃下一个 token） |
+  | `xargs -P n`（`--max-procs`，取值） | `-p` | `--interactive`，**开关** |
+  那个开关于是被当成「取值选项」⇒ **紧跟其后的真程序名被吃掉** ⇒ 整段判不出来。
+- **鉴别证据**：碰撞开关后面若还有别的选项 ⇒ 吃到的是选项 ⇒ 仍命中
+  （`unshare -r -m rm -rf /x`、`strace -A -f rm -rf /x` 改前就命中）—— 正是「吃错了 token」的指纹。
+- **修法①（查表侧：短选项大小写精确）**：新增 `optionKey` / `optionSet` ——
+  **短选项原样比对**（表内拼写 = 该选项的真实大小写）、**长选项仍小写归一**
+  （`--Chdir` 这类历史拼写不受影响）。三处查表点（`unwrapTransparentWrappers`、
+  `suCommandTokens`、`subCommandVerb`）统一走它。
+- **修法②（同一次修法带出的表内校正，逐条 man 核对）**：短选项按真实大小写比对之后，
+  表里就必须写真大小写 —— 否则**反向丢命中**：
+  · `sudo` 补 `-R dir`(=`--chroot`)、`-T timeout`(=`--command-timeout`)、`-U user`(=`--other-user`)、
+    `-D dir`(=`--chdir`)（前三条改前正是撞上小写的 `-r`/`-t`/`-u` 才侥幸命中）；
+  · `strace` 补 `-U columns`(=`--summary-columns`)、`-O overhead`(=`--summary-syscall-overhead`)、
+    `-S sortby`(=`--summary-sort-by`)、`-X format`(=`--const-print-style`)（前三条同因，`-X` 本来就漏）；
+  · `git` 把 `-C path` 写回来（第四轮因「`-c`/`-C` 归一成同一个键」删掉了它；归一取消后不写回，
+    `git -C /tmp push` 就丢命中）；
+  · `xargs` **删掉 `-i`**（不是漏登记，是第四轮归错类别）：GNU man 原文是 `-i[replace-str]`
+    —— 方括号 = 可选参数、只能附着写 ⇒ **不吃下一个 token**，列进来等于把
+    `xargs -i rm -rf /x` 的 `rm` 当取值吃掉（方向与「只列吃掉下一个 token 的」那条取舍相反）。
+  依据：本机 `man sudo`（1.9.x）与 man7.org 的 `xargs(1)`/`strace(1)`/`unshare(1)`/`nsenter(1)`/
+  `ionice(1)`/`taskset(1)`/`su(1)`/`runuser(1)`/`systemd-run(1)` 取值选项表逐条核对；
+  测试里以 `DUAL_VALUE_PAIRS` **显式列出**唯一允许存在的「两条拼写都真吃取值」同形对
+  （`sudo -r/-R`、`-t/-T`、`-u/-U`；`ionice -p/-P`；`strace -e/-E`、`-p/-P`、`-u/-U`、`-o/-O`、`-s/-S`；
+  `su`/`runuser` 的 `-g/-G`；`git -c/-C`），清单陈旧或漏列都会让用例红。
+- **回归（既有命中一条不丢）**：`pnpm -C /tmp publish`、`git -C /tmp push`、`npm -C /tmp publish`、
+  `npm --prefix /tmp publish`、`sudo -u root rm -rf /x`、`ionice -c2 rm -rf /x`、`taskset -c 0 rm -rf /x`、
+  `sudo -C 3 rm -rf /x`、`env -S 'ls; rm -rf /x'` …… 逐条进「既有命中一条都不许丢」用例。
+
+#### 🔴 阻断 B（同根，一并修）：`xargs -l` / `xargs -p`
+- `xargs -l rm -rf /x`、`xargs -p rm -rf /x` 与阻断 A 同一根因（`-L`→`-l`、`-P`→`-p` 折叠）。
+  两轮结果一致 ⇒ **非本轮引入**，但同一次修法一起解决（`-l`/`-p` 不再命中表里的 `-L`/`-P`，
+  按真实语义它们分别是可选附着参数与开关）。
+
+#### 🟢 结构性兜底：新门名 `WRAPPER_OPTION_AMBIGUITY_RULE = 'wrapper-option-ambiguity'`（**可疑**档）
+- **目的**：同族再出现「把开关登记成取值选项」时，**不依赖任何工具的 man 语义**也能兜住 ——
+  判据只看**谁站在程序名的位置上**，不看某个开关吃不吃值。
+- **两个判据**（都只在主路径**一个字都没命中**时生效 ⇒ 只会把静默放行改成保守转交互，
+  **永远不会改掉既有命中的规则名**）：
+  ① 剥壳后交给规则的**头 token 以 `-` 开头**（且段内没有 `-exec` 系标记）⇒ 我们把某个**选项**
+     当成了程序名，真程序名必然在别处被吃掉过；
+  ② 跳词时被当成「取值 / 位置参数」跳过的某个 token **自己能起一条危险命令** ⇒ 那个「取值」
+     其实就是程序名。真实一例：`env -S 'rm -rf /x'`（`-S` 的取值就是整条命令，改前**静默放行**）、
+     `su -G grp rm -rf /x`（真程序名被当成位置参数用户名吃掉）。
+- **与任务原文的差异（如实登记，请按这条口径复核）**：任务第二条写的是「解包后**什么都不剩**
+  但原段首是已知包装器 ⇒ 可疑」。这条**与本项目既有的误伤守卫直接冲突** ——
+  `prlimit --pid 1`、`prlimit -o /tmp/o`、`setarch --show --pid 9284`、`strace --version`、
+  `unshare --help`、`setarch --list` 都是「取值吃掉后什么都不剩」，而它们**必须保持 MISS**
+  （第六轮 24 条守卫的一部分，本轮验收也点名要全 MISS）。故采纳的是**同一原则的可达形态**：
+  判据①（程序名位置站着选项）+ 判据②（被吃掉的"取值"能起一条命令），
+  把「光用完选项、什么都没剩」排除在可疑之外（否则每一次正常用完选项都会弹）。
+  判据①另要求段内**至少两个 token**：`{argv: ['rm','-rf','/']}` 这类 argv 拆词形态经
+  `argsTextOf` 拆出的光秃秃 `-rf` 段仍是**登记在案的残留边界**（既有用例钉着 `=== null`），
+  不许被兜底翻成命中（否则 `{argv: ['ls','-la']}` 也会弹一次）。
+- **探针条数封顶** `MAX_OPTION_PROBES = 8`：兜底只在 MISS 后跑、单段探针条数有上限 ⇒
+  热路径仍是 O(段长) 量级（危险门跑在每次审批上，`boundDangerText` 的 256KB 口径不变）。
+  该上限是**每段共享的预算**（`{ probes: MAX_OPTION_PROBES }` 在段入口创建、一路传给嵌套
+  剥壳与探针自己的判定）：否则 `runuser -u x ` ×N 这类**嵌套剥壳链**会在每一层 MISS 后各
+  重判一次后缀 ⇒ 段内二次方（实测 n=1000 时探针把既有 O(n²) 的常数抬高约 1.6×）。共享后
+  **单段兜底重判硬封顶 8 次**、实测耗时与轮前持平（n=250/500/1000 分别 77/257/1094ms vs
+  轮前 75/262/962ms），代价只是超长病态链的深层探针可能不跑（方向仍是「少弹」，
+  且只影响兜底这一层）。同一条链上**栈溢出阈值与轮前一致**（约 2019 层 / 26KB `runuser -u x`，
+  两个版本同点抛 `RangeError`）——该上限是轮前的递归形状决定的，本轮未触及。
+
+#### 🟡 Minor（本轮一并处理，逐条）
+1. **m3 留痕丢外层段**：`matchSuShell` 的 no-`-c` 分支原先 `return matchSegment(rest.join(' '), depth)`，
+   内层 `trace()` 重算 ⇒ `runuser -u root -- rm -rf /x` 的日志只有 `segment="rm -rf /x"`，
+   而同族（`-c` 正文、shell `-c`、`-exec`、透明包装）都留**外层**段 ——
+   排障时看不到「这条是被 runuser 包着跑的」。现在**规则名仍用内层命中的那条**，留痕统一用外层 `trace()`。
+2. **m4 文档精度**：第四/五/六轮写的「`MUT-` 标记 grep 计数 0」，**全仓**其实有 6 处命中 ——
+   全部在 `CHANGELOG.md` 自身（历轮把变异标记 `MUT-R6-1` / `MUT-M4R` 之类写进文档）。
+   准确口径已就地勘误为「**源码文件**里 `MUT-` 计数 0」（`lib/`、`test/`、`index.js`、`verify.mjs`）。
+3. **m2 文档精度（`command -v` 是整段豁免）**：`isCommandQuery` 一旦认出 `command [-p] -v/-V`，
+   **整段**都不判（不只豁免 `su`/`source` 那两条）⇒ 连带被放过的形态（实测全 MISS）：
+   `command -v rm -rf /x`、`command -v env rm -rf /x`、`command -v busybox rm -rf /x`、
+   `command -v sudo rm -rf /x`、`command -v su rm -rf /x`、`command -V busybox rm -rf /x`、
+   `command -p -v env rm -rf /x`。语义本身**正确**（POSIX：`command -v` 只打印路径、**从不执行**），
+   是刻意边界而不是少弹；**跨段不受影响** —— `command -v su; rm -rf /x` 仍命中 `rm -rf`、
+   `command -v rm; git push` 仍命中 `git push`（分段后逐段判）。就地写进第六轮那一条（见上）。
+
+#### 设计裁定第 10 条：`su` / `runuser` 移出 `TRANSPARENT_WRAPPERS`
+- **选 (a)**：把 `su`/`runuser` 从透明包装表移出，**并删掉随之变死的那条早返回**
+  （`unwrapTransparentWrappers` 里 `if (SU_WRAPPERS.has(head)) return { tokens: out, ... }`）。
+  **⚠️ 顺序要求**：两件事必须**一起**做 —— 只删早返回而保留表成员，`su` 会落入通用剥壳、
+  `-c` 正文被空白切碎 ⇒ **真的漏判**。
+- **行为对照证据（移出 + 删早返回前后）**：终审已实测「全量 538/538 全绿 + 156 条判据层探针逐行相同」；
+  本轮又补了两条哨兵：**源码级**（表里不得再有 `'su'`/`'runuser'`、
+  `unwrapTransparentWrappers` 体内不得再出现 `SU_WRAPPERS`）+ **行为级**
+  （`su root -c "rm -rf /x"` → `rm -rf`、`runuser -u root -- rm -rf /x` → `rm -rf`（留痕外层）、
+  `su - root` → `su-shell`、`sudo su -` → `su-shell`、`command -v su` → MISS，五条读数一字不变）。
+- **单一事实来源**：跳词表（`WRAPPER_VALUE_OPTIONS.su`/`.runuser`）与 `SU_WRAPPERS` 仍在，
+  只是不再有「登记在表里却不剥」这第二处事实来源。
+
+#### 测试与转红（第七轮）
+- 用例数 538 → **546**（+8：判据层 6 条、监听器层 2 条）；`.github/workflows/ci.yml` 的
+  `MIN_TESTS` 同步 538 → **546**（来源已写进注释）；`SKIPPED_ALLOWED` 不变（1）。
+- **被改动的既有断言：0 条**（无放宽、无删除、无 `skip`/`only`）。为让既有断言继续成立，
+  代码侧做了两处**收窄**（方向都是"不误伤"）：兜底判据①要求 `tokens.length > 1`（保住
+  argv 拆词守卫）；兜底整体只在**主路径 MISS** 后生效（保住所有既有命中的规则名）。
+- **转红①（大小写精确）**：把 `optionKey` 改回大小写折叠（标记 `MUT-R7-1`）⇒
+  `test/dangerous-command-gate.test.js` 的阻断用例与表驱动用例转红（读数见交付报告）。
+- **转红②（结构性兜底）**：去掉判据①（标记 `MUT-R7-2`）⇒「结构性可疑门」用例转红（读数见交付报告）。
+- 两次变异都遵守「**先记基线 md5 → 先复制 pristine 副本 → 再动原文件**」；恢复自证 =
+  `cmp` 逐字节 + md5 回基线 + **源码文件**里 `MUT-` 标记 grep 计数 0 + 复跑全绿（546/546/0）。
+
+#### 第七轮冻结凭据（自指说明同前）
+- 协议：`tar -czf /tmp/dsh-agent-dispatch-1.12.6-freeze.tar.gz --exclude=node_modules --exclude=.git .`
+  —— 在**本节写入之后**执行，故包内 `CHANGELOG.md` 与本文件逐字节一致。
+- 包自身的**成员数 / 字节数 / md5** 与解包后 `diff -r -x node_modules -x .git` 的结果、
+  `git status --porcelain`、冻结时刻由交付报告给出（把包自己的 md5 写进包内会改变它自己，构造上不可能自含）。
+- **逐文件 md5 全表（第七轮冻结时点，65 个文件；不含 `CHANGELOG.md` 自身）**：
+
+```text
+  `.github/workflows/ci.yml` `e52c63d1952cb20234c60f9e80146f49`
+  `.gitignore` `fc9d54f7afb97c0d762a0dc93ec64ff8`
+  `.qoder/settings.local.json` `b0b9282667dcaade2d18528a237cd76d`
+  `LICENSE` `6cc0f1157ee6fec2c6fc4f612fa0bce0`
+  `README.en.md` `aa34e20873f8a77c9beb6e1c01a9577c`
+  `README.md` `ed9bf09567fb14fc0882a116ba1d62aa`
+  `cordis.patch.yml` `6344d499f05d66b13910d41f3310bb09`
+  `docs/screenshots/agents.png` `6a30c4c3fea4b4599c6fc22856f02353`
+  `docs/screenshots/fab-done.png` `f3c73094c4ea09c96884991b5ae0248b`
+  `docs/screenshots/fab-idle-1.png` `28043676b9a6086d267648c75dc9ee33`
+  `docs/screenshots/fab-idle-2.png` `48ab4b13a0dbd5061ebb1238422c7444`
+  `docs/screenshots/fab-running.png` `17efd4ab12a948d6ff0492d525e99c6b`
+  `docs/screenshots/history.png` `d89bfde07f90548ad00a49dbe920181a`
+  `docs/screenshots/overview.png` `6ba0684ec70bfabf3af13440e59be7a5`
+  `docs/screenshots/popup-agents-squads.png` `43994906eb5bc31018eff73ff5226812`
+  `docs/screenshots/popup-running.png` `5435027f217509c88f9efd843a54682c`
+  `docs/screenshots/popup-settings.png` `10697535447b3d3a5a27ac5bda5a385b`
+  `docs/screenshots/squads.png` `acb125e19badaa3d37ef97c5eeac36e4`
+  `index.js` `32dac461bbedf1784b4047629d0b3c41`
+  `kiligzzz-dsh-agent-dispatch-1.11.21.tgz` `abee2cabce1248a9f857c7ed19852296`
+  `kiligzzz-dsh-agent-dispatch-1.11.22.tgz` `962754751a70c7c375cce68265488a37`
+  `kiligzzz-dsh-agent-dispatch-1.11.23.tgz` `609fb395e941ff25e317ce89c1d30d5d`
+  `kiligzzz-dsh-agent-dispatch-1.11.24.tgz` `22e7e7fadfe7fc383b06ac92e9b40d7b`
+  `lib/agents.js` `cc09bf96e6ad363e18b3ee85e10dd509`
+  `lib/client.js` `6078d0815f36cd495bf2804fbb04417e`
+  `lib/defaults.js` `f29387cda5012a199e9678e17390d81a`
+  `lib/dispatch.js` `c415c59b661e437a666a1606dd23a7db`
+  `lib/fab-config.js` `e68aaf76cf31904164b3e7ee97ef842b`
+  `lib/health.js` `7a2d06235e40a61facf742ff8dd8e82a`
+  `lib/host-approval.js` `a9f2da27d4b9802b399e7e8581227fb4`
+  `lib/json-safe.js` `cb39c2aeb84952a416aa8ae02c9cd43b`
+  `lib/roster.js` `d9ee0131ac9ad2be8ef3e1c4485ca771`
+  `lib/skill-import.js` `05fbcecfdcd795d5f0921de159f6e345`
+  `lib/squad-registry.js` `16efbdc7adbbc655a80aa40766b6d4d4`
+  `lib/squads.js` `03cd42b9a961d4b17e5cd40601756ffb`
+  `package.json` `e1bd0bb661aa5ad0c1a84a978234bb36`
+  `test-p1p2-smoke.mjs` `bb9b72c42f1509e63186153f199a6f31`
+  `test/acp-config-fallback.test.js` `3961d7af0d3e310db4740a0f9c037c48`
+  `test/acp-twin.test.js` `e7bc1a55cb9331e668963525faf4a55e`
+  `test/agent-api-catalog.test.js` `4e8d5c3f8c62e91a6e40f6a9ec93117f`
+  `test/agent-api-harness.js` `7b48c19983cc6244cd44bfd8e448a178`
+  `test/childid-continuation.test.js` `b1ec780a6529fd841dfd27154ecf0916`
+  `test/client-form-logic.test.js` `109e524ef93378bbf0c9b791b963ddc5`
+  `test/dangerous-command-gate.test.js` `a8f0b0b4cf0c674ddde0a8472c892fad`
+  `test/dedup.test.js` `e93881ba9677de3351c54a29a9ebc243`
+  `test/fab-panel-layout.test.js` `378f9de86246e67bf01fa02fb3034882`
+  `test/failover-claim-race.test.js` `735e23e878a2f1e191a766a3aea2570f`
+  `test/failover-notify.test.js` `542597bd87c1cedde09bbe7a3d8fb2f0`
+  `test/failover-settlement.test.js` `c23fe799487e6bde3d198c04a40ca047`
+  `test/failover.test.js` `07030770e5af9067f538a0c4ab99feff`
+  `test/grant-dialog.test.js` `9c602287549e6042fa52c11a10d1184e`
+  `test/helpers/failover-host.js` `f725f9052a4b54cd66c171d6338048c0`
+  `test/host-0.2-compat.test.js` `e2d46d0cebf92864d746434997a9be04`
+  `test/host-approval-endpoint.test.js` `013bddf8f80f5bb0d9e91ad50d5838e9`
+  `test/host-approval.test.js` `72779f38918a1e163406884105d334c9`
+  `test/interrupt-no-failover.test.js` `bef2189f6bcd2a817f05b7556b744fec`
+  `test/invariants-1-12-6.test.js` `4c30eab81d893985e1f1dc1bc829a734`
+  `test/perm-fab-jump.test.js` `ceb1e12feae9a0b23efecbbc17f0c412`
+  `test/permission-pending.test.js` `83dc18eb17551f07b1dcaf47c04e3039`
+  `test/plugin-diagnostic-log.test.js` `cda1a98981d674b32111ca808765a77b`
+  `test/roster-section.test.js` `1553c426468cd1b82ad425a6f7a542f0`
+  `test/route-validation.test.js` `5d0497e815613ced7611d9db07911687`
+  `test/session-source-v4.test.js` `87156b4abd7dbe3f9f336da6b288daea`
+  `test/tool-grant-session.test.js` `a841561b509b16fde275beeef328ed55`
+  `verify.mjs` `345e3e8fb876f443f9c9c5ddc060ac49`
+```
+
+## 1.12.5（2026-10-05）
+**经用户裁定的行为变更：沙箱越权重新享有「路径级记忆」，但只到本会话为止（会话路径档）。工具名级授权与落盘项目级白名单都不适用于越权；ACP 孪生仍然完全绕过。**
+
+### 变更（用户裁定，不是缺陷修复，也不是自动收紧）
+1.12.x 把排除门做成了**一刀切**：`approval/request` 的 `reason` 匹配
+`/^\s*escalate\s+sandbox\s+to/i` 就直接 `return next()`，读取侧连**路径档一起废掉**。
+副作用是 **1.12.x 曾导致同一路径的越权也反复弹窗**——用户在某个目录点过一次
+「本会话总是允许」后，规则其实**照常写进了根会话键**（写入侧从没被关掉），
+但越权请求永远读不到它。本轮裁定：
+
+- **工具名级授权不适用于越权（口径不变）**：越权请求既不走 `index.js:376` 的
+  `toolGrantCovers` 预短路，也不走 `decide()` 内部的 `session-tool` 档
+  （`lib/host-approval.js:667` 新增入参 `disallowToolGrant`，`:670` 用它跳过那一档）。
+  所以「授权过一次 bash，所有新目录的越权都静默放行」仍然是**做不到**的。
+- **路径级记忆重新生效，但只有会话档**：越权请求走会话路径规则（`scope='session'`），
+  命中即 `allowed-once`；未命中则与 v1.11.24 完全一致地 `next()` 委托给交互层。
+  **同一目录本次会话不再弹、新目录仍弹、换会话仍弹。**
+- **落盘项目档对越权不适用（二次裁定，读写两侧都关）**：读取侧 `decide()` 新增
+  `sessionOnly` 入参（`lib/host-approval.js:667` 签名、`:689` 跳过那一档），越权请求即使落盘白名单
+  完全覆盖这条路径也**不放行**；写入侧 `/agent-api/host-approval-rule` 的
+  `scope==='project'` 分支在暂存上下文**判为沙箱越权**时不落盘，降级写会话路径规则，
+  响应如实回 `scope:'session'` + `projectSuppressed:true`，并留痕
+  `action:'rule-downgraded'`（`index.js` 的 `sandboxEscalated` 分支）。
+  **判据自述更正（1.12.6 终审 B1）**：这条在 1.12.5 的实现里误用了读取侧的合成判据
+  `isDisallowedAutoGrant`（= 越权 **或** ACP 孪生），于是孪生点「总是允许(项目)」也被
+  降级成会话档、`allowlist.json` 根本不创建——与本节最后一条「ACP 孪生一字未动」**自相矛盾**。
+  1.12.6 已把写侧判据收窄回 `isSandboxEscalation(approvalCtx.reason)` 单独一条，
+  孪生的落盘行为恢复 1.12.4；1.12.5 从未发布，故按缺陷记录、不称「回归」。
+  裁定依据：不允许把「某个路径可以被提权到 danger-full-access」静默落盘长期留存，
+  后续会话必须重新问。
+  非越权请求的落盘行为与 1.12.4 **逐字一致**（有回归守卫用例）。
+  本插件的落盘写入点只有一处（`index.js` 的 `appendProjectRule`），且它只能在
+  `scope==='project'` 分支到达；该分支的 `paths` 只能来自 `popPendingContext`
+  （`index.js:1957`），拿不到上下文就直接 400 ⇒ **不存在「判不出是不是越权却照样落盘」的漏口**。
+- **ACP 孪生仍完全绕过（一字未动）**：`toolName==='product_submit' && reason.startsWith('[ACP ')`
+  依旧排在**所有档位之前** `return next()`（`index.js:373`），本插件一档都不判——
+  即使会话路径规则明明覆盖得到它也不放行（新增用例 ⑪ 与端点用例专门钉这一条，
+  防止后来人把早退门挪到路径档之后）。
+
+### 动手前的调查结论（本轮改法的前提，附依据）
+- **谁渲染按钮、谁写下规则**：宿主审批走 waterfall，本插件的监听器 `prepend` 在链头，
+  排在 `dsh-api-remotes` 的客户端转发器**之前**。
+  - 本插件**返回 outcome**（截断链）⇒ 客户端收不到 ⇒ 宿主面板与插件蓝球都不弹；
+  - 本插件**返回 `next()`** ⇒ 链继续 ⇒ 请求转发到客户端 ⇒ 宿主标准面板**和**插件自己的
+    蓝球面板同时渲染（`lib/client.js:3875` `remote.$on("approval/request")`，
+    `:3783`/`:3805` 两组按钮）。
+  所以「插件对某请求 `next()`」**不等于**插件观察不到用户点击——插件根本不需要去
+  hook 宿主面板：它自带一条并行的客户端面板，按钮点击 POST
+  `/agent-api/host-approval-rule`，服务端按 `callId` 重取路径后写规则
+  （`index.js:1989` 工具名档 + `:1994` 路径档）。
+- **越权请求的上下文从来没丢**：`pushPendingContext`（`index.js:363`）排在排除门
+  （`:372`）**之前**，越权请求的解析结果照样进了 `#pendingContexts`，
+  端点 `popPendingContext` 取得到 ⇒ **路径规则一直就可能从越权请求写入**，
+  1.12.x 只是把读取侧关了。结论：**不存在「永远不命中的死分支」**，本轮改动有效。
+- **越权请求的 `paths` 可得性**（宿主侧就地核证，只读不改）：
+  `escalate sandbox to ${mode}: ${justification}` 的审批请求带 `callId` 与 `toolName`
+  （`dsh-sandbox/lib/index.js:105-109`，bash 侧 `dsh-tool-bash/lib/index.js:361-375`
+  传 `callId: exec.callId, toolName: 'bash'`；同类还有 `dsh-tool-fs`、`dsh-tool-pwsh`、
+  `dsh-tools` 的 run_code、`dsh-plugin-manager`），而 `exec.callId` 就是
+  `appendToolCall` 落盘用的 `block.id`（`dsh-agent-loop/lib/index.js:580` 起手、`:681` 落盘，
+  **落盘先于执行先于审批**）⇒ `resolveApprovalContext → findToolCallRecord → extractToolPaths`
+  这条反查链对越权同样成立。
+- **`decide()` 里没有第二套独立越权判据**：判据只有一份
+  （`isSandboxEscalation` `lib/host-approval.js:244` / `isAcpTwinApproval` `:256` /
+  合成 `isDisallowedAutoGrant` `:273`），全部由调用方读；`decide()` 原先只被
+  「调用方先判、命中就不进来」这条约定保护。本轮把约定落成入参（`disallowToolGrant`，
+  二次裁定再加 `sessionOnly`），因为越权现在**要**进 `decide()`，工具名档与落盘项目档
+  必须在里面被跳过。写入侧**不**共用这份合成判据（1.12.6 B1 收窄后）：端点只用
+  `isSandboxEscalation(reason)` 决定能不能落盘，ACP 孪生的项目档因此照旧落盘。
+
+### 已知局限（v1.11.24 同款口径，不是本轮引入的回归）
+- 越权请求反查不出路径时仍然**每次都弹**（`index.js:385`：`paths.length === 0 → next()`）。
+  两种成因：请求不带 `callId`；或工具调用参数里解析不出路径——bash 的命令文本要命中
+  `PATH_RE`（`lib/host-approval.js:144`，只认绝对路径/`~` 家目录那批前缀），
+  相对路径的越权命令（`cat a.txt`）拿不到路径，也就无从记忆。
+- `lib/client.js` 蓝球按钮文案对越权请求不精确（本节写作时**零改动**，已排进 1.12.6
+  「面板说实话」，**1.12.6 已处理**：越权请求不再渲染工具名档按钮、改走「可编辑路径」
+  弹框并在弹框里明说只到本会话；下面三条保留为当时的现状记录）：
+  - 越权请求带 `toolName` 时渲染的是「本会话总是允许该工具」，点击会同时写下工具名档
+    与路径档，但**只有路径档对越权有效**；
+  - 越权请求点「总是允许(项目)」时，服务端**不落盘**，实际只写本会话路径规则
+    （响应回 `scope:'session'`）。
+  ⇒ **越权下点「本会话总是允许(路径)」= 只记本会话，不会落盘、不会跨会话生效。**
+  该按钮的 tooltip 现在写着「落盘到共用白名单，同工作目录跨会话生效」（`lib/client.js:3817`），
+  对越权请求是**不实的**；服务端已在响应里如实回 `scope:'session'` + `projectSuppressed:true`
+  并留下 `action:'rule-downgraded'` 留痕，但**客户端不看响应体**——`apiPost` 之后直接
+  `item.answer("allowed-once")`（`lib/client.js:3805-3815`），所以本轮的抑制对用户
+  在界面上不可见，只有日志看得见。这一条与上面的文案问题是同一件事，一并留待 1.12.6。
+  客户端整个面板没有任何「越权」概念（`lib/client.js` 里 grep `escalate`/`越权` 零命中），
+  要改就得给蓝球新增判据与文案分支——超出本轮裁定范围，留待单独裁决。
+- **越权点「本会话总是允许该工具」仍会写下工具名授权（1.12.4 既有行为，本轮未碰）**：
+  蓝球的这个按钮 POST 带 `toolName`（`lib/client.js:3785`），端点的 `scope==='session'`
+  分支照旧 `addToolGrant`（`index.js:1989`）。该授权**不会**替越权放行（读取侧已锁），
+  但它会让同一根会话后续的**非越权**同类请求不再弹窗。裁定原文只覆盖「落盘/项目级」，
+  工具名档的写入侧未在本次裁定范围内，因此**保持原样并在此如实披露**，等下一步裁定。
+  对照：「总是允许(项目)」按钮的 POST 不带 `toolName`（`lib/client.js:3805-3810`），
+  所以越权走降级路径时只写路径规则，不会顺带写出工具名授权（端点用例的第 ④ 段钉住）。
+
+### 测试
+- **加强一处既有断言（未放宽任何断言）**：`test/tool-grant-session.test.js` 的
+  「② 已授权 bash + 越权 reason → next()，不放行」原 `mkSession('child-1','root-1')`
+  不带 `toolCalls` ⇒ 路径恒空 ⇒ handler 在「paths 为空」那条就 `next()`，
+  排除门根本没被走到。补上真实 bash 记录后，`next()` 只能由
+  「越权不吃工具名短路」解释（变异 M2 下它转红，原写法不会）。
+- **机械同步**：`compileHandler()` 的闭包注入表增加 `isAcpTwinApproval`
+  （handler 体新引用了这个名字；漏注入会退化成 `next()`，由「① 顺序哨兵」用例兜住）。
+- **二次裁定改写了 1 条既有断言的期望**（不是放宽，是**收紧**）：
+  `test/tool-grant-session.test.js` 的
+  `disallowToolGrant=true 时项目档照旧参与（v1.11.24 的路径级记忆等价，含落盘那一档）`
+  原来断言 `allowed=true / scope='project'`——它把越权的记忆范围一路开到落盘白名单，
+  正是用户这轮否决的口径。现改写为
+  `两开关彼此独立：仅 disallowToolGrant=true（不带 sessionOnly）时项目档仍参与`，
+  期望值不变但**语义降级为"两个开关没被焊死"的粒度守卫**（生产调用总是两个同真）；
+  紧随其后新增 `sessionOnly=true（越权二次裁定）→ 落盘项目档即使覆盖该路径也不放行`
+  与 `sessionOnly 只影响越权：非越权请求的落盘项目档放行照旧（回归守卫）`。
+  这条用例的期望被 M4 变异直接证伪（放开落盘即转红）。
+- **新增 10 条**：`test/tool-grant-session.test.js` 越权档位四条（⑧ 路径覆盖→放行、
+  ⑨ 差分对照只 reason 变、⑩ 解析不出路径→仍弹、⑪ ACP 孪生即使路径覆盖也仍弹）+
+  `decide disallowToolGrant` 单元四条（含项目档那条）；
+  `test/host-approval-endpoint.test.js` 端点级两条（真实 POST 写规则后重放的完整用户旅程、
+  只写路径规则的形态 + ACP 孪生对照）。
+- **二次裁定新增 6 条**（394 → 400 例）：
+  - `test/host-approval-endpoint.test.js` 新 describe
+    「沙箱越权不得写落盘项目白名单（v1.12.5 二次裁定：只允许会话档）」三条：
+    1. 越权点「总是允许(项目)」→ 200 且 `json.scope==='session'` + `projectSuppressed===true`；
+       `allowlist.json` **不存在**；同会话第二次 `allowed-once` 且留痕 `scope='session'`；
+       换根（新会话）同路径越权仍 `next()`；同根其它路径的非越权请求也不被顺带放行
+       （证明降级没写出工具名授权）；
+    2. **先由非越权正常落盘**一条规则，记下文件 sha256，再对越权点同一个按钮 →
+       文件 sha256 与条目数**逐字节不变**；
+    3. 非越权的项目档 POST → `scope==='project'`、文件写入（cwd + paths 断言）、
+       **换会话同路径非越权 `allowed-once` 且留痕 `scope='project'`**（回归守卫：
+       正常路径的跨会话持久白名单没被一起关掉），而同一条规则对越权不算数。
+     临时目录由 harness 注入（`test/agent-api-harness.js` 的 `boot()` 把 `DSH_HOME`
+     指到 `mkdtemp`），全程**不落用户 `~/.dsh`**，断言读的是临时目录里的文件本身。
+  - `test/tool-grant-session.test.js` handler 级 ⑫「越权 + 只有落盘项目档覆盖该路径 →
+    `next()`」带差分对照（同规则、同 fixture、非越权必须 `allowed-once`），
+    以及上面提到的 decide 单元两条。
+- **`verify.mjs`**：`:875-883` 新增 `decide(disallowToolGrant)` 的两条纯函数断言
+  （不放行 + 必须 `scope='session'`）；二次裁定再加两条（`:885-897`）：
+  `sessionOnly=true` 的越权**不得**被落盘项目档放行，同一份落盘规则对非越权
+  仍须 `allowed && scope='project'`。落盘写在 verify 自己的临时 `DSH_HOME`
+  （`verify.mjs:45`），不碰用户 `~/.dsh`。843-854 的三判据断言一字未动，仍然成立
+  （`isDisallowedAutoGrant` 的语义读作「不得被工具名档直放」——它**只管读取侧**，
+  落盘抑制另有判据 `isSandboxEscalation`，见 1.12.6 B1）。
+- **变异转红（逐字节恢复自证）**：基线 384 ⇒ 改后 394 例全绿。
+
+  | 变异 | 转红叶子用例 | `node --test` | `node verify.mjs` |
+  |---|---|---|---|
+  | M1 退回 1.12.4 一刀切（`index.js:373` 的条件改回 `isDisallowedAutoGrant`） | ⑧、端点「点过一次后…」、端点「越权 + 只写路径规则…」 | `# pass 391 / # fail 3`，退出码 **1** | 退出码 **0** |
+  | M2 让越权吃工具名预短路（`index.js:376` 去掉 `!disallowToolGrant &&`） | ②、⑨、端点「点过一次后…」 | `# pass 391 / # fail 3`，退出码 **1** | 退出码 **0** |
+  | M3 `decide()` 忽略入参（`lib/host-approval.js:670` 去掉 `!disallowToolGrant &&`） | ②、⑨、端点「点过一次后…」、`decide disallowToolGrant` 单元 2 条 | `# pass 389 / # fail 5`，退出码 **1** | 退出码 **1**（命中新加的 v1.12.5 断言） |
+  | **M4（二次裁定）放开落盘**：端点 `pendingExcluded` 写死 `false`（`index.js:1978`），越权的项目档 POST 重新走 `appendProjectRule`（= 退回本轮改动前） | 端点用例 1「越权点『总是允许(项目)』…」红在 **`越权的项目档 POST 仍然落盘了`（`true !== false`，allowlist.json 被创建）**；端点用例 2「已有项目白名单条目时…」红在 **`越权的项目档 POST 改动了落盘白名单内容`（sha256 变化）** | `# pass 398 / # fail 2`，退出码 **1** | 退出码 **0**（端点分支不在 verify 的覆盖范围内） |
+  | M5 `decide()` 忽略 `sessionOnly`（`lib/host-approval.js:689` 去掉 `!sessionOnly &&`） | ⑫、`sessionOnly=true（越权二次裁定）…` 单元、`sessionOnly 只影响越权…` 回归守卫单元、端点「非越权请求的落盘行为与 1.12.4 一致…」（同一条规则替越权放行） | `# pass 396 / # fail 4`，退出码 **1** | 退出码 **1**（`v1.12.5: 越权被落盘项目档放行…scope=project`） |
+
+  基线 400 例全绿（`# tests 400 / # pass 400 / # fail 0`，退出码 0），`verify.mjs` 退出码 0。
+  变异前留副本，验证后用 `cp -p` 恢复并 `cmp` 确认**逐字节一致**。
+- **恢复自证的一次返工（如实记录）**：M4/M5 那轮变异把「变异前副本」的 `cp -p` 顺序做反了——
+  破坏行被写进了副本，于是"恢复"实际是把破坏写回工作树，`index.js:1978` 与
+  `lib/host-approval.js:689` 一度带着 `// MUT-M4R` / `// MUT-M5R` 留在最终态里
+  （即「放开落盘」的破坏状态被当成了交付状态）。本轮开局全仓 grep `MUT-` 命中这两处，
+  已按语义改回原样，并**用最终字节重跑了 M4/M5**：
+  M4 端点套件 `# pass 19 / # fail 2`（全量 `398/2`，转红理由与表格一致：先红在落盘事实而非响应字段）；
+  M5 全量 `# pass 396 / # fail 4` 且 `verify.mjs` 退出码 1（`v1.12.5: 越权被落盘项目档放行…scope=project`）；
+  两次恢复后均 `cmp` 逐字节一致，最终全绿 400/400、`verify.mjs` 退出码 0。
+  最终基线 md5：`index.js 846b96759446add52e418a83b5fff190`
+  （与先前记录的 `59cceaad…` 不同，差异只有两处注释文本：`:1976` 那行的 `:1951`→`:1957` 引用订正、
+  `:386` 的引号归一为「」，均无行为改动）、
+  `lib/host-approval.js 9625e2838e85b934e2cf3f55d951cdca`（与先前记录相同）。
+- **`verify.mjs` 的覆盖口径沿用 1.12.4**：它只做纯函数/字符串形状断言，
+  `index.js` 里排除门的**顺序**变异（M1/M2）它看不见（`VERIFY_EXIT=0`），
+  这条不变量的守卫靠 `node --test` 的用例与退出码。
+
+### 未做
+- 未部署、未重启宿主、未动 `~/.dsh`、未 `npm pack`、未 `git add`/`commit`；
+  `createPendingRegistry`/permId FIFO、`#pendingContexts` 的既有设计债、
+  以及 auto-review / hook 那两类 `ask` 的排除门语义一律没碰。
+
+
+## 1.12.4（2026-10-05）
+**1.12.3 的终审收尾：fork 会话误判修复（行为收紧）+「降级为路径级」文档更正 + 端点级回归守卫 + 排除门覆盖范围的如实披露。**
+
+### 阻断修复
+- **fork（分叉会话）被当作子会话上溯 → 跨会话静默放行 + 授权寿命越界**。
+  `resolveRootSessionId` 原先只看 `header.parentSession` 就向上走一跳。但宿主的两类
+  会话带 `parentSession` 的语义完全不同：
+  - 委派子代理**必带** `origin:'subagent'` + `delegationDepth>0`
+    （`dsh-subagent/lib/index.js` 的 `childSessionMeta`）；
+  - fork 带 `parentSession`（`cwd` 可选）和一个**随宿主版本而变**的血统标记，**两版都落**
+    `parentSession`。本机两个宿主版本都在，已就地复核：DSH 运行时安装树
+    （`<DSH>/node_modules/@deepseek-ai/`，`<DSH>` = `~/.nvm/versions/node/v22.22.2/lib/node_modules/@deepseek-ai/dsh`）
+    里是 **`dsh-session@0.2.0-rc.2`**，其 `SessionStore.fork()` 落
+    `meta:{ cwd?, parentSession, isSeeded: true }`，且 `validateSessionHeader` **拒绝**
+    `seedLength`（见到即抛 `session header has invalid field "seedLength"`）；另一份
+    **`0.1.0-rc.6`** 在 `third/dsh-plugin-product-subagents/node_modules/`（插件开发用的旧副本），
+    它的 `fork()` 落 `seedLength`、`validateSessionHeader` 承认该字段。
+    它是用户在 GUI（`dsh-client-ui-workspace` 的 menu.fork / 快捷键 F）里另开的
+    一个**新会话**。判据不读那个标记，只读**两版共同的不变量**——fork 头**不带
+    `origin`、不带 `delegationDepth`**（`dsh-subagent` 的 `childSessionMeta` 两版都写这两个字段，
+    只有真子代理才有）。这正是判据跨宿主版本稳健的依据：标记名换了也不影响结论。
+  于是 fork 被解析成它的源会话 R：用户在 fork 里点的授权写进 **R 的键**，
+  R 后续同类请求被静默放行（用户从未在 R 点过）；更糟的是 R 一旦 dispose，
+  fork 再写下的键**没有任何 purge 路径**（`purgeSession(R)` 已跑过、fork 的键又不存在），
+  直接活到进程结束。
+  修复：新增 `isDelegatedSession(session)`（`origin==='subagent' || delegationDepth>0`），
+  `resolveRootSessionId` 的 `parentSession` 跳与 `index.js` 的 `registerSessionRoot`
+  注册点**用同一判据**——注册点不同改的话，fork 派出的子代理仍会经 `#sessionRoots`
+  链回源会话，泄漏更深。链式上溯的每一跳都满足该判据：`#sessionRoots` 只可能由
+  注册点写入，而注册点已按判据把关，映射里不会出现 fork→源 这类边；
+  dispatcher 回退跳的 `entry.childId` 只可能是本插件派出的子会话 id，不可能是 fork id。
+  **行为收紧**：fork 不再继承源会话授权，fork 自身就是根，授权寿命 = fork 会话存续期间。
+  **判据口径（用户裁决）**：`origin === 'subagent'` 是**主判据**（宿主 `dsh-subagent` 的
+  子会话必带该字段），`delegationDepth > 0` 是**兜底判据**，两者都保留、不要删：生产数据里
+  真子代理恒带 `origin='subagent'`，兜底只为覆盖宿主版本差异/旧会话记录只落深度字段的情形
+  （删掉它会把真子代理误判成「自身即根」→ 同一根会话反复弹窗，是可用性退化，不会造成跨会话
+  放行）。兜底只放宽「继续上溯」方向——fork 两个字段都不带，不可能被它拉进链里。
+  不向宿主侧索要 fork 标记（宿主不可改），判据就按上述双条件长期保持。
+
+### 已披露的行为：工具名授权会一并放行 auto-review / 用户 hook 的逐次确认（按用户裁决保持现状，本轮不改代码）
+- 排除门 `lib/host-approval.js:265` 只有两类：
+  `isDisallowedAutoGrant(toolName, reason) === isSandboxEscalation(reason) || isAcpTwinApproval(toolName, reason)`
+  —— 沙箱越权（`reason` 匹配 `/^\s*escalate\s+sandbox\s+to/i`，判据在 `:242`）
+  与 ACP 孪生（`toolName==='product_submit' && reason.startsWith('[ACP ')`，判据在 `:254`）。
+- 判定顺序（`index.js:366-368`）：先过排除门；**没被排除**的请求接着按工具名短路
+  `hostApproval.toolGrantCovers(rootSessionId, ctxInfo.toolName)` → 直接 `allowed-once`。
+  该短路不检查 `paths`，也不检查这条审批是谁发起的。
+- 因此下面两类 `ask` 会被**会话内工具名授权直接放行、不再弹窗**：
+  1. 宿主 auto-review 就某一次具体调用弹出的确认（`dsh-experimental-auto-review`，
+     `reason` 形如 `Auto review denied tool "bash": …`）；
+  2. 用户 hook 判出的 `ask`（`dsh-hooks-claude-code`）。
+  只要它们的 `toolName` 正是用户在本会话点过「总是允许该工具」的那个工具，就命中短路。
+  路径档同理：这类请求通常带可反查的 `callId` ⇒ 能解析出路径 ⇒ 会话路径规则也可能命中。
+- **这是用户明确选择的行为，不是已知漏洞**：用户要的语义是「本会话里点过一次这个工具，
+  就不要再为它弹任何窗」，其中**包含**这类针对具体调用的二次确认。终审实测到上述两类
+  被 in-session `bash` 授权直放并就此请示后，用户的裁决是「不排除，一律放行」。
+- **给后来人的提醒**：不要「顺手补强」——把 `Auto review` / hook 文案加进排除门等于把
+  用户刚关掉的弹窗重新打开；真要改必须先取得用户同意。另外，这两类 `ask` 与普通工具审批
+  在 `toolName` 维度上不可区分，任何排除判据都只能去匹配 `reason` 文案；沙箱那条之所以稳，
+  是因为 `escalate sandbox to` 前缀属于宿主审批协议的一部分（`lib/host-approval.js:237` 原话：
+  「宿主文案可能变化，但「escalate sandbox to」前缀是宿主审批协议的一部分，短期内不会变」），
+  而 auto-review / hook 的文案不属于协议，靠它做安全判据本身就脆弱。
+- **本节这两个披露项本轮零代码改动**（限定于这两项；v1.12.4 整体并非零代码改动，见上面
+  「阻断修复」节），也未为它们新增或放宽任何测试断言：`test/tool-grant-session.test.js`
+  里「排除门先于工具名短路」那条硬不变量用例，覆盖范围仍然是上面这两类，保持原样。
+- **证据口径与复现范围（如实声明；本条取代此前一版里的三处不实陈述）**：上面两类 `ask`
+  的 `reason` 形态**已在本机宿主安装包源码级核证**，两处位置：
+  - `dsh-experimental-auto-review/lib/index.js:433-437` 的 `askUser()` 组装
+    `const denial = 'Auto review denied tool "<name>"'`，`reason` 为 `denial`；带 reviewer 理由时
+    追加 `: <reason>` —— 即披露里那个 `Auto review denied tool "bash": …` 形态；
+  - `dsh-hooks-claude-code/lib/index.js:259-262` 的 hook `ask` 分支**只透传 hook 自带的
+    `merged.reason`**，本包不给 `ask` 设缺省 reason（带的是用户 hook 脚本写的任意文案，或干脆不带）；
+    同文件 `:257` 的 `blocked by PreToolUse hook` 是 **`deny` 分支的缺省 reason**，不是 `ask` 的
+    ——所以 hook 的 `ask` 在 `reason` 维度上**没有可用于识别的稳定特征**。
+  本机两个包都在，且就是较新的宿主版本：
+  ```
+  $ grep -m1 '"version"' <DSH>/node_modules/@deepseek-ai/dsh-experimental-auto-review/package.json
+    "version": "0.2.0-rc.2",
+  $ grep -m1 '"version"' <DSH>/node_modules/@deepseek-ai/dsh-hooks-claude-code/package.json
+    "version": "0.2.0-rc.2",
+  $ grep -rn "Auto review denied" <DSH>/node_modules/@deepseek-ai --include=*.js | wc -l
+  3
+  ```
+  （`<DSH>` = `~/.nvm/versions/node/v22.22.2/lib/node_modules/@deepseek-ai/dsh`；三条命中分别是
+  `dsh-experimental-auto-review/lib/index.js:434`、`:439`、`:442`。）
+  **更正**：本节此前写作「本机宿主安装包未安装这两个包、全包 grep `Auto review denied` 零命中」
+  ——不成立，那是把 grep 范围误写成 `<DSH>/lib`（DSH 顶层 runner 本身不含任何插件包，
+  所以确实是 0 命中）造成的。上面「三处不实陈述」里的**第三处**点名：旧 JSDoc 关于
+  `@deepseek-ai/dsh-session` 的「本机无该包、无法本地复核」——同样不成立，本机并存在 DSH
+  运行时安装树里的 `0.2.0-rc.2` 与 `third/dsh-plugin-product-subagents/node_modules/` 里的
+  插件开发副本 `0.1.0-rc.6`，两版 `fork()` 的头字段都已就地复核（见本条目开头 fork 段）。
+  **仍然未复现的部分**：没有在真实会话里端到端触发这两类 `ask`
+  ——那需要活链路 + 重启宿主加载实验包，而本轮禁止部署（不 `npm pack`、不改 `~/.dsh`、不重启宿主）。
+  所以「这两类 `ask` 会被 in-session 工具名授权直放」是**由我们这侧的代码路径推出的结论**
+  （排除门只覆盖两类 `lib/host-approval.js:265`；工具名短路既不检查 `paths` 也不检查请求来源
+  `index.js:366-368`，可逐行复核），**机制侧确定、观测侧待实测**，请以宿主侧实测为准。
+- **关于宿主行号**：本条目原则上**不写宿主行号**——行号随宿主版本漂移，写死只会误导后来人。
+  上面 `:433-437` / `:259-262` 两处例外，请读作「**在 `0.2.0-rc.2` 上核到的位置**」这一
+  版本快照证据，不是协议承诺；跨版本时请按符号名（`askUser`、`decision === "ask"`）重新定位。
+
+### 文档更正（与真实语义对齐）
+- 「无 `callId` → 降级为路径级」的说法三处更正为 **400 且什么都不写**：
+  1.12.3 CHANGELOG（Major 1 条 + 已知局限，v1.12.3 未发包，就地更正并注明）；
+  `index.js` 端点注释；`lib/client.js` 蓝球按钮 tooltip。
+  根因：`paths = approvalCtx?.paths ?? []`，而路径只能由 `callId` 反查会话记录得到
+  ⇒ 无 callId ⇒ paths 恒空 ⇒ 「降级写路径规则」永不执行。
+- **删除死分支**：`index.js` scope==='session' 里 `else if (toolName && !isConfirmedRoot) {}`
+  的空分支（v1.12.3 声称的降级双保险，实际什么都不做）连同误导性注释一并移除，
+  400 文案改为「未写入任何规则」并说明两个原因。
+- `lib/client.js` 按钮可用性判据按真实依赖重写：`canGrant = callId && 会话 id`，
+  `canToolGrant = canGrant && toolName`。无 callId 时按钮文案为「仅放行本次」，
+  项目档 tooltip 同步说明会返回 400——不再承诺「路径级降级」这种写不进去的东西。
+- `lib/client.js` 无 callId 的 `console.warn`：文案改为真实语义，并加 `!isAcpTwin` 条件
+  ——ACP 孪生不该为它根本不渲染的按钮刷警告；上下文获取失败的 warn 同步去掉
+  「按路径级授权降级」措辞。
+- 琥珀（ACP）面板「总是允许(项目)」tooltip：去掉「按工具名+路径落盘」的承诺
+  ——落盘条目实测只有 `{cwd, paths, grantedAt, note}`，**不含 toolName**；
+  「同时写入本会话工具名放行」保留（该面板走 product-subagents 后端，属实）。
+- `lib/host-approval.js` 里 `isDelegatedSession` 的 JSDoc：fork 血统标记的**宿主版本归属**
+  按本机实测更正——DSH 运行时安装树是 `dsh-session@0.2.0-rc.2`（`fork()` 落 `isSeeded: true`，
+  `validateSessionHeader` 拒绝 `seedLength`），`0.1.0-rc.6`（`fork()` 落 `seedLength`）只是
+  `third/dsh-plugin-product-subagents/node_modules/` 里的插件开发副本；此前注释写成
+  「本机安装的 0.1.0-rc.6」不准确。已同步为与本条目开头 fork 段一致的口径。
+  **纯注释改动**：判据、常量、返回值、日志文案一字未动（与上一份冻结 diff 只落在 JSDoc 行）。
+- 同一口径推广到另外三处仍把「插件开发副本」写成「本机安装」的说明文字：`test/agent-api-harness.js`
+  的 `mkSession` 注释、`test/tool-grant-session.test.js` 的 fork 段注释、`verify.mjs` 的 fork 断言注释
+  （与上面已更正的 JSDoc 自相矛盾，同一事实两处口径打架比单独写错更糟）。**同为纯注释改动**：
+  fixture 的字段与取值、断言的条件与被匹配字符串、`resolveRootSessionId` 与 `isDelegatedSession`
+  判据一字未动，`seedLength` / `isSeeded` / 无标记三种 fork 头的断言用例保持原样。
+
+### 测试守卫（本轮新增）
+- **端点级用例** `test/host-approval-endpoint.test.js`（16 条）：真实 `route.handler` +
+  真实 `approval/request` 监听器，覆盖 有 callId / 无 callId / 客户端故意传子会话 id /
+  无映射孤儿会话 / project 档落盘与跨会话命中 / fork 三例 / 审批留痕三例 /
+  **写入键按通道拆开的三条守卫**（见下）。
+- **撤回一条此前写下的、复现不出的断言（已作废，勿再引用）**：本节早先的版本**错误地**声称
+  「把写入键从 `rootSessionId` 改回 `sid`，本文件 3 条转红」。终审按原样复跑发现**该说法与实际不符**：
+  只把路径规则的写入键改回 `sid`（`addSessionRule(rootSessionId, paths)` →
+  `addSessionRule(sid, paths)`，全仓唯一命中）时，仓库 379 例与 `verify.mjs` **全绿**
+  （**379 例＝三条通道守卫补入前的套件规模，该读数属那个时点、非今天的 384 基线**；
+  `TEST_EXIT=0` / `VERIFY_EXIT=0`，本仓库复跑一致）。根因是**两条通道互相遮蔽**：
+  所有 POST 都带 `toolName` ⇒ `index.js:368` 的工具名短路先命中，路径档的键根本没被走到；
+  而 `addSessionRule` 会把文件**连带的直接父目录**一起写入
+  （`lib/host-approval.js:459` `expandPathsWithParents`），于是「兄弟子会话换一条同目录
+  路径」那条断言其实是被**路径规则**满足的，也不依赖工具名键。
+  换言之：先前那 3 条红的来源是 `addToolGrant` 那一侧 + 留痕断言，路径档的写读键一致
+  在仓库内**一直没有守卫**。**下方表格是补守卫后的当前实测口径，取代上面这句作废断言。**
+- **补的三条按通道拆开的守卫**（每条断言只依赖一把键，谁写错谁转红）：
+  ① 「路径档独立守卫」——授权 `read`、随后用**从未授权的** `write` 命中路径规则，
+     放行只可能来自「路径规则写在根键上」；并带反向对照（路径不覆盖 + 工具名未授权 ⇒ `NEXT`），
+     证明它不是通配放行。
+  ② 「工具名档独立守卫」——路径在授权目录之外，放行只可能来自根键上的工具名授权。
+  ③ 「不变量：两把键各只对自己的通道负责（互不遮蔽）」——同一次授权后，
+     未授权工具名+被覆盖路径、已授权工具名+未覆盖路径 两条各自独立放行，
+     两者都不满足时必须弹窗。
+- **补守卫后的实测敏感度**（**下表数字属 383 基线时点**，即 M1 守卫「工具名授权按精确相等匹配，
+  近似名不串味且仍弹窗」加入**之前**：基线 `node --test test/*.test.js` = `# tests 383 / # pass 383 /
+  # fail 0`，退出码 0。M1 守卫加入后基线为 **384**，同一变异的**通过数各 +1**（`381→382`、`379→380`、
+  `377→378`），**失败条数与转红用例名不变**——这不是算术推断，已在 384 基线上逐条复测，复测读数见下表下方）：
+  下表每行是**改一处写入键**后的读数，转红用例名逐字取自测试文件。
+
+  | 变异（改哪一行） | 转红条数与用例 | `node --test` | `node verify.mjs` |
+  |---|---|---|---|
+  | 路径规则写入键退回 `sid`（`index.js:1972` `addSessionRule(rootSessionId, paths)` → `(sid, paths)`） | **2 条子用例**转红（连同其所属 suite 一起计失败）：「路径档独立守卫：授权 read、用**未授权的 write** 命中路径规则（写读键一致）」、「不变量：两把键各只对自己的通道负责（工具名授权与路径规则互不遮蔽）」 | `# pass 381 / # fail 2`，退出码 **1** | 退出码 **0** |
+  | 工具名授权写入键退回 `sid`（`index.js:1967` `addToolGrant(rootSessionId, toolName)` → `(sid, …)`） | **4 条**：「子会话 + callId → 写到根会话键，同根兄弟子会话随后命中（RED-D 守卫）」、「工具名档独立守卫：路径不覆盖时，只可能由根键的工具名授权放行」、「不变量：两把键各只对自己的通道负责（工具名授权与路径规则互不遮蔽）」、「会话 dispose 清理到东西时留痕 purge 行（含 isRoot / childMappings）」 | `# pass 379 / # fail 4`，退出码 **1** | 退出码 **0** |
+  | 两把键都退回 `sid`（RED-D 原样） | **6 条**：上面两组并集的 5 条，**再加**「客户端故意传子会话 id 作 sessionId → 键仍取服务端解析的根」——该用例两条通道都断言，只有两把键同时写错才转红 | `# pass 377 / # fail 6`，退出码 **1** | 退出码 **0** |
+
+  **384 基线上的逐条复测（M1 守卫加入后实测，非算术推断）**：同一三处键变异分别读得
+  `# pass 382 / # fail 2`、`# pass 380 / # fail 4`、`# pass 378 / # fail 6`，`TEST_EXIT` 三次均为 **1**，
+  转红叶子用例与上面三行**逐名一致**；`node verify.mjs` 三次仍 `VERIFY_EXIT=0`。
+  M1 那条新守卫在这三处变异下**不转红**（它钉的是 `toolGrantCovers` 读取侧的精确匹配，不碰写入键），
+  所以「通过数各 +1、失败数与用例名不变」干净成立。
+
+  **验收口径（终审确认）**：这条不变量的守卫来自 `node --test` 的用例与退出码；`verify.mjs`
+  单独跑只做纯函数/字符串形状断言，在上述三种键变异下**仍全绿**（`VERIFY_EXIT=0`），
+  这是它的能力边界、不是漏检，本轮**不为此改 `verify.mjs`**。
+  两条通道各自有**鉴权类**（非留痕类）独立用例，敏感度不只来自日志断言。
+- **fork 回归用例** `test/tool-grant-session.test.js` 新增 **11 条（9 条单元 + 2 条走真实
+  handler 的集成）**：单元 9 条覆盖 `resolveRootSessionId(fork)===fork.id`、不落 R 键、R 不被静默放行、
+  fork dispose 清自身键、R 已 dispose 后 fork 不留无清理路径的键（D7-D9）、
+  fork 的子代理以 fork 为根、真子代理/孙代理上溯不回归，以及**血统标记三种形态
+  （`seedLength` / `isSeeded` / 不带标记）同结论**那条；集成 2 条为「⑥ fork 会话：真实 handler
+  不登记 fork→源 映射」「⑦ fork 已授权 bash → 源会话的请求仍需人工审批」；另有端点级 fork 3 条。
+  转红实验：把 `resolveRootSessionId` 的上溯跳**与** `index.js` 的注册点同时还原成
+  1.12.3 形态（只看 `parentSession` / 无条件 `registerSessionRoot`）→ **10 条转红、
+  `TEST_EXIT=1`**，且 `node verify.mjs` 同步 `VERIFY_EXIT=1`；恢复实现后 383/383 全绿、
+  `VERIFY_EXIT=0`。**这两组读数（10 条转红、恢复后 383/383）同属 383 基线时点，即 M1 守卫加入前**；
+  恢复态在今天的 384 基线下实测为 `# pass 384 / # fail 0`、`TEST_EXIT=0`、`VERIFY_EXIT=0`，
+  而那条「同时还原上溯跳与注册点」的 1.12.3 变异本轮**未回头重跑**，故其 10 条不保证仍是 10 条。
+  只回退上溯跳而保留注册点判据时，「fork 派出的子代理以 fork 为根」
+  仍绿——那条场景由注册点独立覆盖，属**双守卫冗余**，不是漏洞。
+- `test/agent-api-catalog.test.js` 的假 ctx / 假 webServer harness 提到
+  `test/agent-api-harness.js` 复用（原文件自带，两份桩会各自漂移）；
+  `fireEvent` 改为收集并返回监听器返回值、支持后续实参（waterfall 的 `next`）。
+- `verify.mjs`：`resolveRootSessionId` 断言的 fixture 补上宿主真实字段
+  （`origin:'subagent'` + `delegationDepth`）；fork 断言改成**三种血统标记循环**
+  （`seedLength` / `isSeeded` / 无标记）+ `isDelegatedSession` 双向断言。
+- **审批留痕字段口径的用例**：路径规则命中档断言行里有 `scope:'session'` / `tool` /
+  `sessionId` / `rootSessionId` / `pathCount`，并断言 **`'paths' in row === false`**——
+  把「留痕不带完整路径数组」这条口径钉成可回归的约束，而不是只写在注释里。
+- **工具名精确匹配守卫**（终审 M1）：`test/tool-grant-session.test.js` 的 `HostApprovalRules
+  tool grants` 组新增 1 条「工具名授权按精确相等匹配，近似名不串味且仍弹窗」。守的不变量是
+  **授权只在工具名精确相等时成立**——一个锚点断言（`bash` 必须命中，证明判据本身没坏）+
+  逐一断言 `bash2` / `BASh` / `Bash` / `'bash '` / `' bash'` / `''` / `'  '` **全不命中且仍弹窗**。
+  为什么补：补之前它只靠实现巧合成立（既有断言只有 `bash` ↔ `write` 两把具名工具），
+  **没有任何用例拦得住「顺手加 `trim()` / 大小写归一 / 前缀匹配」**，而那会让人蹭到用户
+  从未点过名的工具的授权。转红口径（实测）：把 `lib/host-approval.js:561` 的
+  `set.has(toolName)` 改成 `set.has(toolName.trim().toLowerCase())` → **仅该用例转红 1 条、
+  `TEST_EXIT=1`**，383 条既有用例仍全绿；恢复后全绿。`verify.mjs` **不覆盖**此不变量（它只做
+  纯函数级断言），同样**只由 `node --test` 的用例与退出码承担**，与上面「验收口径」一致。
+  ⚠️ **计数**：本条加入后本版用例总数 **384（原 383）**。本小节**上面**那几处 383 基线时点的读数
+  （敏感度表的 `# pass 381 / 379 / 377`、fork 变异实验的「恢复实现后 383/383」、撤回段的「379 例」）
+  现已在原地标注时点；键变异另附 **384 基线上的实测复测**（`pass` 各 +1、`fail` 数与转红用例名不变）。
+  本小节不留「孤立看像当前值、实则读自旧基线」的第三种状态。
+
+### 其他（Minor）
+- `index.js` 审批自动放行日志的 `session-tool` 档文案删除：判定侧在上面已按同一判据
+  短路，`decide()` 的 `session-tool` 分支不可能走到这里（v1.12.2 m2 加的是死文案）。
+- `lib/host-approval.js` 文件头注释：「总是允许(项目)」这条列表项被后面
+  「工具名授权双通道边界」段落切断（格式破坏），已归位；补 fork 口径说明。
+- `resolveRootSessionId` JSDoc：删除「只能取直接父级」的旧措辞（与链式上溯段并存矛盾），
+  统一为「委派子会话才上溯 + `#sessionRoots` 链式补齐」；`purgeSession` /
+  `registerSessionRoot` 注释补 fork 与注册点判据的分工。
+- **审批留痕改为进插件既有落盘通道**（回应「purge/命中日志只到 console」）：
+  `index.js` 新增 `logApproval()`，与 v1.11.23 的 `warn()` 同一条通道
+  （`dispatcher.logDiagnostic` → `dataDir/dispatches.jsonl`，`kind:'host-approval'`），
+  自动放行与真正清到东西的 dispose 各留一行；`HostApprovalRules.purgeSession` 不再自己
+  `console.log`，改为返回清理摘要由调用方留痕。理由：v1.11.23 的论证（stdout 是终端
+  socket、进程重启不留痕迹，而事后最需要回溯的恰是这些旁路判定）在这里同样成立——
+  本轮的阻断与三个 Major 全出在「键」上，宿主的 `approval/asked+decided` 审计看不出
+  写读键是否一致。频次有界（一条 = 一次自动放行 / 一次有实际清理的 dispose），
+  且 `mergeDispatchHistory` 已把 `host-approval`/`plugin-warn` 与 `config` 一样按观测行
+  剔除，不会在历史页长出「状态未知」的假卡片。
+  **留痕口径（用户裁决后定稿）**：保留「每次自动放行写一行」，不降为只记 purge——这行是
+  用户排查「点了本会话总是允许为什么没生效」的唯一线索（键落错会话、被判据拒绝都是静默失效）。
+  作为交换，单行只带关键字段：`tool` / `scope`（`session-tool` | `session` | `project`）/
+  `sessionId`（请求方）/ `rootSessionId`（解析出的根）/ `pathCount`，**不写完整 `paths` 数组**
+  （`index.js:384-392`；要看具体路径按 sessionId+callId 回宿主会话记录查）。
+  **注**：`~/.dsh/logs` 只有宿主 startup 日志，本插件从未往里写过（v1.11.23 也没有）；
+  插件的落盘通道一直是 `~/.dsh/data/dsh-agent-dispatch/dispatches.jsonl`。
+
+### 已知限制（本版未处理 · 预存在设计债）
+- **`#pendingContexts` 单调增长**：`index.js:363` 对每个带 `callId` 的审批请求都
+  `pushPendingContext(callId, ctx)`，而只有该 `callId` 被 POST 真正消费时才 `popPendingContext`
+  删除（`lib/host-approval.js:437-441`）；用户没有点授权的 pending 上下文会一直留着，
+  会话 `dispose` 也不清它（`purgeSession` 不触碰这个 Map），于是条目随审批次数线性累积到
+  进程结束。**非本轮引入**：HEAD 版同一位置、同一形态（`git show HEAD:index.js` /
+  `HEAD:lib/host-approval.js` 可核），终审亦确认为既有设计债、不属本轮范围，本轮按指示
+  **不改代码**，仅如实记录。真要收敛需要容量上限 + 随 `session/disposed` 反向清理，属独立变更。
+
+## 1.12.3（2026-10-05）
+**v1.12.2 修正式发布：子会话 dispose 反向回归修复 + 孙代理链式上溯 + 无 callId 降级。**
+
+### 修复
+- **阻断 1（反向回归）**：子会话 dispose 误清主会话根的工具名授权 + 会话级路径规则。
+  v1.12.2 的 `purgeSession` 在子会话销毁时通过 `registerSessionRoot` 反查根 id 并删除
+  `#toolGrants[rootId]` 与 `#sessionRules[rootId]`，恰好制造了本需求要消灭的现象——
+  **每个子代理跑完就丢授权，用户被迫重复点**。修复：`purgeSession` 只清「属于该会话
+  自身的键」，子会话 dispose 不删根授权；根会话 dispose 才清根授权及所有指向该根
+  的子会话映射。参考 product-subagents `dispose()` 只匹配 `key===sid`。
+  **行为放宽点**：授权寿命从「子会话结束即失效」恢复为「主会话存续期间有效」。
+- **Major 1**：无 `callId` 时 REST 端点把工具名授权写到子会话键 → 永不命中。
+  v1.12.2 的 `rootSessionId = approvalCtx?.rootSessionId ?? sid` 在无 callId 时
+  回落到客户端传的 `sid`（可能是子会话 id），而判定侧查的是真正的根 id。
+  修复：服务端在写工具名授权前自行调用 `resolveRootSessionId` 解析根 id；
+  若解析结果等于原始 `sid`（无父级信息，无法确认是否为真正的根）→ 拒写工具名授权；
+  客户端文案同步修正。
+  **更正（v1.12.4）**：本条原写「拒写工具名授权，降级为路径级」不准确——真实行为是
+  **400 且什么都不写**。`paths` 只能由 `callId` 反查会话记录得到，无 callId ⇒ paths 恒空
+  ⇒ 路径规则写入分支也没有内容可写（v1.12.3 里那句「降级为路径级」的 `else if` 是死代码，
+  v1.12.4 已删除）。
+- **Major 2**：嵌套子代理（孙）不共享授权。v1.12.2 的 `resolveRootSessionId`
+  只取 `header.parentSession`（直接父级），孙代理的上溯停在子代理而非根。
+  修复：`resolveRootSessionId` 新增 `sessionRootOf` 参数，利用 `#sessionRoots`
+  映射链式上溯到真正的根（孙→子→根），含循环保护与深度上限（MAX_DEPTH=10）。
+  无 `sessionRootOf` 时退化为只取直接父级。
+
+### 连带同步
+- 测试用例重写：`purgeSession(子会话)` 断言改为「不清根授权 + 兄弟子会话仍命中」；
+  新增 `resolveRootSessionId` 链式上溯用例（孙→根、循环保护、深度上限）；
+  新增「孙代理共享根会话工具名授权」用例；新增「无父级信息不误放行」反证用例。
+- `verify.mjs` 断言同步更新：子会话 purge 不清根授权、根 purge 才清、
+  孙代理链式上溯到根并命中授权。
+- 文件头注释、JSDoc 更新：`purgeSession` 语义从「反查清理根授权」改为「只清自身键」；
+  `registerSessionRoot` JSDoc 说明链式上溯与 purge 的分工。
+
+### 已知局限
+- `resolveRootSessionId` 链式上溯依赖 `#sessionRoots` 映射——已注册的会话才能上溯。
+  宿主原生 spawn 子代理若从未触发过 `approval/request`（未注册映射），则孙代理无法
+  越过未注册的中间层上溯到根。此为信息不足的保守策略，不误放行。
+- 无 `callId` 时无法反查工具调用记录：既解析不出路径、也确认不了根会话 id，
+  端点返回 400 且**什么都不写**（安全侧：宁可不写，也不写到非根键造成永不命中/跨会话放行）。
+  原措辞「降级为路径级」有误，v1.12.4 已更正并在代码里删除对应的死分支。
+
+## 1.12.2（2026-10-05）
+**v1.12.1 的修正式发布：session/disposed 清理键修复 + 集成用例自检加固 + 文案/注释/日志对齐。**
+
+### 修复
+- **M1（核实后不改）**：ACP 琥珀面板 `allow-always` tooltip「同时写入本会话工具名放行」
+  属实——后端为 product-subagents（0.7.6 在 allow-always 时写会话级工具名授权），
+  非本插件 `host-approval-rule` 端点。终审将两个面板搞混。
+- **M2**：`session/disposed` 清理键与写入键不一致 → 子会话 dispose 不应影响根会话授权。
+  写侧用 `rootSessionId`，清侧只取 `session.id` → v1.12.2 修复时走向了另一个极端：
+  子会话销毁时反查根 id 并清除 `#toolGrants[rootId]`，反而制造了反向回归
+  （v1.12.3 阻断 1 已修）。本次新增 `registerSessionRoot(sessionId, rootSessionId)` 映射，
+  为后续链式上溯与清理提供基础。`index.js:321` approval/request handler 中调用 `registerSessionRoot`。
+- **M3**：集成用例花括号计数提取失败时 `throw` 在 `describe` 顶层 → `node:test`
+  不计入 `# fail`、退出码 0（CI 假绿）。修复：将提取逻辑改为非抛错判定，
+  新增 `it('handler 提取自检')` 用例断言提取成功，失败时 `# fail ≥ 1` 且退出码 ≠ 0。
+
+### 文案/注释/日志对齐
+- **m1**：`resolveRootSessionId` JSDoc 标注 dispatcher 回退「当前宿主版本下不可达，仅作防御」
+  （宿主恒会设置 `header.parentSession`，见 dsh-subagent/lib/index.js:476；
+  但若宿主行为变更或存在边界情况，此回退仍作为安全网保留）。
+- **m2**：`index.js:341` 日志三元补 `session-tool` 档 → 「本会话工具授权」。
+- **m3**：CHANGELOG 补记 REST 响应语义变化（scope=session + toolName + 零 paths：400→200）。
+- **m4**：CHANGELOG `sessionId 已改为 rootSessionId` 措辞修正为 `rootSessionId || sessionId`（有回落）。
+- **m5**：`lib/host-approval.js` 文件头注释更新：键从「发起请求的 session id」改为「主会话根 id」，
+  值从「路径规则集合」改为「路径规则集合 + 工具名授权集合」。
+- **m6**：`lib/client.js` 无 callId 时加 `console.warn`（说明缺少 callId/上下文，按路径级授权降级）；
+  取上下文失败时 `.catch(() => {})` → `.catch(e => console.warn(...))`。
+- **m7**：`decide` 工具名短路返回 `covered: []`（空数组）而非 `[...(paths||[])]`——
+  工具名授权不感知具体路径，不应把未校验的 paths 全标覆盖。
+
+## 1.12.1（2026-10-05）
+**v1.12.0 的修正式发布：键一致性修复 + 越权判据收紧 + 根 id 解析的真实行为说明。**
+
+### 修复
+- **路径规则键一致性**：v1.12.0 前端 POST `host-approval-rule` 时 `sessionId` 已改为 `rootSessionId || sessionId`（有回落），
+  但 `decide()` 查路径规则时仍用 `sessionId`（请求方 id），导致子代理写入的路径规则在子代理
+  自己再发同路径请求时不命中。修复：`decide()` 查路径规则时先查 `rootId` 键再兜底查 `sessionId` 键；
+  REST 端点写入路径规则也统一用 `rootSessionId` 键。旧数据（写在 sessionId 键下）仍可命中。
+- **越权判据收紧**：`isSandboxEscalation` 正则改为 `/^\s*escalate\s+sandbox\s+to/i`，
+  匹配前导空白/换行/制表符（只收紧方向，属安全侧）。
+- **根 id 解析真实行为**：`resolveRootSessionId` 移除死参数 `maxDepth`（while 循环从未递增 depth），
+  改为只取直接父级 id。宿主不暴露 session 查询接口，无法逐层回溯；`header.parentSession`
+  指向直接父级而非根 id。JSDoc 已与实现一致。dispatcher 回退改用 `entry.parentSessionId`
+  （而非不存在的 `entry.session.id`）。
+- **前端按钮降级**：无 `toolName` 或无 `rootSessionId` 时，按钮文案从「本会话总是允许该工具」
+  降级为「本会话总是允许(路径)」，tooltip 说明仅路径级生效，不谎称工具级放行。
+- **测试补充**：零断言用例补上 assert；新增路径规则键一致性用例（子代理写入→子代理命中）；
+  新增集成级审批监听器模拟用例（越权不放行、零路径工具名放行、顺序哨兵）；
+  verify.mjs 新增本特性纯函数 + decide + toolGrantCovers + resolveRootSessionId 断言。
+
+### v1.12.1 补丁
+- **真实监听器集成用例**：将模拟函数 `simulateApprovalDecision` 替换为从 index.js 源码
+  花括号计数法提取的真实 handler 函数体，注入真实依赖后驱动判定。包含 5 条集成断言
+  （顺序哨兵、越权不放行、ACP 孪生不放行、未授权走 next、子会话命中根授权）。
+  顺序哨兵用例在「工具名授权挪到 paths.length===0 判据之后」时转红，已实验验证。
+- **ACP 面板文案对齐**：琥珀球 `allow-session` 按钮文案从「本会话总是允许」改为
+  「本会话总是允许该工具」，tooltip 说明工具名级放行语义（对齐 product-subagents
+  0.7.5 新增的服务端工具名授权）；`allow-always` tooltip 补充说明同时写入本会话
+  工具名放行。宿主审批面板文案已在 v1.12.0 更新，本次不动。
+- **REST 响应语义变化**：`POST /agent-api/host-approval-rule` 在 `scope=session` +
+  有 `toolName` + 零 `paths` 时，由 v1.12.0 的 **400**（无法解析路径）变为
+  v1.12.1 的 **200**（工具名级授权不依赖路径）。
+
+### 已知局限（v1.12.3 已修复）
+- ~~`resolveRootSessionId` 只取直接父级 id，嵌套子代理（子→孙）不与顶层子代理共享授权。~~
+  v1.12.3 已实现链式上溯（通过 `#sessionRoots` 映射），孙代理可共享根授权。
+- 宿主原生 spawn 子代理的 `header.parentSession` 缺失时，fallback 为自身 id，不同子代理
+  的授权无法共享。
+
+## 1.12.0（2026-10-05）
+**行为变更（破坏性）：会话内授权粒度从「路径」放宽到「工具名」，作用域从「自己的会话」变为「主会话根」。**
+
+### 背景：为什么改变授权粒度
+旧实现的「本会话总是允许」按钮按路径授权：bash 在路径 A 下被授权后，路径 B 的同类请求仍弹窗。
+对于 bash 等频繁触达不同路径的工具，用户需要反复点同一按钮。同一主代理会话内的所有子代理
+（含宿主原生 spawn 的）也不共享授权——子代理 C 的 bash 授权对子代理 D 无效。
+
+### 变更
+- **工具名级会话授权**：新增 `#toolGrants: Map<rootSessionId, Set<toolName>>`，同一主会话根
+  下所有子代理共享工具名授权。bash 授权一次后，同一根会话内所有 bash 调用（不同路径、
+  不同子代理）自动放行。
+- **根会话 id 解析**：`resolveRootSessionId(session, dispatcher)` 从 `session.header.parentSession`
+  （dsh-session 类型定义 `types.d.ts:71`）向上回溯；宿主字段缺失时回退到 dispatcher 的
+  `entry.parentSessionId`；都取不到则 fallback 自身 sessionId。
+- **安全硬约束**：沙箱越权（reason 匹配 `/^escalate\s+sandbox\s+to/i`）与 ACP 孪生审批
+  （`toolName === 'product_submit' && reason.startsWith('[ACP ')`）即使工具名已授权也
+  不得直放——由 `isDisallowedAutoGrant()` 集中判据，仍走人工审批。
+- **按钮文案更新**：「本会话总是允许」→「本会话总是允许该工具」，如实反映新语义。
+- **`decide()` 新增 `scope: 'session-tool'`**：工具名授权命中时返回此 scope，与旧的
+  `'session'`（路径规则）区分。
+- **REST 端点扩展**：`POST /agent-api/host-approval-rule` 接受 `toolName` 字段，
+  `scope === 'session'` 时写入根会话 + 工具名授权。
+- **GET 上下文端点扩展**：`/agent-api/host-approval-context` 响应新增 `rootSessionId` 字段。
+
+### 破坏性说明
+- 授权粒度从路径放宽到工具名：之前「本会话总是允许」只放行特定路径，现在放行同一工具
+  的所有路径请求。已有用户习惯如果依赖路径级精细控制，需使用项目规则代替。
+- 作用域从「自己的会话」变为「主会话根」：子代理的授权现在对兄弟子代理和主会话同样生效，
+  不再隔离。
+
 ## 1.11.24（2026-10-03）
 **行为变更（用户可见，不是内部重构）：fallback 换档从「自动孙代」改为「主代理显式换档（同级子代理）」。**
 
@@ -1390,3 +3180,181 @@ UI 全面重构，设计语言学记忆系统（dsh-mnemon MnemonView）：
 - `/expert` slash 命令：列专家 / 直接委派。
 - 委派决策落盘 `dispatches.jsonl` 可审计。
 - 零 `@deepseek-ai/dsh-tools` 依赖（规避官方双实例 bug #1697/#783）。
+### 第八轮（收尾轮：2 阻断「**欠吃**」方向 + 1 测试盲区 M2）
+
+**背景**：独立只读终审（会话 `af118eb7`）在第七轮收尾版上，用**本机（macOS，即部署平台）真二进制**
+复现了 12 条静默放行（判据层 `null` / 监听器层 `allowed-once`）。方向与第七轮**相反**：
+第七轮修的是「**多吃**」（把开关当取值选项 ⇒ 吃掉真程序名），本轮修的是「**欠吃**」
+（该吃的取值没吃 ⇒ 紧跟的真程序名被当成取值/普通参数跳过 ⇒ 整段判不出）。
+第七轮那条结构性兜底对「欠吃」**零覆盖**（终审分析，本轮复核确认）：判据①只在「剥壳结果的头
+token 以 `-` 开头」时触发，而漏登记时头 token 是**取值本身**（`/bin`、`%`、`root`、`2`）；
+判据②的探针只在**被表吃掉**时才生成 ⇒ 漏登记时探针集合为空。
+
+#### 🔴 B1（阻断）已登记包装器**漏登记真实取值选项**（每条都做了本机真二进制双向核对）
+
+| 形态 | 本机核对命令与读数 | 缺口 |
+|---|---|---|
+| `env -P /bin rm -rf /x` | `env -P` → `option requires an argument -- P`；`env -P /bin /bin/echo HI` → `HI`；附着形态 `env -P/bin /bin/echo HI` → `HI`；usage 里有 `[-P utilpath]` | `env` 表缺 BSD `-P utilpath` |
+| `xargs -J % rm -rf /x` | `xargs -J` → `option requires an argument -- J`；`printf 'a\n' \| xargs -J % /bin/echo HI` → `HI a`；反向核对 `xargs -J /bin/echo HI` → `xargs: HI: No such file or directory`（**恰好吃掉一个 token**，把真程序名当取值） | `xargs` 表缺 BSD `-J replstr` |
+| `xargs -I {} -R 2 rm -rf /x` | `xargs -R` → `option requires an argument -- R`；`printf 'a\nb\n' \| xargs -I {} -R 2 /bin/echo HI` → `HI`×2 | 缺 `-R replacements` |
+| `xargs -I {} -S 100 rm -rf /x` | `xargs -S` → `option requires an argument -- S`；`printf 'a\n' \| xargs -I {} -S 100 /bin/echo HI` → `HI` | 缺 `-S replsize` |
+| `chroot -u root /mnt rm -rf /x`、`chroot -G staff /mnt rm -rf /x` | 本机 usage：`chroot [-g group] [-G group,group,...] [-u user] newroot [command]`；`-u`/`-g`/`-G` 各自 `option requires an argument`；`chroot -u root /nonexistent-xyz /bin/echo HI` → 报的是 **NEWROOT** 不存在（⇒ `-u` 吃的是 `root`、下一 token 才是新根） | `chroot` **整条没有取值表条目**（第六轮只登记了位置参数 `newroot`） |
+
+落点（`lib/host-approval.js`）：`WRAPPER_VALUE_OPTIONS` 的 `env` 补 `-P`、`xargs` 补 `-J/-R/-S`、
+新增 `chroot: optionSet(['-u','-g','-G'])`。
+**`xargs -i` 仍不得加回**（第七轮已删）：本机 `xargs -i` → `xargs: invalid option -- i`（BSD 无此选项），
+GNU man 写的是 `-i[replace-str]`（方括号 = 可选附着、**不吃**下一个 token）。
+
+#### 🔴 B2（阻断）`TRANSPARENT_WRAPPERS` 漏了整类「执行下一条命令」的 macOS 包装器
+
+| 形态 | 本机核对（无害的 `/bin/echo HI`） | 登记结论 |
+|---|---|---|
+| `arch -x86_64 rm -rf /x`、`arch -arm64 git push` | `arch -x86_64 /bin/echo HI` → `HI`；`arch -x86_64` 单独写 → `arch: No command to execute`；`arch --help` → `arch: Unknown architecture: help` | 进名单；取值选项 = **空集**（`-x86_64`/`-arm64` 只是架构选择器，**不吃**下一个 token —— 登记它会把真程序名 `rm` 当取值吃掉 ⇒ 反而漏） |
+| `caffeinate -d rm -rf /x` | `caffeinate -t` → `option requires an argument -- t`；`-w` 同理；`-t 1 /bin/echo HI` → `HI`；`-disu /bin/echo HI` → `HI` | 进名单；取值选项 `-t`/`-w`（`-d/-i/-s/-u` 是开关） |
+| `script -q /dev/null rm -rf /x` | `script -q /dev/null /bin/echo HI` → `HI`；`script -t`/`-T` 各自 `option requires an argument`；本机 man SYNOPSIS：`script [-aeFkqr] [-t time] [file [command ...]]` | 进名单；取值选项 `-t`/`-T`；**位置参数 `[1]` = 记录文件**（漏掉它 ⇒ 头 token 变成 `/dev/null` ⇒ 静默放行）。注意 `-F` 在本机是**开关**（"Immediately flush output"，`script -F /dev/null /bin/echo HI` 把 `/dev/null` 当记录文件）⇒ **不列** |
+| `xcrun rm -rf /x` | `xcrun /bin/echo HI` → `HI`；`xcrun -sdk /bin/echo HI` → 去开 `/bin/echo/SDKSettings.plist`（⇒ `-sdk` 吃掉 `/bin/echo`）；`-sdk`/`--sdk`/`--toolchain` 单独写都报 argument missing | 进名单；取值选项 `-sdk`/`--sdk`/`--toolchain`；其余（`-v/-l/-f/-r/-n/-k/--run/--find/--show-sdk-*`）是开关 |
+
+口径旁证：Linux 的孪生 `setarch` 早在第六轮名单里（`:574-581` + 位置参数 `:750`），macOS 的 `arch` 漏了。
+`WRAPPER_POSITIONAL_ARGS` 因此从 `{ chroot: [1], setarch: [1,0] }` 变成再加一条 `script: [1]`。
+
+#### 🟠 M2（测试盲区）已修：表驱动用例从「读源码」改为「**字面量期望清单**双向对拍」
+
+终审变异实测：把 `env` 的 `-C` 从源码表里删掉后，旧用例仍 **47/47 全绿**（变异存活）——
+因为旧用例**从源码读表**，删条目 = 同时删掉断言。
+新用例 `第八轮 M2：取值选项表与**字面量期望清单**双向对拍（删条目 / 加条目都必须红）`：
+- 期望集合写成**字面量**（两张表全部条目，逐条注明来源）；
+- 期望有、源码没有 ⇒ **红**（欠吃方向）；源码有、期望没有 ⇒ **红**（多吃方向）；
+  确属有意为之的必须写进 `EXTRA_SOURCE_ENTRIES` + 理由（当前为空 = 一条都不许多）；
+- 另钉：4 个 macOS 同族名字在 `TRANSPARENT_WRAPPERS` 里、`script`/`chroot` 的位置参数形状。
+
+#### 口径变化如实补记：第七轮把一批「第六轮命中」收窄成了 MISS（**不是回归**）
+
+第七轮把短选项查表从「大小写折叠」改成「**原样精确**」后，一批第六轮会命中的形态（终审统计
+**298 条**）变成 MISS。终审已逐条核查并确认：**这些选项拼写在真机上并不存在**（命令本身会报
+`invalid option` 之类错误、根本不会执行），因此收窄方向与真相同向、不是少弹。
+本轮的表差分复核（第六轮源码 `a290b9f2…` vs 本轮）：
+- 表**内容**上第六轮→本轮只少了一条：`xargs -i`（第七轮删，理由见上；本机 BSD 无 `-i`、GNU man 是可选附着）；
+- 表**新增** 27 条：`sudo -R/-T/-U/-D`+4 长选项、`strace -U/-O/-S/-X`、`git -C`（第七轮），
+  `env -P`、`xargs -J/-R/-S`、`chroot -u/-g/-G`、`caffeinate -t/-w`、`script -t/-T`、`xcrun -sdk/--sdk/--toolchain`（本轮）；
+- 其中在本机**有二进制可核**的都已逐条核过（见上表与第七轮节）；`strace`/`sudo` 的拼写来源是
+  man 页（本机无这些 Linux 工具）。
+
+#### 未在本机核对（待 Linux 侧验证，**故意不写进表**，也不删既有条目）
+
+| 条目 | 为什么没写进表 / 待办 |
+|---|---|
+| GNU chroot `--userspec` / `--groups` 的**空格形态** | 本机 macOS chroot 对 `--…` 一律 `illegal option -- -`（无长选项），核不到；GNU coreutils 的 `--userspec=USER:GROUP` 是**必需参数**长选项，空格形态在 Linux 上大概率也吃取值 —— 但按纪律「拿不准宁可列清单、不写进表」，待 Linux 侧用真二进制核过再补 |
+| `nsenter -w` / `-W`（工作目录 / ？） | 本机无 `nsenter`、无 man 页（macOS 无该工具）；现有 `-t/-N/-G/-S` 来自 Linux man（第五/六轮） |
+| `doas -a` 等 | 本机无 `doas`；现有 `-u/-C` 来自 OpenBSD man（第五轮） |
+| `strace` 全表的**真机**复核 | 本机无 `strace`；表来源是 man7 `strace(1)`（第六/七轮逐字核对） |
+| `unshare` / `systemd-run` / `setarch` / `prlimit` / `firejail` / `ionice` / `taskset` / `busybox` / `toybox` / `coreutils` | 同上：本机无这些 Linux 工具，现有条目来自各自 man 页（第五/六轮） |
+| GNU-only `xargs -d` / `-a` | 本机 BSD xargs 报 `invalid option`（GNU 才有 `-d delim` / `-a file`，两者都吃取值）⇒ 表里保留是**跨平台**口径，本机核不到 |
+
+#### 残余风险（本轮新登记）
+
+1. **`script [file]` 不带命令时会起一个交互 shell**（本机实测；`script -q /dev/null` 会跑用户 shell），
+   当前判据层返回 `null`（放行）。未按 `SHELL_STDIN_RULE` 处理，依据是本机实测
+   `printf 'echo X\n' | script -q /dev/null` **只回显、未执行**（非 tty 下 shell 立刻退出）⇒
+   不是「危险命令正文被藏起来」的那类；如实登记为边界，若 Linux 侧行为不同需重新评估。
+2. **`caffeinate` 不带命令**只是持有断电断言（不执行命令）⇒ 与 `env` 不带命令同类，保持放行。
+3. 兜底与表单向性：本轮全部修法是**加条目 + 加名单**（只多弹不少弹）；误伤面用 19 条守卫钉住。
+
+#### 转红（三项，每项都先记基线 md5 + 存 pristine 副本，再动原文件）
+
+| 变异 | 做法 | 读数 | 红点 |
+|---|---|---|---|
+| `MUT-R8-1` | 删掉源码表 `env` 的 `-P` | `# tests 52 / # pass 49 / # fail 3`，退出码 1 | 判据层 31（B1 行为）、**34（M2：`WRAPPER_VALUE_OPTIONS.env 丢了取值选项 -P`）**、监听器层 3 |
+| `MUT-R8-2` | 把 `arch` 移出 `TRANSPARENT_WRAPPERS` | `52 / 49 / 3`，退出码 1 | 判据层 32（B2：`arch -x86_64 rm -rf /x 静默放行`）、**34（M2：`TRANSPARENT_WRAPPERS 里没有 arch`）**、监听器层 3 |
+| `MUT-R8-3` | `optionKey` 改回 `toLowerCase()`（复用第七轮那条） | `52 / 50 / 2`，退出码 1 | 判据层 23（大小写碰撞）、24（表驱动） |
+
+恢复自证（三项同法）：`cmp` 逐字节 + md5 回基线（`lib/host-approval.js`
+`7026ed8c0c629d52152894cd5e7f9079`、`test/dangerous-command-gate.test.js`
+`276e4e9f2a17371c7c5fea7e43c5c2a0`）+ **源码文件**里 `MUT-` grep 计数 0 + 复跑全量 551/551/0。
+
+#### 验收（判据层 + 监听器层双证）
+
+- **必须命中/`next()`（12 条）**：`env -P /bin rm -rf /x`、`env -P /bin npm publish`、
+  `xargs -J % rm -rf /x`、`xargs -I {} -R 2 rm -rf /x`、`xargs -I {} -S 100 rm -rf /x`、
+  `chroot -u root /mnt rm -rf /x`、`chroot -G staff /mnt rm -rf /x`、`arch -x86_64 rm -rf /x`、
+  `arch -arm64 git push`、`caffeinate -d rm -rf /x`、`script -q /dev/null rm -rf /x`、`xcrun rm -rf /x`
+  —— 判据层 12/12 命中（`rm -rf` / `npm publish` / `git push`），监听器层 12/12 `next()`、零 auto-grant。
+- **必须仍无害放行（`allowed-once`）**：`env -P /bin ls`、`env -i ls`、`xargs -J % ls`、
+  `xargs -I {} -R 2 ls`、`chroot -u root /mnt ls`、`arch -x86_64 ls`、`caffeinate -d ls`、
+  `script -q /dev/null ls`、`xcrun ls` + 第七轮全部守卫形态 —— 判据层全 `null`，监听器层走工具名档。
+- 复跑第七轮那份 110 条判据层探针：`不符预期 0 条`。
+
+#### 第八轮冻结凭据（自指说明同前）
+- 协议：`tar -czf /tmp/dsh-agent-dispatch-1.12.6-freeze.tar.gz --exclude=node_modules --exclude=.git .`
+  —— 在**本节写入之后**执行，故包内 `CHANGELOG.md` 与本文件逐字节一致。
+- 包自身的**成员数 / 字节数 / md5 / sha256**、解包后 `diff -r -x node_modules -x .git` 的结果、
+  `git status --porcelain`、冻结时刻由交付报告给出（把包自己的 md5 写进包内会改变它自己，
+  构造上不可能自含）。
+- **逐文件 md5 全表（第八轮冻结时点，65 个文件；不含 `CHANGELOG.md` 自身）**：
+
+```text
+  `.github/workflows/ci.yml` `4c3b180cfe820bf80c91a5b7050d783c`
+  `.gitignore` `fc9d54f7afb97c0d762a0dc93ec64ff8`
+  `.qoder/settings.local.json` `b0b9282667dcaade2d18528a237cd76d`
+  `LICENSE` `6cc0f1157ee6fec2c6fc4f612fa0bce0`
+  `README.en.md` `aa34e20873f8a77c9beb6e1c01a9577c`
+  `README.md` `ed9bf09567fb14fc0882a116ba1d62aa`
+  `cordis.patch.yml` `6344d499f05d66b13910d41f3310bb09`
+  `docs/screenshots/agents.png` `6a30c4c3fea4b4599c6fc22856f02353`
+  `docs/screenshots/fab-done.png` `f3c73094c4ea09c96884991b5ae0248b`
+  `docs/screenshots/fab-idle-1.png` `28043676b9a6086d267648c75dc9ee33`
+  `docs/screenshots/fab-idle-2.png` `48ab4b13a0dbd5061ebb1238422c7444`
+  `docs/screenshots/fab-running.png` `17efd4ab12a948d6ff0492d525e99c6b`
+  `docs/screenshots/history.png` `d89bfde07f90548ad00a49dbe920181a`
+  `docs/screenshots/overview.png` `6ba0684ec70bfabf3af13440e59be7a5`
+  `docs/screenshots/popup-agents-squads.png` `43994906eb5bc31018eff73ff5226812`
+  `docs/screenshots/popup-running.png` `5435027f217509c88f9efd843a54682c`
+  `docs/screenshots/popup-settings.png` `10697535447b3d3a5a27ac5bda5a385b`
+  `docs/screenshots/squads.png` `acb125e19badaa3d37ef97c5eeac36e4`
+  `index.js` `32dac461bbedf1784b4047629d0b3c41`
+  `kiligzzz-dsh-agent-dispatch-1.11.21.tgz` `abee2cabce1248a9f857c7ed19852296`
+  `kiligzzz-dsh-agent-dispatch-1.11.22.tgz` `962754751a70c7c375cce68265488a37`
+  `kiligzzz-dsh-agent-dispatch-1.11.23.tgz` `609fb395e941ff25e317ce89c1d30d5d`
+  `kiligzzz-dsh-agent-dispatch-1.11.24.tgz` `22e7e7fadfe7fc383b06ac92e9b40d7b`
+  `lib/agents.js` `cc09bf96e6ad363e18b3ee85e10dd509`
+  `lib/client.js` `6078d0815f36cd495bf2804fbb04417e`
+  `lib/defaults.js` `f29387cda5012a199e9678e17390d81a`
+  `lib/dispatch.js` `c415c59b661e437a666a1606dd23a7db`
+  `lib/fab-config.js` `e68aaf76cf31904164b3e7ee97ef842b`
+  `lib/health.js` `7a2d06235e40a61facf742ff8dd8e82a`
+  `lib/host-approval.js` `7026ed8c0c629d52152894cd5e7f9079`
+  `lib/json-safe.js` `cb39c2aeb84952a416aa8ae02c9cd43b`
+  `lib/roster.js` `d9ee0131ac9ad2be8ef3e1c4485ca771`
+  `lib/skill-import.js` `05fbcecfdcd795d5f0921de159f6e345`
+  `lib/squad-registry.js` `16efbdc7adbbc655a80aa40766b6d4d4`
+  `lib/squads.js` `03cd42b9a961d4b17e5cd40601756ffb`
+  `package.json` `e1bd0bb661aa5ad0c1a84a978234bb36`
+  `test-p1p2-smoke.mjs` `bb9b72c42f1509e63186153f199a6f31`
+  `test/acp-config-fallback.test.js` `3961d7af0d3e310db4740a0f9c037c48`
+  `test/acp-twin.test.js` `e7bc1a55cb9331e668963525faf4a55e`
+  `test/agent-api-catalog.test.js` `4e8d5c3f8c62e91a6e40f6a9ec93117f`
+  `test/agent-api-harness.js` `7b48c19983cc6244cd44bfd8e448a178`
+  `test/childid-continuation.test.js` `b1ec780a6529fd841dfd27154ecf0916`
+  `test/client-form-logic.test.js` `109e524ef93378bbf0c9b791b963ddc5`
+  `test/dangerous-command-gate.test.js` `276e4e9f2a17371c7c5fea7e43c5c2a0`
+  `test/dedup.test.js` `e93881ba9677de3351c54a29a9ebc243`
+  `test/fab-panel-layout.test.js` `378f9de86246e67bf01fa02fb3034882`
+  `test/failover-claim-race.test.js` `735e23e878a2f1e191a766a3aea2570f`
+  `test/failover-notify.test.js` `542597bd87c1cedde09bbe7a3d8fb2f0`
+  `test/failover-settlement.test.js` `c23fe799487e6bde3d198c04a40ca047`
+  `test/failover.test.js` `07030770e5af9067f538a0c4ab99feff`
+  `test/grant-dialog.test.js` `9c602287549e6042fa52c11a10d1184e`
+  `test/helpers/failover-host.js` `f725f9052a4b54cd66c171d6338048c0`
+  `test/host-0.2-compat.test.js` `e2d46d0cebf92864d746434997a9be04`
+  `test/host-approval-endpoint.test.js` `013bddf8f80f5bb0d9e91ad50d5838e9`
+  `test/host-approval.test.js` `72779f38918a1e163406884105d334c9`
+  `test/interrupt-no-failover.test.js` `bef2189f6bcd2a817f05b7556b744fec`
+  `test/invariants-1-12-6.test.js` `4c30eab81d893985e1f1dc1bc829a734`
+  `test/perm-fab-jump.test.js` `ceb1e12feae9a0b23efecbbc17f0c412`
+  `test/permission-pending.test.js` `83dc18eb17551f07b1dcaf47c04e3039`
+  `test/plugin-diagnostic-log.test.js` `cda1a98981d674b32111ca808765a77b`
+  `test/roster-section.test.js` `1553c426468cd1b82ad425a6f7a542f0`
+  `test/route-validation.test.js` `5d0497e815613ced7611d9db07911687`
+  `test/session-source-v4.test.js` `87156b4abd7dbe3f9f336da6b288daea`
+  `test/tool-grant-session.test.js` `a841561b509b16fde275beeef328ed55`
+  `verify.mjs` `345e3e8fb876f443f9c9c5ddc060ac49`
+```

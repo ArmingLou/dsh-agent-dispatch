@@ -296,7 +296,11 @@ describe('E 点击接线（源码不变量）', () => {
   })
 
   it('决策按钮不冒泡到行（点「允许一次」不该同时触发跳转）', () => {
-    const btn = src.slice(src.indexOf('const mkBtn = (label, answer, cls, tip) => {'))
+    // v1.12.6(U2)：琥珀球 mkBtn 多出第 5 个参数 grant（「可编辑路径」弹框开关），
+    // 锚点改成签名前缀匹配——本条钉的是按钮 stopPropagation，不是它的参数表。
+    const at = src.search(/const mkBtn = \(label, answer, cls, tip(?:, grant)?\) => \{/)
+    assert.ok(at >= 0, '琥珀球 mkBtn 签名锚点丢失（改签名请同步本用例）')
+    const btn = src.slice(at)
     assert.match(btn, /b\.addEventListener\("click", \(ev\) => \{[\s\S]{0,40}ev\.stopPropagation\(\);/)
   })
 })

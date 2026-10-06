@@ -16,4 +16,88 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      # v1.12.6(m1) + v1.12.6（终审 Major）：verify.mjs 只做字符串/纯函数断言，
+      # **一个用例都不跑**。
+      # 终审 FG3 实测：把某个用例包进 `if (false) it(...)`，node --test 仍然
+      # 「# tests 399 / # pass 399 / # fail 0 / EXIT=0」——用例静默消失没有任何信号。
+      # 终审 Major 再实测（v1.12.6 第四轮按实测口径改正）：`it.skip()` / `t.skip()` 之后
+      # TAP 汇总实测是「# tests 4 / # pass 2 / # skipped 2」——即 skip **会**进 `# tests`、
+      # **不进** `# pass`，`# skipped` 单独计数。所以**只比 `# tests` 的守卫照样绿**
+      # （总数没少、pass 悄悄少一条）；真正拦住第二个 skip 的是下面的 `# pass` 下限。
+      # 所以这里同时断言三件事：
+      #   ① `# pass >= MIN_TESTS - SKIPPED_ALLOWED`（被删 / 被 if(false) / 被 .skip 都红）；
+      #   ② `# cancelled == 0`（取消不是通过）；③ `# todo == 0`（todo 不是通过）。
+      # SKIPPED_ALLOWED = 已登记的**准跳**条数，当前 1，来源只有一条：
+      #   · test/host-0.2-compat.test.js:334-340（用例起于 334 行，`t.skip` 在 340 行）
+      #     —— 它硬编码 `/Users/arming/.nvm/.../dsh-util-values/lib/index.js`：
+      #     macOS 开发机上可解析、ubuntu-latest 上必然解析不到 ⇒ 走 `t.skip(...)` + return，
+      #     CI 上固定少 1 条 pass（本地不跳，pass 数就是 MIN_TESTS）。
+      # 除它之外**不许再有准跳**：新增 skip 会让 CI 红，那时要么删掉 skip、
+      # 要么在此登记来源并同步 SKIPPED_ALLOWED，不许直接把下限往下调。
+      # MIN_TESTS = `# tests` 计数下限（本地 Node 22 实测；新增用例时一起抬上去）。
+      # v1.12.6 第四轮（终审修复）随新增用例上抬：497 → 509（第三轮）→ **518**（第四轮，
+      # 危险命令门 +9 条：判据层 6 条、弹框预填 3 条）
+      # v1.12.6 第五轮再上抬：518 → **531**（判据层/监听器层 +5：multi-exec 段首 `-exec`、
+      # 新包装器 doas/setsid/chroot/ionice/taskset、`source`/`.` 的 shell-source、监听器层
+      # 误伤守卫；端点层 +4：M-B 全非法 400 / 真删空工具档 / 合法路径 / 混合声明；
+      # 弹框预填 +4：按 cwd 解析、absolutizeDirs、盘根不参与、非绝对路径不勾选三态）
+      # v1.12.6 第六轮再上抬：531 → **538**（+7：判据层 3 条 —— 另外 9 个同族包装器
+      # unshare/nsenter/strace/firejail/systemd-run/su/runuser/setarch/prlimit、
+      # `su`/`runuser` 没有 `-c` 的 su-shell 门、截断边界的字符下标口径；监听器层 3 条 ——
+      # 9 个包装器在「已授权 bash」下仍 next()、同一批误伤守卫、commandText 超限的
+      # command-too-long 门（含 argsText 只截断的对照）；弹框 1 条 —— resolveAgainstCwd
+      # 收到绝对路径直接返回）
+      # v1.12.6 第七轮再上抬：538 → **546**（+8：判据层 6 条 —— 大小写折叠阻断的 9 条
+      # 碰撞形态、取值选项表**短选项大小写精确**的表驱动用例、既有命中回归清单、
+      # 结构性兜底 `wrapper-option-ambiguity`（含 `-exec` 与 argv 拆词两条守卫）、
+      # `su`/`runuser` no-`-c` 分支的外层留痕、设计裁定第 10 条的源码级哨兵；
+      # 监听器层 2 条 —— 9 条碰撞在「已授权 bash」下仍 next()（含兜底与 m3 留痕）、
+      # 同一批误伤守卫仍吃工具名档）
+      # Node 版本差异若少算，本守卫会红，那时按 CI 打印的实际数下调并在 CHANGELOG
+      # 说明，不要直接删守卫。
+      # v1.12.6 第八轮再上抬：546 → **551**（+5：判据层 4 条 —— 欠吃方向 12 条
+      # （`env -P` / xargs 的 BSD `-J/-R/-S` / chroot 的 `-u/-g/-G`，含附着形态）、
+      # macOS 四个同族包装器（`arch`/`caffeinate`/`script`/`xcrun`）14 条、
+      # 欠吃方向的误伤守卫 19 条、**M2**：取值选项表与**字面量**期望清单双向对拍
+      # （删条目 ⇒ 红、加条目 ⇒ 红；修复「删条目 = 同时删断言」的测试盲区）；
+      # 监听器层 1 条 —— 12 条欠吃形态在「已授权 bash」下仍 next()、无害形态仍 allowed-once）
+      - name: 单元 / 集成测试（含用例条数守卫）
+        env:
+          MIN_TESTS: 551
+          SKIPPED_ALLOWED: 1
+        run: |
+          set -uo pipefail
+          node --test --test-reporter=tap test/*.test.js > tests.tap
+          status=$?
+          grep -E '^# (tests|suites|pass|fail|cancelled|skipped|todo) ' tests.tap || echo '（TAP 汇总行缺失）'
+          if [ "$status" -ne 0 ]; then
+            echo "测试失败（exit=$status）"
+            exit "$status"
+          fi
+          # TAP 汇总行取值：`# tests 507` → 第三列。取不到就让守卫自己红（不许静默放行）
+          num() { awk -v k="# $1 " 'index($0,k)==1{print $3; found=1} END{if(!found) print ""}' tests.tap; }
+          n=$(num tests); p=$(num pass); c=$(num cancelled); td=$(num todo); sk=$(num skipped)
+          if [ -z "$n" ] || [ -z "$p" ]; then
+            echo 'Tap 输出里取不到 "# tests" / "# pass" 计数（reporter 变了？守卫已失效，请同步本步骤）'
+            exit 1
+          fi
+          floor=$((MIN_TESTS - SKIPPED_ALLOWED))
+          if [ "$p" -lt "$floor" ]; then
+            echo "通过用例数 $p < 下限 $floor（= MIN_TESTS $MIN_TESTS - 准跳 $SKIPPED_ALLOWED）：有用例被删除 / 被 if(false) 短路 / 被 .skip（对照终审 FG3 与 .skip 那条 Major）。"
+            echo "恢复用例；确属新增准跳时，先在 ci.yml 注释里登记来源并同步 SKIPPED_ALLOWED，再谈下调。"
+            exit 1
+          fi
+          if [ "$n" -lt "$MIN_TESTS" ]; then
+            echo "用例数 $n < 下限 $MIN_TESTS：用例总数被静默削减。请恢复用例，或确属删除时同步下调 MIN_TESTS 并在 CHANGELOG 说明原因。"
+            exit 1
+          fi
+          if [ "$c" != "0" ]; then
+            echo "有 $c 条用例被取消（cancelled）：取消不是通过，请查清原因。"
+            exit 1
+          fi
+          if [ "$td" != "0" ]; then
+            echo "有 $td 条 todo 用例：todo 不是通过，请补完或显式删除。"
+            exit 1
+          fi
+          echo "通过用例数 $p ≥ 下限 $floor（# tests $n ≥ $MIN_TESTS；skipped $sk = 已登记的准跳上限 $SKIPPED_ALLOWED；cancelled $c；todo $td）"
       - run: node verify.mjs
