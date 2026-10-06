@@ -3,7 +3,10 @@
 // 本文件是**汇总守卫**，不是重复劳动：每条都只补该不变量在仓库里最薄弱的那一环，
 // 其余覆盖面在注释里点名到既有用例（改坏了该红的那条必须存在且被命名）。
 //
-//   ① 沙箱越权读取侧：不吃工具名档、不吃落盘项目档，但**会话路径档照旧**
+//   ① 沙箱越权读取侧：**吃**工具名档与落盘会话路径档、**不吃**落盘项目档
+//      （v1.12.7 用户第三次裁定收窄：越权不再被排除出工具名档；唯一保留的约束是
+//        sessionOnly——不写跨会话落盘白名单。危险命令门/超长门/执行类无正文门
+//        排在最前，与档位无关，永远走交互；见 test/invariants-1-12-7.test.js）
 //      （既有覆盖：tool-grant-session.test.js「decide disallowToolGrant」5 例、
 //        host-approval-endpoint.test.js:568/595/784/795；本文件补 decide 三档开关的
 //        **组合真值表**——单开关各自生效、双开关互不牵连）
@@ -127,10 +130,16 @@ describe('不变量①：沙箱越权——工具名档与落盘项目档都不�
     } finally { t.restore() }
   })
 
-  it('判据侧：越权只关工具名档，且与 ACP 孪生同源不同档', () => {
+  it('判据侧（v1.12.7 拆开）：越权**不再**关工具名档，只剩 ACP 孪生一种来源', () => {
     assert.equal(isSandboxEscalation(ESC), true)
-    assert.equal(isDisallowedAutoGrant('bash', ESC), true)
+    // 反转点：v1.12.5/1.12.6 这里期望 true。用户裁定「工具档不受越权限制」后
+    // isDisallowedAutoGrant 拆开 ⇒ 越权为 false，改回 true 即「越权又被排除出工具档」
+    // （1.12.x 的实战失效原样复发）。
+    assert.equal(isDisallowedAutoGrant('bash', ESC), false,
+      'v1.12.7：越权不得再被算进「不得用工具名档」——工具档是它唯一能记住的档')
     assert.equal(isAcpTwinApproval('bash', ESC), false)
+    // 孪生仍必须被排（且它在 index.js 有更早的 return next() 早退门，见不变量②）
+    assert.equal(isDisallowedAutoGrant('product_submit', '[ACP qoder] x'), true)
   })
 })
 

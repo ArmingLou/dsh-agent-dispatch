@@ -362,14 +362,22 @@ export function apply(ctx, config = {}) {
         if (req.callId && ctxInfo) {
           hostApproval.pushPendingContext(req.callId, { ...ctxInfo, sessionId, rootSessionId })
         }
-        // 排除门按档位拆分（v1.12.5 用户裁定 + 二次裁定）：
+        // 排除门按档位拆分（v1.12.5 用户裁定 + 二次裁定；v1.12.7 第三次裁定收窄）：
         //   ACP 孪生 → 本插件一档都不判，直接交回宿主与琥珀球（v1.11.4 语义完全不变）；
-        //   沙箱越权 → 禁用「工具名级」短路**与「落盘项目级」白名单**，只保留会话路径档。
-        // 越权因此重新享有路径级记忆，但记忆范围是本次主代理会话：同一路径点过一次
-        // 「总是允许」后不再反复弹窗，换个会话仍要问（v1.12.5 二次裁定）。
-        // 写入侧从来没被关掉（pushPendingContext 在上面、排除门之前就已暂存上下文，
-        // 客户端蓝球对 next() 委托的请求照样渲染按钮并 POST 规则）——1.12.x 的回归
-        // 只出在读取侧：一刀切 return next() 让写在根会话键上的路径规则永远读不到。
+        //   沙箱越权 → **v1.12.7 起只剩「禁用落盘项目级白名单」这一条约束**
+        //     （sessionOnly，见下面的档位判定）。用户裁定：**工具档不受越权限制**——
+        //     语义是同一工作区内该工具任意路径（含工作区外）直接放行；危险命令门、
+        //     超长门、执行类无正文门在最前面，与档位无关，永远走交互。
+        // 为什么改（用户本机实测）：几乎只有「沙箱越权」这一类请求会产生授权弹框
+        // （子代理审批被宿主钉死、auto-review/hooks 未启用）。1.12.5/1.12.6 把越权请求
+        // 从工具名档里逐请求排除 ⇒ 用户点过一次「本会话总是允许」写下的工具名授权
+        // 永远读不到，工具名档在实战中形同失效。
+        // 写入侧从来没被越权守卫关掉（pushPendingContext 在上面、排除门之前就已暂存上下文，
+        // 客户端蓝球对 next() 委托的请求照样渲染按钮并 POST 规则；越权请求点「本会话允许」
+        // 且路径清空时走的 addToolGrant 分支里没有任何 isSandboxEscalation 判据）
+        // ⇒ 本次改动只动**读取侧**：让写进 #toolGrants 的那条授权真正被消费。
+        // 1.12.x 的另一半回归（一刀切 return next() 让写在根会话键上的**路径**规则永远读不到）
+        // 已在 v1.12.5 修掉，本次不动路径档语义。
         if (isAcpTwinApproval(ctxInfo.toolName, ctxInfo.reason)) return next()
         // v1.12.6 危险命令排除门（用户裁决）：`rm -rf` / `npm publish` / `pnpm publish` /
         // `yarn publish` / `git push` **在任何档位下都必须走交互授权**——工具名档、
@@ -463,7 +471,15 @@ export function apply(ctx, config = {}) {
           return next()
         }
         const disallowToolGrant = isDisallowedAutoGrant(ctxInfo.toolName, ctxInfo.reason)
-        // 优先短路：工具名授权（不依赖 paths，即使解析不出路径也能命中）——越权不走这一档
+        // v1.12.7（用户裁定：**工具档不受越权限制**，语义 `{cwd: 工作区, tools:['bash']}`）：
+        // 上面那条判据已拆开——沙箱越权**不再**算「不得用工具档」，只剩 ACP 孪生一种来源，
+        // 而孪生在更上面（本文件的 isAcpTwinApproval 早退门）就 return next() 了 ⇒ 这里恒 false。
+        // 保留 `!disallowToolGrant` 是防御性冗余：早退门若被挪走，孪生至少不会吃到工具名档。
+        // 越权请求因此照常消费工具名档：命中即放行，任意路径（含工作区外）。
+        // 危险命令门/超长门/执行类无正文门都在**更上面**，与档位无关 ⇒ rm -rf、git push、
+        // npm publish 即使工具档命中仍永远走交互（顺序哨兵：test/dangerous-command-gate.test.js
+        // 与 verify.mjs 都按下面这行的**字面量**锚定位置，别改这行的形状）。
+        // 优先短路：工具名授权（不依赖 paths，即使解析不出路径也能命中）
         if (!disallowToolGrant && ctxInfo.toolName && hostApproval.toolGrantCovers(rootSessionId, ctxInfo.toolName)) {
           logApproval(
             `宿主审批自动放行（本会话工具授权命中）: ` +
@@ -474,14 +490,21 @@ export function apply(ctx, config = {}) {
         }
         // 路径规则：解析不出路径的请求不参与路径规则匹配，直接放行到交互层
         if (ctxInfo.paths.length === 0) return next()
-        // 两个开关同源（都是「被排除的越权请求」），但在 decide 里各管一档：
-        // disallowToolGrant 关工具名档，sessionOnly 关落盘项目档。
-        const hit = hostApproval.decide({ sessionId, rootSessionId, cwd: ctxInfo.cwd, paths: ctxInfo.paths, toolName: ctxInfo.toolName, disallowToolGrant, sessionOnly: disallowToolGrant })
+        // 两个开关**各管一档，判据同源但不再焊死**（v1.12.7 的关键解耦）：
+        //   disallowToolGrant = isDisallowedAutoGrant（拆开后只剩 ACP 孪生 ⇒ 生产路径恒 false）
+        //     ⇒ 关「工具名档」；
+        //   sessionOnly = isSandboxEscalation(reason) 单独一条
+        //     ⇒ 关「落盘项目档」。
+        // 改前是 `sessionOnly: disallowToolGrant`：一旦把越权从 disallowToolGrant 里摘出去，
+        // 这个焊点会**顺带把越权放进项目档**（跨会话静默提权，用户明确否决过）——
+        // 所以拆判据必须同时拆这个焊点，两件事是同一次改动。
+        const sessionOnly = isSandboxEscalation(ctxInfo.reason)
+        const hit = hostApproval.decide({ sessionId, rootSessionId, cwd: ctxInfo.cwd, paths: ctxInfo.paths, toolName: ctxInfo.toolName, disallowToolGrant, sessionOnly })
         if (hit.allowed) {
           // v1.12.4：这里的 scope 只可能是 'session'（会话路径规则）或 'project'（项目规则）——
-          // 'session-tool' 档在上面已短路（越权请求根本不走那一档），永远到不了这里，故不再列进文案
-          // （v1.12.2 m2 是死文案）。
-          // v1.12.5 二次裁定：越权请求到这里只可能是 'session'——落盘项目档也被 sessionOnly 跳过了。
+          // 'session-tool' 档在上面已短路，永远到不了这里，故不再列进文案（v1.12.2 m2 是死文案）。
+          // v1.12.5 二次裁定：越权请求到这里只可能是 'session'——落盘项目档被 sessionOnly 跳过
+          // （工具名档在更上面就短路了，越权也一样）。
           // 留痕**不带 paths 数组**（用户裁决：单行要精炼）：完整路径既撑爆日志又没有排查价值，
           // 要看具体是哪几个路径，按 sessionId + callId 回宿主会话记录查。
           logApproval(
@@ -2110,6 +2133,37 @@ export function apply(ctx, config = {}) {
                 dropped: declared.dropped,
               })
             }
+            // v1.12.7 终审 M1（纵深防御；现网不可触发，因为客户端「仅本次放行」根本不发 POST）：
+            // **`paths: null` 与「未给 paths 键」必须严格区分**。
+            // 客户端「仅本次放行」的显式契约是 `{paths: null, mode:'once'}` ＝ 一条规则都不写；
+            // 但 `validateDeclaredPaths` 的 `given = Array.isArray(raw)` 会把 `null` 归成
+            // `given=false`，于是整条请求落进下面 `useDeclared=false` 的 legacy 分支
+            // （**同时写工具名档与路径档**）——语义与「仅本次」正好相反：用户以为什么都没记住，
+            // 实际拿到的是「该工具对任意路径免弹」。终审探针实测：
+            // `POST {scope:'session',sessionId:'S2',callId:'n1',toolName:'read',paths:null}` ⇒
+            // 200 `written:true, paths:['/etc/passwd'], toolName:'read'`，随后同工具任意路径被放行。
+            // 判据用**键是否存在**（不是值的形态）：键在且值为 null ⇒ 不写任何档，如实回
+            // `written:false`（同一响应包络，客户端 200 即视为成功、继续走「仅本次」）；
+            // 键不存在 ⇒ 完全不走这里，legacy 行为逐字不变（老客户端兼容）。
+            if (body && Object.prototype.hasOwnProperty.call(body, 'paths') && body.paths === null) {
+              logApproval(
+                `宿主审批规则：paths=null ⇒ 不写任何档（客户端「仅本次放行」的显式声明）: ` +
+                `tool=${toolName ?? '未解析出'} scope=${scope} session=${sid} callId=${callId ?? '无'}`,
+                {
+                  action: 'rule-none-declared-null', scope, tool: toolName ?? null,
+                  sessionId: sid, callId: callId ?? null,
+                },
+              )
+              return send(res, 200, {
+                ok: true,
+                written: false,
+                scope,
+                paths: null,
+                toolName,
+                rootSessionId,
+                reason: 'paths 显式声明为 null（＝仅本次放行）⇒ 路径档与工具名档一律未写',
+              })
+            }
             if (useDeclared && !approvalCtx) {
               return send(res, 400, {
                 ok: false,
@@ -2138,6 +2192,11 @@ export function apply(ctx, config = {}) {
               // 弹框里**真删空**（`paths: []`，`dropped === []`）⇒ 「只要工具名」（用户明确定的
               // 语义）。v1.12.6 第五轮（终审 M-B）之后，**「给了但全非法」到不了这里** ——
               // 它在上面就 400 了；走到这里只可能是客户端如实报了空声明。
+              // v1.12.7（用户裁定）：**沙箱越权请求也走这里，没有任何守卫挡它**——这是有意行为。
+              // 越权请求在弹框里把目录全删空 ⇒ 写下的就是工具名档（会话级、内存、
+              // purgeSession 清），读取侧现在会消费它：同一主会话内该工具任意路径
+              // （含工作区外）直接放行；危险命令仍永远弹（门排在档位判定之前）。
+              // 越权唯一被抑制的仍是**落盘项目档**（下面的 sandboxEscalated 分支）。
               if (toolName && isConfirmedRoot) writeResult = hostApproval.addToolGrant(rootSessionId, toolName)
               if (!writeResult) {
                 return send(res, 400, {
@@ -2161,6 +2220,10 @@ export function apply(ctx, config = {}) {
                 writeResult = hostApproval.addSessionRule(rootSessionId, paths, { expand: false })
               } else {
                 // 工具名级授权：写入根会话 + 工具名（v1.12.3 根会话确认门见上）
+                // v1.12.7（用户裁定）：**越权请求也走这一条**，与「删空路径」那条一样没有守卫
+                // ——写入侧从来就不区分越权（唯一区分越权的是下面 sandboxEscalated 的落盘抑制）。
+                // 读取侧现在消费它（scope='session-tool'），所以越权请求点一次「本会话总是允许」
+                // 之后，同一主会话内该工具对任意路径直接放行。
                 // v1.12.4：删掉 v1.12.3 那句「降级为路径级」的空 else-if 分支——它是死代码：
                 // 走到这里必然无 callId ⇒ paths 为 [] ⇒ 下面的路径规则写入也不会执行，
                 // 真实行为是「什么都不写，落到下面返回 400」。
@@ -2250,7 +2313,9 @@ export function apply(ctx, config = {}) {
             // v1.11.14(A)：改为按请求逐条。permissionPending 保留"最早未决那条"
             // 的旧对象形态（老 client 只认这个字段，行为等同改前），
             // permissionPendingList 是新 client 用来一请求渲染一行的全量数组。
-            ...permPending(entry?.permissionPending),
+            // v1.12.7：第二个实参把 `~` 展开基准（os.homedir()）透给浏览器半——
+            // 琥珀球（ACP 通道）的弹框只能从这条轮询通道拿到 home（产品侧不透传）。
+            ...permPending(entry?.permissionPending, os.homedir()),
           }
         })
         // v1.9.3：非本插件派遣子代理（product_delegate 等宿主 product 子代理）的
@@ -2277,7 +2342,7 @@ export function apply(ctx, config = {}) {
             squadEmoji: '',
             squadRunId: null,
             permissionPending: null,
-            ...permPending(rows),
+            ...permPending(rows, os.homedir()),
           })
         }
         return send(res, 200, { ok: true, active, recent: mergeDispatchHistory(readDispatches(20), new Set(active.map((a) => a.childId).filter(Boolean))) })
@@ -2354,6 +2419,9 @@ export function apply(ctx, config = {}) {
           approvalCtx = {
             toolName: null, paths: [], structuredPaths: [], inferredPaths: [],
             reason: null, cwd: null, callId: callId || null, callFound: false, rootSessionId: null,
+            // v1.12.7：`~` 展开基准照常下发——没有暂存上下文时客户端仍可能拿到
+            // `~/.ssh/id_rsa` 这类候选路径，缺了它整行会退回「不勾选 + 警示」。
+            home: os.homedir(),
           }
         }
         return send(res, 200, { ok: true, ...approvalCtx })

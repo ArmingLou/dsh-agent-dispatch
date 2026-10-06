@@ -6,6 +6,9 @@
 // 前端孪生闸门见 test/acp-twin.test.js。
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Dispatcher, serializePermissionPending } from '../lib/dispatch.js'
 
 const registry = { get: (id) => ({ id, name: '资深开发（中坚）' }) }
@@ -196,5 +199,134 @@ describe('A /agent-api/active 的 permissionPending 序列化（新老客户端�
     assert.deepEqual(entry.permissionPending[0].suggestedDirs, [])
     d.markPermissionPending({ childId: 'child-B', permId: 'p#2', description: 'R2', suggestedDirs: [{ p: 1 }, '/ok', '  '] })
     assert.deepEqual(entry.permissionPending[1].suggestedDirs, ['/ok'])
+  })
+})
+
+// ── v1.12.7 裁定 B：product-subagents 0.7.10 的三键（grantTier / grantReason / grantDropped）
+// 与 outcome `granted-once-fallback` 的兼容展示。跨仓只读核对结论：
+//   · 对方 outcome 集合 = granted-session | granted-always | granted-once-fallback | allowed-once | rejected | error
+//     ⇒ 本仓 ok 白名单早已含 `granted-once-fallback`（v1.9.0 起），不需要扩。
+//   · 三键是**增量**的：老对端不带 ⇒ 行为必须逐字不变（兼容用例）。
+//   · `grantTier:'none'` = 用户声明的路径一条都没通过校验 ⇒ 路径档与工具档**都不写**，
+//     只放行本次。**必须让用户看到「没有记住」**，否则就是「点了允许却不知道为什么下次还问」。
+describe('v1.12.7 裁定 B：grantTier/Reason/Dropped 的展示（含老对端兼容）', () => {
+  function harness() {
+    const injected = []
+    const dir = mkdtempSync(join(tmpdir(), 'ad-perm-none-'))
+    const parentAgent = { session: { id: 'parent-1' }, inject: (m) => injected.push(m) }
+    const ctx = {
+      subagents: { interrupt: () => {} },
+      get: (name) => (name === 'agents' ? { get: (id) => (id === 'parent-1' ? parentAgent : undefined) } : undefined),
+      emit: () => {},
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    }
+    const d = new Dispatcher({ ctx, registry, dataDir: dir, idleReleaseMs: 0 })
+    d.activeChildren.set('child-A', activeEntry('child-A'))
+    d.markPermissionPending(pending('child-A', 'tc#1', 'Allow writing /etc/hosts?'))
+    const text = () => (injected.map((m) => m.content.map((c) => c.text).join('')).join('\n'))
+    const logRows = () => {
+      const f = join(dir, 'dispatches.jsonl')
+      if (!existsSync(f)) return []
+      return readFileSync(f, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+    }
+    return { d, injected, text, logRows }
+  }
+  const resolve = (h, extra) => h.d.markPermissionResolved({ childId: 'child-A', permId: 'tc#1', ...extra })
+
+  it('grantTier:none ⇒ 面板明说「没有记住」+ 逐条 reason/value + 不得说成已进工具名档', () => {
+    const h = harness()
+    resolve(h, {
+      outcome: 'granted-once-fallback',
+      grantTier: 'none',
+      grantReason: '用户声明的路径一条都没通过服务端校验 ⇒ 路径档与工具档一律未写（仅放行本次）',
+      grantDropped: [{ reason: '非绝对路径', value: './a.txt' }, { reason: '访问被拒绝', value: '/etc/hosts' }],
+    })
+    const t = h.text()
+    assert.match(t, /没有记住/, '必须让用户看到「没有记住」，否则「点了允许为什么还问」无解')
+    assert.match(t, /用户声明的路径一条都没通过服务端校验/, '产品侧给的 grantReason 要如实转述')
+    assert.match(t, /非绝对路径: \.\/a\.txt/, '逐条列出被丢弃的路径（含原因）')
+    assert.match(t, /访问被拒绝: \/etc\/hosts/)
+    assert.match(t, /没有\*\*进入工具名档/, '不得让用户以为已进入工具名档')
+    assert.doesNotMatch(t, /已落盘项目白名单/, 'grantTier:none 时绝不能说已落盘（那是最典型的假话）')
+    assert.match(t, /已放行本次（落盘失败未记忆）/, 'outcome granted-once-fallback 的既有 label 不变')
+    // 留痕：这一行是「上次点了允许为什么还问」的唯一现场证据
+    const rows = h.logRows().filter((r) => r.kind === 'perm-resolved')
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0].grantTier, 'none')
+    assert.equal(rows[0].droppedCount, 2)
+    assert.equal(rows[0].grantDropped.length, 2)
+    assert.equal(rows[0].outcome, 'granted-once-fallback')
+  })
+
+  it('grantDropped 缺失/脏载荷 ⇒ 兜底文案可用，不炸（产品侧只给了 grantTier 也能说清）', () => {
+    for (const dropped of [undefined, 'nope', [{}, { reason: 'x' }, null]]) {
+      const h = harness()
+      resolve(h, { outcome: 'allowed-once', grantTier: 'none', grantDropped: dropped })
+      const t = h.text()
+      assert.match(t, /没有记住/, `dropped=${JSON.stringify(dropped)}：仍必须说「没有记住」`)
+      assert.match(t, /路径档与工具档一律未写/, '缺 grantReason 时用本仓兜底文案，不许空白')
+    }
+    // 极长列表只列前 8 条 + 总数（面板注入限 500 字，不能把注入挤爆）
+    const h = harness()
+    resolve(h, {
+      outcome: 'granted-once-fallback', grantTier: 'none',
+      grantDropped: Array.from({ length: 12 }, (_, i) => ({ reason: '非绝对路径', value: `./${i}.txt` })),
+    })
+    assert.match(h.text(), /…共 12 条/)
+  })
+
+  it('老对端（0.7.9 及以前不带三键）⇒ 行为逐字不变（兼容）', () => {
+    for (const [outcome, label] of [
+      ['granted-always', '已获批准（总是允许，已落盘项目白名单）'],
+      ['granted-session', '已获批准（本会话总是允许）'],
+      ['granted-once-fallback', '已放行本次（落盘失败未记忆）'],
+      ['allowed-once', '已获批准'],
+    ]) {
+      const h = harness()
+      resolve(h, { outcome })
+      const t = h.text()
+      assert.ok(t.includes(label), `老 payload（无 grantTier）必须保持既有 label：${outcome}`)
+      assert.doesNotMatch(t, /没有记住/, '老 payload 没有 grantTier ⇒ 不得凭空说「没有记住」')
+      assert.deepEqual(h.logRows().filter((r) => r.kind === 'perm-resolved'), [], '老 payload 不产生新的留痕行')
+    }
+  })
+
+  it('超长 value/reason 必须截断（v1.12.7 终审 Minor 7）：条数有限但单条长度无上限 ⇒ 落盘行会膨胀', () => {
+    const h = harness()
+    const long = 'x'.repeat(5000)
+    resolve(h, {
+      outcome: 'granted-once-fallback', grantTier: 'none',
+      grantReason: '声明的路径未通过校验',
+      grantDropped: [{ reason: '非绝对路径', value: long }],
+    })
+    const rows = h.logRows().filter((r) => r.kind === 'perm-resolved')
+    assert.equal(rows.length, 1)
+    const v = rows[0].grantDropped[0].value
+    assert.ok(v.length <= 121 + '…[截断]'.length, `单条 value 未截断：${v.length} 字符`)
+    assert.match(v, /…\[截断\]$/, '截断必须可辨识（带标记，不是静默丢尾）')
+    assert.equal(rows[0].droppedClipped, true, '截断事实要留痕（含上限值）')
+    assert.equal(rows[0].droppedClipLimit, 120)
+    // 面板文本同样受限（注入消息有 500 字上限，不能被一条 path 撑爆）
+    assert.ok(h.text().includes('…[截断]'), '注入文本里的超长路径也应带截断标记')
+    // grantReason 独立成例：它同样来自对端，也可能超长
+    const h3 = harness()
+    resolve(h3, { outcome: 'granted-once-fallback', grantTier: 'none', grantReason: 'r'.repeat(400) })
+    const r3 = h3.logRows().filter((r) => r.kind === 'perm-resolved')[0]
+    assert.ok(r3.grantReason.length <= 121 + '…[截断]'.length, `grantReason 未截断：${r3.grantReason.length} 字符`)
+    assert.match(r3.grantReason, /…\[截断\]$/)
+    // 短值不受影响（不引入无谓的标记）
+    const h2 = harness()
+    resolve(h2, { outcome: 'allowed-once', grantTier: 'none', grantDropped: [{ reason: '非绝对路径', value: './a.txt' }] })
+    const r2 = h2.logRows().filter((r) => r.kind === 'perm-resolved')[0]
+    assert.equal(r2.grantDropped[0].value, './a.txt')
+    assert.equal('droppedClipped' in r2, false, '没截断时不得出现截断标记')
+  })
+
+  it('grantTier:none 只对「成功放行」的 outcome 生效（失败结局不得反过来说已放行）', () => {
+    const h = harness()
+    resolve(h, { outcome: 'rejected', grantTier: 'none', grantReason: 'x' })
+    const t = h.text()
+    assert.doesNotMatch(t, /没有记住/, '拒绝不是「放行了但没记住」——不能给用户这种错觉')
+    assert.match(t, /已结束\(rejected\)/, '未知/失败结局照旧如实显示')
   })
 })

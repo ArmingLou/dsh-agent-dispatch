@@ -1317,15 +1317,20 @@ describe('监听器层：危险命令在任何档位下都不自动放行', () =
 
 // ════════════════════════════════════════════════════════════════════
 describe('既有两道门的行为不被这道门改动', () => {
-  it('越权（escalate sandbox）仍然只走会话路径档——普通命令照旧放行', async () => {
+  it('越权（escalate sandbox）的普通命令照旧被工具名档放行——危险命令门不碰它', async () => {
     const b = await bootWithBashGranted()
     try {
       const s = mkSession({ id: 'child-2', parentSession: 'R', toolCalls: bashCall('e1', 'ls /tmp/x') })
       const r = await approve(b, s, { callId: 'e1', toolName: 'bash', reason: 'escalate sandbox to read-write: need write' })
-      // 无路径规则覆盖 ⇒ 越权仍要交互（与 1.12.5 语义一致）；这里只断言**没被新门拦**
+      // 这里只断言**没被新门拦**：越权的普通命令不是危险命令门的职责。
+      // v1.12.7 之前这条断言的是 nextCalled===true（那时越权被排除出工具名档）；
+      // 用户第三次裁定「工具档不受越权限制」之后，已授权 bash 的越权普通命令必须放行，
+      // 而危险命令门在任何档位下都不得把「普通命令」判成命中（下面那条第八轮用例
+      // 覆盖反向：危险命令即使在已授权 bash 下一律 next()）。
       assert.equal(logRows(b.home).filter((r2) => r2.action === 'danger-command-block').length, 0,
         '越权的普通命令被危险命令门拦了——那是另一道门的职责')
-      assert.equal(r.nextCalled, true)
+      assert.equal(r.res, 'allowed-once', 'v1.12.7：越权的普通命令照旧吃工具名档')
+      assert.equal(r.nextCalled, false)
     } finally { await b.close() }
   })
 

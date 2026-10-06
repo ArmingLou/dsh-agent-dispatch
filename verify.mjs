@@ -848,8 +848,11 @@ if (!c.includes('uiSubs')) throw new Error('v0.9.29: 持久化状态应有订阅
     throw new Error('v1.12.1: isSandboxEscalation 误判非越权文案')
   if (!ha.isAcpTwinApproval('product_submit', '[ACP qoder] x'))
     throw new Error('v1.12.1: isAcpTwinApproval 不匹配 ACP 孪生')
-  if (!ha.isDisallowedAutoGrant('bash', 'escalate sandbox to read-write: x'))
-    throw new Error('v1.12.1: isDisallowedAutoGrant 不拦截沙箱越权')
+  // v1.12.7（用户第三次裁定「工具档不受越权限制」）：越权**不再**被这条判据排除。
+  // 这里留的是**反向断言**而不是删掉——判据被改回「越权也算」就是裁定的原样复发，
+  // 而它的实战后果是「点过一次本会话总是允许该工具」写下的授权永远读不到。
+  if (ha.isDisallowedAutoGrant('bash', 'escalate sandbox to read-write: x'))
+    throw new Error('v1.12.7: isDisallowedAutoGrant 又把沙箱越权算成「不得用工具名档」（工具档将被逐请求排除）')
   if (!ha.isDisallowedAutoGrant('product_submit', '[ACP qoder] x'))
     throw new Error('v1.12.1: isDisallowedAutoGrant 不拦截 ACP 孪生')
 
@@ -1061,6 +1064,254 @@ if (!c.includes('uiSubs')) throw new Error('v0.9.29: 持久化状态应有订阅
     throw new Error('v1.12.6 G1: 危险命令名单不是单点常量（定义/引用缺失）')
   if (!/与 product-subagents[^\n]*同一份/.test(hostSrc6))
     throw new Error('v1.12.6 G1: 未声明名单来源与「需人工保持同步」')
+}
+
+// ── v1.12.7：工具档不再被越权排除 + 两档开关解耦 + `~` 展开基准下发 ──
+//
+// 本块是**读取侧语义反转**的汇总守卫（行为断言在 test/invariants-1-12-7.test.js、
+// test/host-approval-endpoint.test.js、test/grant-dialog.test.js；这里只钉字符串/纯函数层，
+// 保证这四处哪怕被整块删掉也能在 CI 上看见）。
+{
+  const ha = await import('./lib/host-approval.js')
+  const dp = await import('./lib/dispatch.js')
+  const idx = readFileSync(path.join(root, 'index.js'), 'utf8')
+  const clientV7 = readFileSync(path.join(root, 'lib', 'client.js'), 'utf8')
+  const hostV7 = readFileSync(path.join(root, 'lib', 'host-approval.js'), 'utf8')
+  const dispatchV7 = readFileSync(path.join(root, 'lib', 'dispatch.js'), 'utf8')
+
+  // ① 判据拆开：越权**不**关工具档，孪生**仍然**关（行为面见 test/invariants-1-12-7.test.js ①②④）
+  const ESC = 'escalate sandbox to read-write: need to write outside the sandbox'
+  if (ha.isDisallowedAutoGrant('bash', ESC))
+    throw new Error('v1.12.7-1: 越权仍被算进「不得用工具名档」——工具档会被逐请求排除（实战失效复发）')
+  if (!ha.isDisallowedAutoGrant('product_submit', '[ACP qoder] 请求权限'))
+    throw new Error('v1.12.7-1: ACP 孪生不再被排除（孪生会吃工具名档，违反「完全绕过、不动它」）')
+  if (!ha.isSandboxEscalation(ESC))
+    throw new Error('v1.12.7-1: isSandboxEscalation 自身必须仍能识别越权（它只剩 sessionOnly 与文案两个用途）')
+
+  // ② 两档开关**解耦**：越权只关项目档、不关工具档；焊点回去（sessionOnly: disallowToolGrant）
+  //    的后果是「判据一拆，越权连项目档一起放开 ⇒ 跨会话静默提权」。
+  const rv7 = new ha.HostApprovalRules()
+  rv7.addToolGrant('root-v7', 'bash')
+  const toolHit = rv7.decide({ sessionId: 'child-v7', rootSessionId: 'root-v7', paths: ['/v7/a.txt'], toolName: 'bash', disallowToolGrant: false, sessionOnly: true })
+  if (!toolHit.allowed || toolHit.scope !== 'session-tool')
+    throw new Error(`v1.12.7-2: 越权（sessionOnly=true）拿不到工具名档 allowed=${toolHit.allowed} scope=${toolHit.scope}`)
+  const projRule = rv7.appendProjectRule({ cwd: '/v7cwd', paths: ['/v7/outside'] })
+  if (!projRule.ok) throw new Error('v1.12.7-2: 项目档夹具写入失败')
+  const projOnly = rv7.decide({ sessionId: 'root-v7b', rootSessionId: 'root-v7b', cwd: '/v7cwd', paths: ['/v7/outside/x.txt'], toolName: null, sessionOnly: true })
+  if (projOnly.allowed)
+    throw new Error('v1.12.7-2: sessionOnly=true 仍走了落盘项目档——越权可被跨会话白名单静默放行')
+  const projOn = rv7.decide({ sessionId: 'root-v7b', rootSessionId: 'root-v7b', cwd: '/v7cwd', paths: ['/v7/outside/x.txt'], toolName: null, sessionOnly: false })
+  if (!projOn.allowed || projOn.scope !== 'project')
+    throw new Error('v1.12.7-2: 非越权的项目档被一起关掉了（超出裁定范围）')
+
+  // ③ 生产调用点：`sessionOnly` 必须是 isSandboxEscalation 单独一条、**不得**与
+  //    disallowToolGrant 焊在一起（解耦点在 index.js，纯函数层测不到）。
+  if (!idx.includes('const sessionOnly = isSandboxEscalation(ctxInfo.reason)'))
+    throw new Error('v1.12.7-3: index.js 找不到 `const sessionOnly = isSandboxEscalation(ctxInfo.reason)`（解耦点丢失）')
+  // 查**调用行本身**（不是整份源码）：index.js 的注释里刻意写着改前的焊点写法做历史说明，
+  // 整份 includes 会把那段说明当成复发。锚定 decide 调用行，两个开关必须是**两个独立实参**。
+  const decideLine = idx.split('\n').find((l) => l.includes('const hit = hostApproval.decide('))
+  if (!decideLine) throw new Error('v1.12.7-3: index.js 找不到 decide 的调用点')
+  if (/sessionOnly:\s*disallowToolGrant/.test(decideLine))
+    throw new Error('v1.12.7-3: 两档开关又焊死在一起（sessionOnly: disallowToolGrant）——越权会被放进落盘项目档')
+  if (!/\bdisallowToolGrant,\s*sessionOnly\b/.test(decideLine))
+    throw new Error(`v1.12.7-3: decide 调用行必须同时传两个独立开关：${decideLine.trim()}`)
+  if (!/const disallowToolGrant = isDisallowedAutoGrant\(ctxInfo\.toolName, ctxInfo\.reason\)/.test(idx))
+    throw new Error('v1.12.7-3: disallowToolGrant 的判据被改名/移位（工具名档的开关来源变了）')
+  // 危险命令门 / 超长门 / 执行类无正文门必须仍排在工具名短路之前（顺序哨兵，位置敏感）
+  const shortAt7 = idx.indexOf('if (!disallowToolGrant && ctxInfo.toolName && hostApproval.toolGrantCovers(')
+  if (shortAt7 < 0) throw new Error('v1.12.7-3: 工具名短路调用点丢失')
+  for (const [needle, why] of [
+    ['const danger = dangerousCommandMatch(dangerCmd.text)', '危险命令门'],
+    ['if (dangerCmd.omitted > 0) {', '超长兜底门'],
+    ["action: 'no-command-text-block'", '执行类无正文门'],
+  ]) {
+    const at = idx.indexOf(needle)
+    if (at < 0) throw new Error(`v1.12.7-3: ${why}的调用点丢失（${needle}）`)
+    if (at > shortAt7) throw new Error(`v1.12.7-3: ${why}排到了工具名短路之后——已授权工具名下会被静默放行`)
+  }
+
+  // ④ `~` 展开基准全链路：服务端下发 home → 序列化逐行带 home → 客户端用它拼绝对路径。
+  //    任一环缺失 ⇒ `~/.ssh/id_rsa` 这类候选退回「原样 + 不勾选 + 警示」（老行为）。
+  const ctx = ha.resolveApprovalContext({ session: { header: { cwd: '/v7cwd' } }, callId: null, toolName: 'bash', reason: null })
+  if (ctx.home !== (await import('node:os')).default.homedir())
+    throw new Error(`v1.12.7-4: resolveApprovalContext 没下发 home（实际 ${JSON.stringify(ctx.home)}）`)
+  if (!/home,\n/.test(hostV7.slice(hostV7.indexOf('return {\n    toolName: resolvedToolName,'))))
+    throw new Error('v1.12.7-4: resolveApprovalContext 的返回对象里没有 home 字段')
+  const ser7 = dp.serializePermissionPending([{ permId: 'v7#1', description: 'R', at: 1 }], '/home/v7user')
+  if (ser7.permissionPendingList[0].home !== '/home/v7user')
+    throw new Error('v1.12.7-4: serializePermissionPending 没把 home 透到每一行')
+  const ser7b = dp.serializePermissionPending([{ permId: 'v7#2', description: 'R', at: 2 }])
+  if (ser7b.permissionPendingList[0].home !== null)
+    throw new Error('v1.12.7-4: 不给 home 时必须序列化成 null（前端按此走降级分支）')
+  if (!/export function serializePermissionPending\(value, home = null\)/.test(dispatchV7))
+    throw new Error('v1.12.7-4: serializePermissionPending 的 home 形参丢失')
+  if ((idx.match(/permPending\([^)]*os\.homedir\(\)\)/g) || []).length !== 2)
+    throw new Error('v1.12.7-4: /agent-api/active 的两个 permPending 调用点没都传 os.homedir()')
+  if (!idx.includes('home: os.homedir(),'))
+    throw new Error('v1.12.7-4: /agent-api/host-approval-context 的兜底上下文没带 home（缺它整行退回不勾选）')
+
+  // ⑤ 客户端：`~` 用下发的 home 展开；拿不到时降级。旧假话（`~` 不展开 / 服务端只认绝对路径
+  //    所以丢弃 / 越权不走工具名档）一律不得回来——面板说谎是用户专门抓到过的问题。
+  if (!/function resolveAgainstCwd\(rel, cwd, home\) \{/.test(clientV7))
+    throw new Error('v1.12.7-5: resolveAgainstCwd 没有第三个 home 形参')
+  if (!/function absolutizeDirs\(paths, cwd, home\) \{/.test(clientV7))
+    throw new Error('v1.12.7-5: absolutizeDirs 没有第三个 home 形参')
+  if (!/function dirsOfPaths\(paths, cwd, home\) \{/.test(clientV7))
+    throw new Error('v1.12.7-5: dirsOfPaths 没有第三个 home 形参')
+  for (const needle of [
+    'const homePath = typeof o.home === "string" && o.home.trim() ? o.home.trim() : null;',
+    'const amberHome = typeof p.home === "string" && p.home.trim() ? p.home.trim() : null;',
+    'item.home = typeof d.home === "string" && d.home.trim() ? d.home.trim() : null;',
+    'if (!h || !ABS_PATH_RE.test(h) || ROOT_LIKE_RE.test(h)) return null;',
+  ]) {
+    if (!clientV7.includes(needle))
+      throw new Error(`v1.12.7-5: lib/client.js 里找不到 "${needle}"（\`~\` 展开链路被拆）`)
+  }
+  // v1.12.7 终审 Minor 1（X2 变异暴露的守卫缺口）：上面那条 needle 只钉了守卫行的**字面存在**，
+  // 没钉 `h` 的**来源唯一性** ⇒ 把来源行改成 `String(home || "").trim() || String(cwd || "").trim()`
+  // （拿不到 home 就用 cwd 猜）时，弹框层 3 条用例转红，而 verify 当时仍 exit 0。
+  // `~` 的展开基准只能是服务端下发的 home：用 cwd 猜等于把 `~/…` 的授权挪到工作区目录。
+  const homeSrcLine = (clientV7.match(/^\s*const h = String\(home[^\n]*$/m) || [])[0]
+  if (!homeSrcLine) throw new Error('v1.12.7-5: 找不到 `const h = String(home…`（`~` 展开基准的来源行）')
+  if (/\bcwd\b/.test(homeSrcLine))
+    throw new Error(`v1.12.7-5: \`~\` 的展开基准行引用了 cwd（拿不到 home 时用工作区目录猜）：${homeSrcLine.trim()}`)
+  if (!homeSrcLine.includes('String(home || "")'))
+    throw new Error(`v1.12.7-5: \`~\` 的展开基准不再是「只认服务端下发的 home」：${homeSrcLine.trim()}`)
+  // 旧口径的反向断言必须查**去注释后的可执行源码**：client.js 的注释里刻意保存了
+  // 改前的原话做历史说明（「改前那句『沙箱越权不走工具名档』已经是假话」），
+  // 整份 includes 会把那段说明当成复发。面板说谎是**字符串**层面的问题，只查代码。
+  const clientV7Code = clientV7
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+  for (const [needle, why] of [
+    ['越权不走工具名档', '已失效的旧口径（越权现在照吃工具档）'],
+    ['工具名档对本条不生效', '已失效的旧口径（越权按钮已与普通请求同档）'],
+    ['服务端也不展开', '已失效的旧口径（`~` 现在按服务端下发的 home 展开）'],
+    ['非绝对路径：`~` 不展开', '已失效的旧口径（`~` 会展开，只有拿不到 home 才降级）'],
+  ]) {
+    if (clientV7Code.includes(needle))
+      throw new Error(`v1.12.7-5: lib/client.js 仍在说「${why}」：${needle}`)
+  }
+  // 越权那句提示必须如实（覆盖用户可读的三件事）
+  // v1.12.7（用户后续裁定）后锚点改为 toolTierLine：一级提示与二级选项共用它，
+  // 两处任一说谎都算复发。
+  const hintStart = clientV7.indexOf('const toolTierLine = "「该工具对任意路径都将放行」= 只记住工具名"')
+  if (hintStart < 0) throw new Error('v1.12.7-5: 弹框「一条都没勾」的后果说明（toolTierLine）丢失')
+  const hintV7 = clientV7.slice(hintStart, hintStart + 900)
+  for (const needle of ['任意路径放行（含工作区外）', '危险命令', '不写落盘白名单']) {
+    if (!hintV7.includes(needle))
+      throw new Error(`v1.12.7-5: 越权「删空目录」提示缺「${needle}」——面板会说谎`)
+  }
+  // `~` 的判定：拿不到 home 才降级，watch 提示本身不得再断言「不展开」
+  if (!clientV7.includes('本次没拿到服务端下发的 home，`~` 无法展开'))
+    throw new Error('v1.12.7-5: 拿不到 home 的降级提示被删（用户会以为 `~` 行是被服务端丢弃的）')
+
+  // ── ① 二级选择（用户裁定：空路径集必须先二选一，不得静默按工具名档提交）──
+  if (!clientV7.includes('function openSecondLevel() {'))
+    throw new Error('v1.12.7-6: 找不到 openSecondLevel ——「空路径集」又会直接提交成一个语义不明的档')
+  // 契约三值：`once` = 只放行一次（什么都不写）；`tools` = 工具名档；`paths` = 目录档
+  for (const needle of [
+    'if (picked.length > 0) { finish({ paths: picked, mode: "paths" }); return; }',
+    'finish({ paths: null, mode: "once" });',
+    'finish({ paths: [], mode: "tools" });',
+  ]) {
+    if (!clientV7.includes(needle)) throw new Error(`v1.12.7-6: 二级选择的载荷分支丢失：${needle}`)
+  }
+  // 「仅本次放行」绝不能把那批非法路径当数组回传（服务端 `paths` 非空但全被丢弃
+  // ⇒ mode:'none' 拒写出口；那是 fail-closed 兜底，不是正常出口）。
+  if (!/finish\(\{ paths: null, mode: "once" \}\)/.test(clientV7))
+    throw new Error('v1.12.7-6: 「仅本次放行」必须是 paths:null（回传非法路径会撞服务端拒写出口）')
+  if (/finish\(\{ paths: \[\][^}]*mode: "once"/.test(clientV7))
+    throw new Error('v1.12.7-6: 「仅本次放行」被写成了空数组——空数组的服务端语义恰好是「只写工具名档」')
+  // Esc：二级开着时只关二级（否则用户没法回一级改选，且整个弹框被一起关掉）
+  if (!clientV7.includes('if (secondLevel) { closeSecondLevel(); return; }'))
+    throw new Error('v1.12.7-6: Esc 未先判二级 —— 二级会被一级的监听连锅端掉')
+  // 没有工具名时「任意路径」必须不可点（工具名档没有可写的键）
+  if (!/allBtn\.disabled = true/.test(clientV7))
+    throw new Error('v1.12.7-6: 解析不出工具名时「任意路径」按钮没被禁用（会写出没有键的档）')
+  // 确认键必须**唯一**地走 openSecondLevel。这条守卫是 M9 转红实验暴露的缺口：
+  // 当时「确认键绕过二级、空集直接提交成工具名档」的变异让用例红了 8 条，verify 却仍然全绿。
+  if (!clientV7.includes('btnOk.addEventListener("click", (ev) => { ev.stopPropagation(); openSecondLevel(); });'))
+    throw new Error('v1.12.7-6: 确认键没有先走二级选择（空路径集会被静默提交成一个档）')
+  if ((clientV7.match(/btnOk\.addEventListener\("click"/g) || []).length !== 1)
+    throw new Error('v1.12.7-6: 确认键挂了多个 click 处理器（会绕过或重复提交）')
+  // `paths: []` 只允许出现在「任意路径」那一档；别的空数组出口一律不许有
+  for (const mm of clientV7.matchAll(/finish\(\{ paths: \[\][^}]*\}\)/g)) {
+    if (!/mode: "tools"/.test(mm[0]))
+      throw new Error(`v1.12.7-6: 出现了非「任意路径」档的空数组提交：${mm[0]}`)
+  }
+  // CSS：二级层不得引入新色值（复用既有 palette / 阴影 token）
+  const cssV7 = clientV7.slice(clientV7.indexOf('.ad-grant-2nd{'), clientV7.indexOf('.ad-grant-2nd-actions'))
+  if (!cssV7) throw new Error('v1.12.7-6: 找不到 .ad-grant-2nd 的 CSS 段')
+  // 允许值 = 既有弹框已经在用的那几种（主色 #e8a33d、白底、两层遮罩/阴影黑）。
+  // `rgba(0,0,0,.25)` 是既有 shadow token 的 fallback（与 .ad-grant-pop 逐字一致），不算新色值。
+  const allowedColors = new Set(['#e8a33d', '#fff', '#ffffff', 'rgba(0,0,0,.35)', 'rgba(0,0,0,0.35)', 'rgba(0,0,0,.25)', 'rgba(0,0,0,0.25)', 'transparent', 'inherit', 'none', 'currentColor'])
+  for (const m of cssV7.matchAll(/(#[0-9a-fA-F]{3,8}|rgba?\([^)]*\)|hsla?\([^)]*\))/g)) {
+    if (!allowedColors.has(m[1])) throw new Error(`v1.12.7-6: 二级层引入了新色值 ${m[1]}（用户裁定：视觉一致、不新增色值）`)
+  }
+
+  // ── ② 通道接线：两条通道的「仅本次」与「任意路径」必须各走各的 ──
+  const hostOnce = clientV7.indexOf('if (d.mode === "once") {', clientV7.indexOf('const grantViaDialog = (scope) => async () => {'))
+  if (hostOnce < 0) throw new Error('v1.12.7-6: 宿主通道缺「仅本次」分支')
+  const hostOnceBody = clientV7.slice(hostOnce, hostOnce + 260)
+  if (!hostOnceBody.includes('return "allowed-once"')) throw new Error('v1.12.7-6: 宿主通道「仅本次」没有如实回报 allowed-once')
+  if (/apiPost/.test(hostOnceBody)) throw new Error('v1.12.7-6: 宿主通道「仅本次」竟然发了 POST —— 一条规则都不许写')
+  if (!clientV7.includes('const toolTier = d.mode === "tools";'))
+    throw new Error('v1.12.7-6: 宿主通道的工具名档判据丢失')
+  if (!clientV7.includes('if (item.toolName && (scope === "session" || toolTier)) payload.toolName = item.toolName;'))
+    throw new Error('v1.12.7-6: 工具名档必须在**两种 scope** 下都带 toolName（缺 key 服务端只会 400 什么都不写）')
+  // 琥珀通道：仅本次 ⇒ allow-once 且**不带**第四参（paths）
+  if (!clientV7.includes('if (d.mode === "once") { sendDecision(a, "allow-once", "仅本次放行"); return; }'))
+    throw new Error('v1.12.7-6: 琥珀通道「仅本次」必须 sendDecision(allow-once) 且不传 paths')
+  if (/sendDecision\(a, "allow-once", "仅本次放行", /.test(clientV7))
+    throw new Error('v1.12.7-6: 琥珀通道「仅本次」传了 paths —— 产品侧会据此写档（路径档或工具名档）')
+  // toolTierDisk：宿主恒 false（只有会话级工具档）、琥珀 = 该按钮是否落盘
+  if (!clientV7.includes('toolTierDisk: false,')) throw new Error('v1.12.7-6: 宿主通道没把 toolTierDisk=false 透给弹框')
+  if (!clientV7.includes('toolTierDisk: grant.projectTier === true,'))
+    throw new Error('v1.12.7-6: 琥珀通道没把「工具名档是否落盘」透给弹框（二级说明会说谎）')
+  if (!clientV7.includes('宿主通道的工具名档只有会话级'))
+    throw new Error('v1.12.7-6: 项目档 + 宿主通道时必须点明「要落盘请勾目录」（否则用户以为已落盘）')
+
+  // ── ③ 跨仓展示：grantTier/Reason/Dropped 三键（0.7.10）──
+  if (!dispatchV7.includes("|| outcome === 'granted-once-fallback'"))
+    throw new Error('v1.12.7-7: ok 白名单丢了 granted-once-fallback（0.7.10 起会发这个 outcome）')
+  if (!dispatchV7.includes("const noMemory = ok && info && String(info.grantTier || '') === 'none'"))
+    throw new Error("v1.12.7-7: grantTier==='none' 的「没有记住」展示丢失（用户会以为已记住）")
+  if (!dispatchV7.includes("（下次同类请求仍会询问；本条**没有**进入工具名档）"))
+    throw new Error('v1.12.7-7: 「没有记住」必须点明「没有进入工具名档」')
+  if (!/Array\.isArray\(info && info\.grantDropped\) \? info\.grantDropped : \[\]/.test(dispatchV7))
+    throw new Error('v1.12.7-7: grantDropped 的防御性解析丢失（老对端不带该键 ⇒ 必须退化成空数组）')
+  if (!dispatchV7.includes("kind: 'perm-resolved'"))
+    throw new Error('v1.12.7-7: grantTier:none 未留痕（「上次点了允许为什么还问」就没有现场证据）')
+  if (!/grantTier: 'none', grantReason: clipDrop\(\(info && info\.grantReason\) \|\| ''\)/.test(dispatchV7))
+    throw new Error('v1.12.7-7: 留痕行缺 grantTier/grantReason（或 grantReason 未截断）')
+  // 终审 Minor 7：value/reason 是用户输入原文 ⇒ 必须逐条截断（条数有限、长度无上限）
+  if (!dispatchV7.includes('const DROP_CLIP = 120'))
+    throw new Error('v1.12.7-7: grantDropped 的截断上限常量丢失（超长串会让 dispatches.jsonl 单行膨胀）')
+  if (!dispatchV7.includes("…[截断]"))
+    throw new Error('v1.12.7-7: 截断必须带可辨识标记（不得静默丢尾）')
+  if (!/droppedClipped \? \{ droppedClipped: true, droppedClipLimit: DROP_CLIP \}/.test(dispatchV7))
+    throw new Error('v1.12.7-7: 截断事实未留痕（droppedClipped/droppedClipLimit）')
+
+  // ── ④ 终审 M1：端点上 `paths:null` 与「未给 paths 键」必须严格区分 ──
+  // 根因是 `validateDeclaredPaths` 的 `given = Array.isArray(raw)` 把 null 归成 given=false
+  // ⇒ 落进 legacy 分支同时写工具档与路径档（与客户端「仅本次放行」的语义正好相反）。
+  // 守卫钉三件事：门存在、门的位置在 legacy 写入之前、响应如实回 written:false 并留痕。
+  const nullGateAt = idx.indexOf("Object.prototype.hasOwnProperty.call(body, 'paths') && body.paths === null")
+  if (nullGateAt < 0)
+    throw new Error('v1.12.7-8: 端点的 paths:null 门丢失（null 会被当成「未给」⇒ 同时写工具档与路径档）')
+  const legacyWriteAt = idx.indexOf('if (useDeclared && paths.length === 0) {')
+  if (legacyWriteAt < 0) throw new Error('v1.12.7-8: 找不到 legacy 工具名档写入分支（结构变了，请同步本守卫）')
+  if (nullGateAt > legacyWriteAt)
+    throw new Error('v1.12.7-8: paths:null 门排在了 legacy 写入之后 ⇒ null 仍会被写进规则')
+  if (!idx.includes("action: 'rule-none-declared-null'"))
+    throw new Error('v1.12.7-8: paths:null 未留痕（排障时看不出「为什么什么都没写」）')
+  const nullGateBody = idx.slice(nullGateAt, nullGateAt + 900)
+  if (!/written: false/.test(nullGateBody))
+    throw new Error('v1.12.7-8: paths:null 的响应没有如实回 written:false')
+  if (!/paths: null/.test(nullGateBody))
+    throw new Error('v1.12.7-8: paths:null 的响应没有回带 paths:null（会让人以为走了 legacy 自动分析）')
 }
 
 console.log(`OK: ${PKG_NAME} v${pkg.version} 一致性链（无内置 Agent）+ ${tools.length} 工具 + /${commands.join('/')} 命令`)

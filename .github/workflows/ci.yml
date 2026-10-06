@@ -61,9 +61,33 @@ jobs:
       # 欠吃方向的误伤守卫 19 条、**M2**：取值选项表与**字面量**期望清单双向对拍
       # （删条目 ⇒ 红、加条目 ⇒ 红；修复「删条目 = 同时删断言」的测试盲区）；
       # 监听器层 1 条 —— 12 条欠吃形态在「已授权 bash」下仍 next()、无害形态仍 allowed-once）
+      # v1.12.7 三轮叠加（每轮都按本地 Node 22 实测的 `# tests` 同步）：
+      #   551 → **578**（+27：判据反转/工具档/`~` 展开等第一批）；
+      #   → **590**（+12：裁定 A「空路径集先二选一」5 + 通道接线 6 + 裁定 B 三键 1… 见下 ⑤）；
+      #   → **593**（+3：终审 M1 端点 `paths:null` 2 + Minor 7 截断 1）。
+      #   ① 既有 16 条断言因语义反转被改写（不加条数）：tool-grant-session 7 条、
+      #      host-approval-endpoint 4 条、grant-dialog 3 条、invariants-1-12-6 1 条、
+      #      dangerous-command-gate 1 条；另有 tool-grant-session 的 handler 注入表
+      #      补登记 `isSandboxEscalation`（漏登记会把 4 条用例吞成假红）。
+      #   ② 新增 test/invariants-1-12-7.test.js：20 条（不变量①–⑦：越权吃工具档 /
+      #      未命中仍弹 / 三门压过工具档 / ACP 孪生仍绕过 / 越权仍不落项目档 /
+      #      `~` 按 home 展开 / 拿不到 home 保持现状；含纯函数层与源码级顺序哨兵）。
+      #   ③ 新增 test/grant-dialog.test.js 的 v1.12.7 弹框层：4 条（`~` 展开后恢复
+      #      默认勾选并随确认发出、cwd 缺失也展开、拿不到 home 原样+不勾选+警示、
+      #      `~user/…` 不展开）。
+      #   ④ verify.mjs 新增 v1.12.7 断言块（不占用例条数）。
+      #   ⑤ v1.12.7 第二轮（裁定 A「空路径集先二选一」/ 裁定 B「0.7.10 三键」）：新增
+      #      test/grant-dialog.test.js 二级选择 5 条 + 通道接线 6 条（含全链路两条）、
+      #      test/permission-pending.test.js 5 条（含老对端兼容）、verify.mjs 的
+      #      v1.12.7-6/-7 断言块（不占用例条数）。
+      #   ⑥ 终审收口轮：test/host-approval-endpoint.test.js 新增 2 条（paths:null 不写档 /
+      #      无该键时 legacy 逐字不变）、test/permission-pending.test.js 新增 1 条（超长
+      #      value/reason 必须截断）；verify.mjs 新增 v1.12.7-8 端点门守卫 + 
+      #      `~` 基准来源行的反向断言 + 截断守卫（均不占用例条数）。
+      # 新增用例时请一起把这个数抬上去。
       - name: 单元 / 集成测试（含用例条数守卫）
         env:
-          MIN_TESTS: 551
+          MIN_TESTS: 593
           SKIPPED_ALLOWED: 1
         run: |
           set -uo pipefail

@@ -273,16 +273,19 @@ describe('POST /agent-api/host-approval-rule：fork 会话是独立主会话（v
   })
 })
 
-describe('沙箱越权：工具名档不适用、路径级记忆重新生效（v1.12.5 用户裁定）', () => {
+describe('沙箱越权：工具名档**适用**、路径级记忆仍生效、落盘项目档仍不适用（v1.12.7 第三次裁定）', () => {
   // 这里跑的是用户那一趟真实动作：蓝球弹出一条 bash 越权 → 点「本会话总是允许该工具」
   // → POST 的 scope==='session' 分支**同时**写下工具名授权与会话路径规则
   // （index.js 的 addToolGrant + addSessionRule）→ 后续请求重新判定。
-  // 1.12.4 的一刀切让这套写入白做（读取侧根本不看越权请求），同一路径反复弹窗；
-  // v1.12.5 恢复路径档，同时必须守住「工具名授权不得替越权放行」。
+  // 历史：1.12.4 的一刀切让这套写入白做（读取侧根本不看越权请求），同一路径反复弹窗；
+  // v1.12.5 恢复路径档，但把越权从**工具名档**里逐请求排除 ⇒ 写下的工具名授权永远
+  // 读不到，用户本机几乎只有越权这一类弹框 ⇒ 工具名档在实战中形同失效。
+  // v1.12.7（用户第三次裁定）：越权照吃工具名档 —— 同一主会话内该工具对**任意路径**
+  // （含工作区外）直接放行。唯一保留的约束是「不写落盘项目档」（见本 describe 末尾那条）。
   const ESC = 'escalate sandbox to read-write: need to write outside the sandbox'
   const bashCall = (callId, file) => [{ callId, name: 'bash', arguments: { command: `cat ${file}` } }]
 
-  it('点过一次后：同一路径的越权自动放行（留痕 scope=session）、新路径的越权仍弹窗、非越权照旧吃工具名档', async () => {
+  it('点过一次后：同路径与**新路径**的越权都被工具名档放行（scope=session-tool）、非越权零漂移', async () => {
     const b = await boot()
     try {
       const s1 = mkSession({ id: 'child-1', parentSession: 'R', toolCalls: bashCall('ce1', '/tmp/proj/a.txt') })
@@ -295,25 +298,31 @@ describe('沙箱越权：工具名档不适用、路径级记忆重新生效（v
       assert.equal(status, 200)
       assert.equal(json.rootSessionId, 'R')
 
-      // ② 同一路径的越权 → 放行，且放行必须来自**路径档**
+      // ② 同一路径的越权 → 放行。v1.12.7：工具名档排在路径档**之前**，所以留痕是
+      // 'session-tool'（改前是 'session'——那时越权被逐请求排除出工具名档）。
       const same = await approve(b, s1, { callId: 'ce1', toolName: 'bash', reason: ESC })
-      assert.equal(same.res, 'allowed-once', '路径级记忆对越权没重新生效（仍是 1.12.4 的一刀切）')
+      assert.equal(same.res, 'allowed-once', '越权没被已写下的授权放行（1.12.x 的实战失效复发）')
       assert.equal(same.nextCalled, false)
       const escRow = logRows(b.home).filter((r) => r.kind === 'host-approval' && r.action === 'auto-grant').at(-1)
-      assert.equal(escRow.scope, 'session', '越权的放行被工具名档解释了——用户裁定工具名档不适用于越权')
+      assert.equal(escRow.scope, 'session-tool',
+        'v1.12.7 用户裁定「工具档不受越权限制」：越权必须被工具名档短路，留痕不得再是路径档')
 
-      // ③ 换一条没记过的路径的越权 → 仍然弹窗：根键上的 bash 工具名授权不得替它放行
+      // ③ v1.12.7 反转点：换一条**没记过的路径**的越权 → 也放行。
+      // 改前这条断言的是 `nextCalled === true`（「根键上的 bash 工具名授权不得替它放行」）。
+      // 现在语义就是用户要的「同一主会话内该工具对任意路径（含工作区外）直接放行」。
       const s2 = mkSession({ id: 'child-2', parentSession: 'R', toolCalls: bashCall('ce2', '/tmp/elsewhere/x.txt') })
       const fresh = await approve(b, s2, { callId: 'ce2', toolName: 'bash', reason: ESC })
-      assert.equal(fresh.nextCalled, true, '越权吃了根键上的工具名授权（新路径也放行了）')
-      assert.notEqual(fresh.res, 'allowed-once')
+      assert.equal(fresh.res, 'allowed-once', 'v1.12.7：越权必须照吃根键上的工具名授权（任意路径）')
+      assert.equal(fresh.nextCalled, false)
+      const freshRow = logRows(b.home).filter((r) => r.kind === 'host-approval' && r.action === 'auto-grant').at(-1)
+      assert.equal(freshRow.scope, 'session-tool')
 
-      // ④ 同一份授权、同一条新路径，只把 reason 换回非越权 → 工具名档照旧放行
+      // ④ 非越权零漂移：同一份授权、同一条新路径，只把 reason 换回非越权 → 同样放行
       const plain = await approve(b, s2, { callId: 'ce2', toolName: 'bash', reason: 'tool requires approval' })
       assert.equal(plain.res, 'allowed-once', '非越权请求的行为被这次改动带偏了')
       assert.equal(plain.nextCalled, false)
       const toolRow = logRows(b.home).filter((r) => r.kind === 'host-approval' && r.action === 'auto-grant').at(-1)
-      assert.equal(toolRow.scope, 'session-tool', '非越权的放行应当来自工具名档（与 ② 形成对照）')
+      assert.equal(toolRow.scope, 'session-tool')
     } finally { await b.close() }
   })
 
@@ -339,9 +348,13 @@ describe('沙箱越权：工具名档不适用、路径级记忆重新生效（v
       assert.equal(offDir.res, 'allowed-once', '补出的工具名授权没生效（这一档其实两档都写）')
       const toolRow = logRows(b.home).filter((r) => r.kind === 'host-approval' && r.action === 'auto-grant').at(-1)
       assert.equal(toolRow.scope, 'session-tool')
-      // 越权本身仍不吃工具名档（不变量①）
+      // v1.12.7 反转：越权**也**吃补出来的工具名授权（用户裁定「工具档不受越权限制」）。
+      // 改前这条断言的是 `nextCalled === true / 越权吃了补出来的工具名授权`。
       const escOther = await approve(b, s3, { callId: 'ce3', toolName: 'bash', reason: ESC })
-      assert.equal(escOther.nextCalled, true, '越权吃了补出来的工具名授权')
+      assert.equal(escOther.res, 'allowed-once', 'v1.12.7：越权必须也吃补出来的工具名授权')
+      assert.equal(escOther.nextCalled, false)
+      const escOtherRow = logRows(b.home).filter((r) => r.kind === 'host-approval' && r.action === 'auto-grant').at(-1)
+      assert.equal(escOtherRow.scope, 'session-tool')
 
       // ACP 孪生走的是另一条早退门：**同一个根会话键**下路径规则明明覆盖得到它，
       // 它仍然必须弹窗——早退门排在所有档位之前（v1.11.4 语义完全不变）。
@@ -588,19 +601,25 @@ describe('M1：路径级记忆的粒度是**目录**（含直接父目录），�
   const ESC = 'escalate sandbox to read-write: need to write outside the sandbox'
   const bashCall = (callId, file) => [{ callId, name: 'bash', arguments: { command: `cat ${file}` } }]
 
-  it('点一次会话档后：同目录兄弟路径不再弹；换目录仍要问', async () => {
+  it('点一次会话档后：同目录兄弟路径不再弹；换目录仍要问（走**纯路径档**，避开工具名档）', async () => {
+    // v1.12.7：越权现在照吃工具名档，所以本用例必须**只写路径档**才测得到 M1 的目录粒度。
+    // 用「声明目录」形态（body.paths 给了非空数组）——契约「paths 与 tools 互斥」，
+    // 服务端走 `if (useDeclared) addSessionRule(..., { expand: false })` 那条，不写工具名档。
+    const DECLARED = ['/tmp/dad-m1/alpha']
     const b = await boot()
     try {
       const s1 = mkSession({ id: 'R', toolCalls: bashCall('c1', '/tmp/dad-m1/alpha/a.txt') })
       assert.equal((await approve(b, s1, { callId: 'c1', toolName: 'bash', reason: ESC })).nextCalled, true)
-      assert.equal((await postRule(b, { scope: 'session', sessionId: 'R', callId: 'c1', toolName: 'bash' })).status, 200)
+      assert.equal((await postRule(b, { scope: 'session', sessionId: 'R', callId: 'c1', paths: DECLARED })).status, 200)
 
       // ① 同目录的**另一个文件**：越权 ⇒ 目录级记忆覆盖得到 ⇒ 不再弹
       const sib = mkSession({ id: 'R', toolCalls: bashCall('c2', '/tmp/dad-m1/alpha/b.txt') })
       const hit = await approve(b, sib, { callId: 'c2', toolName: 'bash', reason: ESC })
       assert.equal(hit.res, 'allowed-once', '目录级粒度被改成了文件级（M1 语义）')
       const hitRow = logRows(b.home).filter((r) => r.kind === 'host-approval' && r.action === 'auto-grant').at(-1)
-      assert.equal(hitRow.scope, 'session', '兄弟路径的放行必须来自会话**路径**档，不是工具名档（不变量①）')
+      assert.equal(hitRow.scope, 'session',
+        '兄弟路径的放行必须来自会话**路径**档（本用例刻意用声明目录形态避开工具名档；'
+        + '若变成 session-tool，说明「paths 与 tools 互斥」的写入契约被破坏了）')
 
       // ② 子目录（目录前缀语义：/tmp/dad-m1/alpha 覆盖其下任意层级）
       const nested = mkSession({ id: 'R', toolCalls: bashCall('c3', '/tmp/dad-m1/alpha/deep/c.txt') })
@@ -854,7 +873,11 @@ describe('U2（v1.12.6）：body.paths 三态——声明是用户意志，服�
     } finally { await b.close() }
   })
 
-  it('越权 + 删空声明 ⇒ 只写工具名档，但读取侧仍不走那一档（不变量①）', async () => {
+  it('越权 + 删空声明 ⇒ 只写工具名档，且读取侧**现在会消费**它（v1.12.7 不变量①反转）', async () => {
+    // 改前（v1.12.5/1.12.6）这条用例叫「只写工具名档，但读取侧仍不走那一档」，
+    // 断言的是越权请求 next()。用户第三次裁定后：删空目录 = 「只要工具名」，
+    // 而工具名档对越权生效 ⇒ 同一主会话内该工具对任意路径（含工作区外）直接放行。
+    // 改回「读取侧不消费」即本轮裁定的原样复发（用户本机唯一的弹框类别又变回每次都弹）。
     const b = await boot()
     try {
       const s = mkSession({ id: 'R', toolCalls: bashCall('c1', '/tmp/dad-u2-esc2/alpha/a.txt') })
@@ -863,10 +886,23 @@ describe('U2（v1.12.6）：body.paths 三态——声明是用户意志，服�
         scope: 'session', sessionId: 'R', callId: 'c1', toolName: 'bash', paths: [],
       })
       assert.equal(status, 200, '越权请求删空后被拒（工具名档写不出去）')
+      // ① 同一路径的越权 → 被工具名档放行（工具档排在路径档之前 ⇒ 留痕 session-tool）
       const again = mkSession({ id: 'R', toolCalls: bashCall('c2', '/tmp/dad-u2-esc2/alpha/a.txt') })
       const res = await approve(b, again, { callId: 'c2', toolName: 'bash', reason: ESC })
-      assert.equal(res.nextCalled, true, '越权请求吃了工具名档短路 ⇒ 不变量①破了')
-      assert.notEqual(res.res, 'allowed-once')
+      assert.equal(res.res, 'allowed-once', 'v1.12.7：越权请求必须消费工具名档短路')
+      assert.equal(res.nextCalled, false)
+      const row = logRows(b.home).filter((r) => r.kind === 'host-approval' && r.action === 'auto-grant').at(-1)
+      assert.equal(row.scope, 'session-tool')
+      // ② v1.12.7 的语义本体：**换一条完全不同的路径**的越权也放行（任意路径，含工作区外）
+      const other = mkSession({ id: 'R', toolCalls: bashCall('c3', '/outside/workspace/z.txt') })
+      const res2 = await approve(b, other, { callId: 'c3', toolName: 'bash', reason: ESC })
+      assert.equal(res2.res, 'allowed-once', '工具名档的语义是「该工具任意路径」，换个目录就不放行说明语义缩水了')
+      assert.equal(res2.nextCalled, false)
+      // ③ 未授权的**另一个**工具仍然照常弹（工具档不是全放行）
+      const otherTool = mkSession({ id: 'R', toolCalls: [{ callId: 'c4', name: 'write', arguments: { file_path: '/tmp/x.txt' } }] })
+      const miss = await approve(b, otherTool, { callId: 'c4', toolName: 'write', reason: ESC })
+      assert.equal(miss.nextCalled, true, '工具名档放行外溢到了未授权的工具名')
+      assert.notEqual(miss.res, 'allowed-once')
     } finally { await b.close() }
   })
 })
@@ -968,6 +1004,70 @@ describe('审批留痕落盘（v1.12.4：console 之外进决策日志）', () =
       assert.equal(purges[0].isRoot, true)
       assert.equal(purges[0].hadGrants, true)
       assert.equal(purges[0].childMappings, 1)
+    } finally { await b.close() }
+  })
+})
+
+// ── v1.12.7 终审 M1：`paths: null`（＝仅本次放行）与「未给 paths 键」必须严格区分 ──
+//
+// 现场（终审真实端点探针）：
+//   POST {scope:'session',sessionId:'S2',callId:'n1',toolName:'read',paths:null}
+//   ⇒ 200 {ok:true,written:true,scope:'session',paths:['/etc/passwd'],toolName:'read',count:1}
+//   随后同工具任意路径请求被 allowed-once 放行。
+// 根因：`validateDeclaredPaths` 的 `given = Array.isArray(raw)` 把 `null` 判成 given=false
+// ⇒ 落进 legacy 分支（**同时写工具名档与路径档**），语义与「仅本次」正好相反。
+// 现网不可触发（客户端「仅本次」根本不发 POST，见 test/grant-dialog.test.js），属纵深防御。
+describe('v1.12.7 终审 M1：paths:null ⇒ 不写任何档（与「未给 paths 键」严格区分）', () => {
+  const allowlist = (home) => path.join(home, 'data', 'dsh-plugin-product-subagents', 'allowlist.json')
+
+  it('① paths:null ⇒ 不写规则、allowlist.json 不被创建、后续同工具任意路径仍弹', async () => {
+    const b = await boot()
+    try {
+      // 先制造一次真实审批（服务端要能按 callId 反查到上下文，否则 400 会遮蔽本用例的靶子）
+      const s1 = mkSession({ id: 'child-1', parentSession: 'R', toolCalls: writeCall('n1', '/etc/passwd') })
+      assert.equal((await approve(b, s1, { callId: 'n1', toolName: 'read' })).nextCalled, true)
+
+      // 键在且值为 null（客户端「仅本次放行」的显式声明）
+      const nullPost = await postRule(b, { scope: 'session', sessionId: 'child-1', callId: 'n1', toolName: 'read', paths: null })
+      assert.equal(nullPost.status, 200, 'null 是「什么都不写」的合法表达，不该按错误处理')
+      assert.equal(nullPost.json.written, false, 'paths:null 竟然写了规则（落进 legacy 分支＝授权放大）')
+      assert.equal(nullPost.json.paths, null, '响应不得回带服务端自动分析的路径（那是 legacy 分支的痕迹）')
+      // 留痕：这一条是排「用户点了仅本次为什么还是任意路径免弹」的唯一现场证据
+      const rows = logRows(b.home).filter((r) => r.kind === 'host-approval' && r.action === 'rule-none-declared-null')
+      assert.equal(rows.length, 1, 'paths:null 未留痕')
+      assert.equal(rows[0].tool, 'read')
+
+      // 事实优先：同一根下换任意路径的同工具请求**仍然要弹**（没有任何工具名档被写下）
+      const s2 = mkSession({ id: 'child-2', parentSession: 'R', toolCalls: writeCall('n2', '/etc/hosts') })
+      const after = await approve(b, s2, { callId: 'n2', toolName: 'read' })
+      assert.equal(after.nextCalled, true, 'paths:null 之后同工具任意路径被静默放行——工具名档被写下了')
+      assert.notEqual(after.res, 'allowed-once')
+
+      // 项目档同形：paths:null 也**不得**落盘（allowlist.json 连文件都不该建）
+      const p = await postRule(b, { scope: 'project', sessionId: 'child-1', callId: 'n1', toolName: 'read', paths: null })
+      assert.equal(p.status, 200)
+      assert.equal(p.json.written, false)
+      assert.equal(existsSync(allowlist(b.home)), false, 'paths:null 的项目档 POST 建了落盘白名单')
+    } finally { await b.close() }
+  })
+
+  it('② 无 paths 键 ⇒ legacy 行为逐字不变（仍写工具名档）', async () => {
+    const b = await boot()
+    try {
+      const s1 = mkSession({ id: 'child-1', parentSession: 'R', toolCalls: writeCall('c1', '/proj/a.txt') })
+      await approve(b, s1, { callId: 'c1', toolName: 'write' })
+      // **不带** paths 键（老客户端形态）
+      const legacy = await postRule(b, { scope: 'session', sessionId: 'child-1', callId: 'c1', toolName: 'write' })
+      assert.equal(legacy.status, 200)
+      assert.equal(legacy.json.written, true, '无 paths 键必须仍按自动分析写规则（不得被上一条改动波及）')
+      assert.equal(legacy.json.toolName, 'write')
+      assert.equal('paths' in legacy.json, true, 'legacy 分支仍如实回带自动分析的路径')
+
+      // 同根兄弟子会话的**路径外**请求被工具名档放行 ⇒ 工具名档确实写下了
+      const s2 = mkSession({ id: 'child-2', parentSession: 'R', toolCalls: writeCall('c2', '/elsewhere/b.txt') })
+      const sib = await approve(b, s2, { callId: 'c2', toolName: 'write' })
+      assert.equal(sib.res, 'allowed-once', 'legacy 工具名档没写出去（兼容被破坏）')
+      assert.equal(sib.nextCalled, false)
     } finally { await b.close() }
   })
 })

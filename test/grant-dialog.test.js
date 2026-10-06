@@ -169,6 +169,31 @@ function dialogParts(doc) {
   }
 }
 
+/**
+ * v1.12.7 二级选择层。layers 为空数组＝当前没有二级；
+ * opts 顺序固定：[0]「仅本次放行」，[1]「任意路径放行」。
+ */
+function secondLevelParts(doc) {
+  const masks = byClass(doc.body, 'ad-grant-mask')
+  const mask = masks[masks.length - 1]
+  if (!mask) return { layers: [], layer: null, card: null, titles: [], notes: [], opts: [], once: null, all: null, back: null }
+  const layers = byClass(mask, 'ad-grant-2nd')
+  const layer = layers[layers.length - 1] || null
+  const notes = layer ? byClass(layer, 'ad-grant-2nd-note') : []
+  const opts = layer ? byClass(layer, 'ad-grant-2nd-opt') : []
+  return {
+    layers,
+    layer,
+    card: layer ? byClass(layer, 'ad-grant-2nd-card')[0] || null : null,
+    titles: layer ? byClass(layer, 'ad-grant-2nd-title') : [],
+    notes,
+    opts,
+    once: opts[0] || null,
+    all: opts[1] || null,
+    back: layer ? (byClass(layer, 'ad-btn')[0] || null) : null,
+  }
+}
+
 /** 某一组里的目录行（groups[0]=实际触达，groups[1]=文本推测） */
 function rowsOfGroup(group) {
   return byClass(group, 'ad-grant-row').map((box) => ({
@@ -455,11 +480,17 @@ describe('U2 openGrantDialog：确认才生效，取消什么都不发', () => {
     btnCancelAndResolve(mod, p, doc)
   })
 
-  it('会话档 vs 项目档 vs 越权：档位说明各自如实（越权不落盘、不走工具名档）', async () => {
+  it('会话档 vs 项目档 vs 越权：档位说明各自如实（越权不落盘、但**吃**工具名档）', async () => {
     const cases = [
       { o: { projectTier: false }, session: /会话档[\s\S]*不落盘/, project: null, esc: null },
       { o: { projectTier: true }, session: null, project: /项目档[\s\S]*落盘/, esc: null },
-      { o: { projectTier: true, escalation: true }, session: null, project: null, esc: /沙箱越权[\s\S]*只到本会话[\s\S]*不落盘/ },
+      {
+        o: { projectTier: true, escalation: true }, session: null, project: null,
+        esc: /沙箱越权[\s\S]*只到本会话[\s\S]*不落盘/,
+        // v1.12.7：越权的档位说明必须**同时**说清两件仍然成立的事（不落盘 + 危险命令仍问）
+        // 与那件新成立的事（删空目录 = 只记工具名 ⇒ 本会话内任意路径放行）
+        escExtra: [/任意路径放行/, /危险命令[\s\S]*仍会每次询问/],
+      },
     ]
     for (const c of cases) {
       const { mod, doc } = buildGrantModule()
@@ -468,11 +499,22 @@ describe('U2 openGrantDialog：确认才生效，取消什么都不发', () => {
       if (c.session) assert.match(note, c.session)
       if (c.project) assert.match(note, c.project)
       if (c.esc) assert.match(note, c.esc)
+      if (c.escExtra) for (const re of c.escExtra) assert.match(note, re)
       if (c.esc) {
         const { rows, hint } = dialogParts(doc)
         rows[0].chk.checked = false
         rows[0].chk.fire('change')
-        assert.match(hint.textContent, /不走工具名档/, '越权全不勾时必须说清工具名档对它无效（否则是第二次骗人）')
+        // v1.12.7（用户裁定「工具档不受越权限制」）：旧文案「沙箱越权不走工具名档
+        // （读取侧按请求逐条排除）」已经成为假话——越权现在照吃工具档。提示必须改成
+        // 如实口径：删空目录 = 本会话内该工具对任意路径放行（含工作区外）。
+        assert.match(hint.textContent, /本会话内该工具对任意路径放行（含工作区外）/,
+          '越权全不勾时必须说清「删空目录 = 只按工具名记住 ⇒ 任意路径放行」')
+        assert.match(hint.textContent, /危险命令[\s\S]{0,40}仍会每次询问/,
+          '必须同时点明危险命令仍每次都问（否则用户以为连 rm -rf 都放过了）')
+        assert.match(hint.textContent, /不写落盘白名单/,
+          '必须同时点明越权仍不落盘（换会话仍要问）——这是越权唯一保留的约束')
+        assert.doesNotMatch(hint.textContent, /不走工具名档/,
+          'v1.12.7 已失效的旧说法不得回来（面板说谎是用户专门抓到过的问题）')
       }
       btnCancelAndResolve(mod, p, doc)
     }
@@ -506,7 +548,7 @@ describe('U2 openGrantDialog：确认才生效，取消什么都不发', () => {
     const d = await p
     // 末尾斜杠不在客户端剪（客户端不判路径合法性）——服务端 validateDeclaredPaths
     // 归一，两处各剪一次必然出现"一边认一边不认"
-    assert.deepEqual(d, { paths: ['/tmp/a', '/tmp/c/'] })
+    assert.deepEqual(d, { paths: ['/tmp/a', '/tmp/c/'], mode: 'paths' })
     assert.equal(byClass(doc.body, 'ad-grant-mask').length, 0, '确认后遮罩必须撤掉')
   })
 
@@ -619,14 +661,17 @@ describe('U4 两组预填：实际触达默认勾选、文本推测默认不勾�
     const { btnOk } = dialogParts(doc)
     btnOk.click()
     const d = await p
-    assert.deepEqual(d, { paths: SUG }, '未勾选的推测目录不得出现在请求体里')
+    assert.deepEqual(d, { paths: SUG, mode: 'paths' }, '未勾选的推测目录不得出现在请求体里')
     for (const bad of INF) assert.equal(d.paths.includes(bad), false, `${bad} 未勾选却发了出去`)
   })
 
   // ── v1.12.6 第五轮（终审 M-B + 用户裁定）──────────────────────────────
-  it('M-B：非绝对路径（`~` 解析不出）**强制不勾选**，行下给可读提示，且不随确认发出去', async () => {
+  it('M-B：非绝对路径（`~` 拿不到 home 因而解析不出）**强制不勾选**，行下给可读提示，且不随确认发出去', async () => {
     const { mod, doc } = buildGrantModule()
-    // 上游已按 cwd 解析过一轮；`~` 走降级 ⇒ 这里原样进来
+    // 上游已按 cwd 解析过一轮；`~` 因为**没拿到 home** 走降级 ⇒ 这里原样进来。
+    // v1.12.7：本用例**刻意不传 home**，钉的就是「拿不到 home ⇒ 保持旧行为」这一半；
+    // 「拿到 home ⇒ 展开成绝对路径 + 恢复默认勾选」的另一半见
+    // test/invariants-1-12-7.test.js（不变量⑥/⑦）。
     const p = mod.openGrantDialog({
       product: 'qoder', toolName: 'Edit', cwd: '/proj',
       suggestedDirs: ['/proj', '~/.ssh/id_rsa'], inferredDirs: ['~/.ssh/id_rsa.pub'],
@@ -640,11 +685,15 @@ describe('U4 两组预填：实际触达默认勾选、文本推测默认不勾�
     assert.match(warns[0].textContent, /非绝对路径/)
     assert.match(warns[0].textContent, /服务端/)
     assert.match(warns[0].textContent, /不会写入规则/)
-    assert.match(warns[0].textContent, /不展开/, '`~` 的降级原因要写清')
+    // v1.12.7：改前这里断言的是 /不展开/ —— 那句话现在只在「拿不到 home」时为真，
+    // 而且必须点明**原因**是 home 缺失（不然用户以为 `~` 永远不展开，而它其实会展开）。
+    assert.match(warns[0].textContent, /没拿到服务端下发的 home/, '`~` 的降级原因必须说清是「没拿到 home」')
+    assert.match(warns[0].textContent, /`~` 无法展开/, '降级口径：无法展开（不是「不展开」这种一概而论）')
+    assert.doesNotMatch(warns[0].textContent, /服务端也不展开/, '已失效的旧说法不得回来')
     assert.equal(byClass(groups[1], 'ad-grant-rowwarn').length, 1, '第二组的同类行同样要提示')
     btnOk.click()
     const d = await p
-    assert.deepEqual(d, { paths: ['/proj'] }, '没勾选的非绝对路径一条都不许发出去')
+    assert.deepEqual(d, { paths: ['/proj'], mode: 'paths' }, '没勾选的非绝对路径一条都不许发出去')
   })
 
   it('M-B：cwd 缺失时相对路径降级为「原样 + 不勾选」，提示要说明是缺 cwd', async () => {
@@ -673,7 +722,86 @@ describe('U4 两组预填：实际触达默认勾选、文本推测默认不勾�
     rows[0].chk.fire('change')
     btnOk.click()
     const d = await p
-    assert.deepEqual(d, { paths: ['/proj/x.txt'] }, '用户手改成绝对路径后应能正常写入')
+    assert.deepEqual(d, { paths: ['/proj/x.txt'], mode: 'paths' }, '用户手改成绝对路径后应能正常写入')
+  })
+
+  // ── v1.12.7 不变量⑥⑦（弹框层）：`~` 展开基准 = 服务端下发的 home ──
+  //
+  // 服务端在 approval context / /agent-api/active 里下发 `home`（os.homedir()），
+  // 客户端用它把 `~/...` 拼成绝对路径、**恢复默认勾选**；拿不到 home 时保持现状
+  // （原样保留 + 不勾选 + 保留警示，即上面那条 M-B 用例钉的行为）。
+  // 纯函数层（resolveAgainstCwd / dirsOfPaths / absolutizeDirs）在
+  // test/invariants-1-12-7.test.js；这里只钉**用户看得见的那一半**。
+  it('不变量⑥：拿到 home ⇒ `~/...` 预填成绝对路径、默认勾选、提示消失、并随确认发出', async () => {
+    const { mod, doc } = buildGrantModule()
+    // 生产接线（lib/client.js 的两条通道）是「上游先 dirsOfPaths/absolutizeDirs 绝对化，
+    // 再把结果交给弹框」——openGrantDialog 自己不猜路径。这里照同一条链路走。
+    const CWD = '/proj'
+    const HOME = '/home/dev'
+    const sug = mod.dirsOfPaths(['/proj', '~/work/a.txt'], CWD, HOME)
+    const inf = mod.dirsOfPaths(['~/.ssh/id_rsa'], CWD, HOME)
+    assert.deepEqual(sug, ['/proj', '/home/dev/work'], '`~/work/a.txt` 必须拼成 home 下的绝对目录')
+    assert.deepEqual(inf, ['/home/dev/.ssh'])
+    const p = mod.openGrantDialog({ product: 'qoder', toolName: 'Edit', cwd: CWD, home: HOME, suggestedDirs: sug, inferredDirs: inf })
+    const { groups, rows, btnOk } = dialogParts(doc)
+    assert.deepEqual(rows.map((r) => r.dir.value), ['/proj', '/home/dev/work', '/home/dev/.ssh'],
+      '`~` 行必须按服务端下发的 home 拼成绝对目录（与 normalizeCandidate 同源口径）')
+    assert.deepEqual(rows.map((r) => r.chk.checked), [true, true, false],
+      '`~` 展开成功后必须**恢复默认勾选**（展开不出来才强制关闭）；'
+      + '第三行是「文本推测」组，按 v1.12.6 U4 的既定语义本来就不默认勾选，与 `~` 无关')
+    assert.equal(rows[0].chk.checked, true)
+    assert.equal(rows[1].chk.checked, true, '`~/work/a.txt`（实际触达组）展开成绝对目录后必须恢复勾选')
+    assert.equal(byClass(groups[0], 'ad-grant-rowwarn').length, 0, '展开成功后那行的降级提示必须消失')
+    assert.equal(byClass(groups[1], 'ad-grant-rowwarn').length, 0, '`~` 展开成功后推论组那行同样不该有降级提示')
+    btnOk.click()
+    const d = await p
+    assert.deepEqual(d, { paths: ['/proj', '/home/dev/work'], mode: 'paths' }, '展开后的绝对路径必须随确认发出去')
+  })
+
+  it('不变量⑥：cwd 缺失也不影响 `~` 展开（ACP/琥珀通道恒无 cwd）', async () => {
+    const { mod, doc } = buildGrantModule()
+    // 琥珀通道：产品侧不透传 cwd，本插件只补了 home。`~` 的基准是 home、与 cwd 无关，
+    // 所以这里必须能展开；cwd 缺失只该影响**相对路径**（下一行）。
+    const sug = mod.absolutizeDirs(['~/.ssh/id_rsa'], null, '/home/dev')
+    const rel = mod.absolutizeDirs(['./x.txt'], null, '/home/dev')
+    assert.deepEqual(sug, ['/home/dev/.ssh/id_rsa'], '`~` 的基准是 home、与 cwd 无关（琥珀通道的 home 不该白带）')
+    assert.deepEqual(rel, ['./x.txt'], '对照：相对路径缺 cwd 时仍原样保留（不猜）')
+    const p = mod.openGrantDialog({ toolName: 'Bash', home: '/home/dev', suggestedDirs: [...sug, ...rel] })
+    const { groups, rows, btnOk } = dialogParts(doc)
+    assert.deepEqual(rows.map((r) => r.dir.value), ['/home/dev/.ssh/id_rsa', './x.txt'])
+    assert.deepEqual(rows.map((r) => r.chk.checked), [true, false], '只有 `~` 那行恢复勾选，相对路径行仍然强制关闭')
+    assert.equal(byClass(groups[0], 'ad-grant-rowwarn').length, 1, '缺 cwd 的相对路径行仍要有警示')
+    btnOk.click()
+    assert.deepEqual(await p, { paths: ['/home/dev/.ssh/id_rsa'], mode: 'paths' })
+  })
+
+  it('不变量⑦：拿不到 home ⇒ 原样保留 + 不勾选 + 保留警示，且不随确认发出', async () => {
+    const { mod, doc } = buildGrantModule()
+    const p = mod.openGrantDialog({ toolName: 'Edit', cwd: '/proj', home: null, suggestedDirs: ['~/.ssh/id_rsa'] })
+    const { groups, rows, btnOk } = dialogParts(doc)
+    assert.deepEqual(rows.map((r) => r.dir.value), ['~/.ssh/id_rsa'], '拿不到 home 时 `~` 必须原样保留（绝不猜）')
+    assert.equal(rows[0].chk.checked, false, '拿不到 home 时不得默认勾选')
+    const warn = byClass(groups[0], 'ad-grant-rowwarn')[0]
+    assert.ok(warn, '拿不到 home 的降级行必须给提示')
+    assert.match(warn.textContent, /本次没拿到服务端下发的 home/)
+    assert.match(warn.textContent, /不会写入规则/)
+    btnOk.click()
+    // v1.12.7：一行都没勾 ⇒ 确认先进二级选择（改前这里直接发 `{paths:[]}`）。
+    const lv2 = secondLevelParts(doc)
+    assert.equal(lv2.layers.length, 1)
+    lv2.once.click()
+    assert.deepEqual(await p, { paths: null, mode: 'once' }, '没勾选的非绝对路径一条都不许发出去')
+  })
+
+  it('不变量⑦：`~user/…`（别人的 home）不展开，走同一条降级', async () => {
+    const { mod, doc } = buildGrantModule()
+    const p = mod.openGrantDialog({ toolName: 'Edit', home: '/home/dev', suggestedDirs: ['~root/.ssh'] })
+    const { groups, rows } = dialogParts(doc)
+    assert.deepEqual(rows.map((r) => r.dir.value), ['~root/.ssh'])
+    assert.equal(rows[0].chk.checked, false)
+    assert.match(byClass(groups[0], 'ad-grant-rowwarn')[0].textContent, /`~user\/…` 不展开/)
+    dialogParts(doc).btnCancel.click()
+    await p
   })
 
   it('勾选一个推测项 ⇒ 它才作为 paths 元素发出；取消勾选立刻消失', async () => {
@@ -698,25 +826,141 @@ describe('U4 两组预填：实际触达默认勾选、文本推测默认不勾�
     assert.deepEqual((await p2).paths, SUG, '勾上又取消 ⇒ 不得残留在提交结果里')
   })
 
-  it('两组都清空 ⇒ 发出 paths: []（＝只要工具名档）', async () => {
+  it('两组都清空 ⇒ 先弹二级选择；选「仅本次」⇒ paths:null/mode:once，选「任意路径」⇒ paths:[]/mode:tools', async () => {
+    // v1.12.7 改写（用户裁定）：改前这里直接断言 `{paths: []}`（＝确认即按工具名档提交）。
+    // 现在确认只**打开二级选择**，落哪一档由用户在二级里明确选。
     for (const how of ['uncheck', 'delete']) {
+      for (const pick of ['once', 'tools']) {
+        const { mod, doc } = buildGrantModule()
+        const p = mod.openGrantDialog({ product: 'qoder', toolName: 'Bash', suggestedDirs: SUG, inferredDirs: INF })
+        const { rows, btnOk } = dialogParts(doc)
+        if (how === 'uncheck') {
+          for (const r of rows) { r.chk.checked = false; r.chk.fire('change') }
+        } else {
+          for (const r of [...rows].reverse()) r.del.click()
+        }
+        assert.match(dialogParts(doc).hint.textContent, /一条都没勾/)
+        assert.match(dialogParts(doc).hint.className, /warn/)
+        assert.equal(how === 'uncheck' ? rows.length : dialogParts(doc).rows.length, how === 'uncheck' ? 5 : 0)
+        btnOk.click()
+        // 一级弹框**没有**被关掉：二级是叠在它上面的
+        assert.equal(byClass(doc.body, 'ad-grant-mask').length, 1, '二级不是新开一个遮罩，而是叠在同一个遮罩里')
+        const lv2 = secondLevelParts(doc)
+        assert.equal(lv2.layers.length, 1, `${how}/${pick}：确认后必须出现二级选择`)
+        if (pick === 'once') lv2.once.click()
+        else lv2.all.click()
+        const d = await p
+        assert.deepEqual(d, pick === 'once'
+          ? { paths: null, mode: 'once' }
+          : { paths: [], mode: 'tools' }, `${how}/${pick}：二级选择的载荷形状不符`)
+      }
+    }
+  })
+
+  it('二级选择：取消 / Esc / 点二级遮罩 ⇒ 回到一级，什么都没决定（不提交、不写规则）', async () => {
+    for (const how of ['back', 'esc', 'layer']) {
       const { mod, doc } = buildGrantModule()
       const p = mod.openGrantDialog({ product: 'qoder', toolName: 'Bash', suggestedDirs: SUG, inferredDirs: INF })
       const { rows, btnOk } = dialogParts(doc)
-      if (how === 'uncheck') {
-        for (const r of rows) { r.chk.checked = false; r.chk.fire('change') }
-      } else {
-        for (const r of [...rows].reverse()) r.del.click()
+      for (const r of rows) { r.chk.checked = false; r.chk.fire('change') }
+      btnOk.click()
+      assert.equal(secondLevelParts(doc).layers.length, 1)
+      if (how === 'back') secondLevelParts(doc).back.click()
+      else if (how === 'esc') doc.fire('keydown', { key: 'Escape' })
+      else {
+        const l = secondLevelParts(doc).layer
+        l.fire('click', { target: l })
       }
-      assert.match(dialogParts(doc).hint.textContent, /一条都没勾/)
-      assert.match(dialogParts(doc).hint.className, /warn/)
-      // 行数要在**关框前**读：btnOk.click() 之后遮罩已被 finish() 撤掉，
-      // 此时再 dialogParts() 只会得到「遮罩应恰好 1 个，实际 0」的假失败。
-      assert.equal(how === 'uncheck' ? rows.length : dialogParts(doc).rows.length, how === 'uncheck' ? 5 : 0)
+      assert.equal(secondLevelParts(doc).layers.length, 0, `${how}：二级应当关闭`)
+      // ★ 关键：一级弹框**还开着**（Esc 不能被二级吞掉后连一级一起关），Promise 仍未决议
+      assert.equal(byClass(doc.body, 'ad-grant-mask').length, 1, `${how}：一级弹框被一起关掉了（用户没法改选）`)
+      assert.equal(dialogParts(doc).rows.length > 0, true)
+      let settled = false
+      p.then(() => { settled = true }, () => { settled = true })
+      await new Promise((r) => setTimeout(r, 5))
+      assert.equal(settled, false, `${how}：二级取消竟然提交了决策（什么都没决定才是对的）`)
+      // 回到一级还能正常走完：改勾一行 ⇒ 直接按路径档提交
+      dialogParts(doc).rows[0].chk.checked = true
+      dialogParts(doc).rows[0].chk.fire('change')
       btnOk.click()
       const d = await p
-      assert.deepEqual(d, { paths: [] }, `${how}：必须发空数组（契约里空数组＝只要工具名，不能省略该键）`)
+      assert.equal(d.mode, 'paths')
     }
+  })
+
+  it('二级选择必须说清后果：任意路径 = 该工具任意路径放行 + 危险命令仍问 + 写明落盘与否', async () => {
+    const session = buildGrantModule()
+    const p1 = session.mod.openGrantDialog({ product: 'qoder', toolName: 'Bash', projectTier: false, suggestedDirs: ['/tmp/x'] })
+    dialogParts(session.doc).rows[0].chk.checked = false
+    dialogParts(session.doc).rows[0].chk.fire('change')
+    dialogParts(session.doc).btnOk.click()
+    const lv2 = secondLevelParts(session.doc)
+    const allTxt = lv2.all.textContent + ' ' + lv2.notes.map((n) => n.textContent).join(' ')
+    assert.match(allTxt, /任意路径/, '必须点明「任意路径」')
+    assert.match(allTxt, /含工作区外/, '必须点明含工作区外')
+    assert.match(allTxt, /危险命令[\s\S]{0,80}仍会每次询问/, '必须点明危险命令仍每次都问')
+    assert.match(allTxt, /不落盘|本会话/, '必须写明这一档的落盘语义')
+    assert.match(lv2.once.textContent, /都不写|仅本次|只放行/, '「仅本次放行」必须说清「什么都不写」')
+    lv2.once.click()
+    assert.deepEqual(await p1, { paths: null, mode: 'once' })
+
+    // 落盘档（琥珀通道 allow-always）：文案必须改成「落盘」而不是「不落盘」
+    const disk = buildGrantModule()
+    const p2 = disk.mod.openGrantDialog({ product: 'qoder', toolName: 'Bash', projectTier: true, toolTierDisk: true, suggestedDirs: ['/tmp/x'] })
+    dialogParts(disk.doc).rows[0].chk.checked = false
+    dialogParts(disk.doc).rows[0].chk.fire('change')
+    dialogParts(disk.doc).btnOk.click()
+    const lv2b = secondLevelParts(disk.doc)
+    const txt2 = lv2b.all.textContent + ' ' + lv2b.notes.map((n) => n.textContent).join(' ')
+    assert.match(txt2, /落盘|跨会话/, 'toolTierDisk=true 时必须说清落盘，不能说成「不落盘」')
+    assert.match(txt2, /危险命令[\s\S]{0,80}仍会每次询问/)
+    lv2b.all.click()
+    assert.deepEqual(await p2, { paths: [], mode: 'tools' })
+
+    // 宿主通道的项目档：工具名档**没有**落盘档 ⇒ 必须点明「要落盘请填目录」
+    const hostProject = buildGrantModule()
+    const p3 = hostProject.mod.openGrantDialog({ product: 'qoder', toolName: 'Bash', projectTier: true, toolTierDisk: false, suggestedDirs: ['/tmp/x'] })
+    dialogParts(hostProject.doc).rows[0].chk.checked = false
+    dialogParts(hostProject.doc).rows[0].chk.fire('change')
+    dialogParts(hostProject.doc).btnOk.click()
+    const txt3 = secondLevelParts(hostProject.doc).notes.map((n) => n.textContent).join(' ')
+    assert.match(txt3, /宿主通道的工具名档只有会话级/, '宿主项目档必须如实说「工具名档不落盘」')
+    secondLevelParts(hostProject.doc).once.click()
+    await p3
+  })
+
+  it('二级选择：解析不出工具名 ⇒ 「任意路径」不可点（并给出原因），只剩「仅本次」', async () => {
+    const { mod, doc } = buildGrantModule()
+    const p = mod.openGrantDialog({ product: 'qoder', suggestedDirs: ['/tmp/x'] }) // 不给 toolName
+    const { rows, btnOk } = dialogParts(doc)
+    rows[0].chk.checked = false
+    rows[0].chk.fire('change')
+    assert.match(dialogParts(doc).hint.textContent, /解析不出工具名/)
+    btnOk.click()
+    const lv2 = secondLevelParts(doc)
+    assert.equal(lv2.opts.length, 2, '两个选项都要渲染出来（藏起来用户会以为是自己点错了）')
+    assert.equal(lv2.once.disabled, false)
+    assert.equal(lv2.all.disabled, true, '没有工具名时「任意路径」必须不可点——工具名档没有可写的键')
+    assert.match(lv2.notes.map((n) => n.textContent).join(' '), /解析不出工具名 ⇒ 工具名档无从谈起/)
+    lv2.once.click()
+    assert.deepEqual(await p, { paths: null, mode: 'once' })
+  })
+
+  it('二级选择：全非法行（不可拼绝对路径）也走同一条路 —— 「仅本次」不回传那批非法路径', async () => {
+    const { mod, doc } = buildGrantModule()
+    // 全部行都是非绝对路径（没有 cwd/home ⇒ 拼不出来）⇒ 勾选集恒为空
+    const p = mod.openGrantDialog({ toolName: 'Edit', suggestedDirs: ['./a.txt', '~/.ssh/id_rsa'] })
+    const { rows, btnOk } = dialogParts(doc)
+    assert.deepEqual(rows.map((r) => r.chk.checked), [false, false], '前置：非法行强制不勾选')
+    btnOk.click()
+    const lv2 = secondLevelParts(doc)
+    assert.equal(lv2.layers.length, 1, '全非法也必须进二级，而不是静默按工具档提交')
+    assert.match(lv2.once.title + lv2.all.title + lv2.notes.map((n) => n.textContent).join(' '), /./)
+    lv2.once.click()
+    const d = await p
+    assert.deepEqual(d, { paths: null, mode: 'once' },
+      '「仅本次」必须是 paths:null —— 回传那批非法路径会落到服务端「给了非空但全被丢弃」的拒写出口')
+    assert.equal(d.paths, null, '绝不允许把非法路径当数组回传')
   })
 
   it('推测档里与实触达档重名的那条不重复出现（同一目录不能两处两个勾选状态）', async () => {
@@ -763,10 +1007,14 @@ describe('U4 两组预填：实际触达默认勾选、文本推测默认不勾�
     const at = src.indexOf('function openGrantDialog(opts) {')
     assert.ok(at > 0, 'openGrantDialog 定义丢失')
     const body = src.slice(at, src.indexOf('\n    // 返回一跳', at))
-    assert.match(body, /finish\(\{ paths: collect\(\) \}\)/,
-      '确认必须发 collect()（勾选行），不能发预填数组')
+    // v1.12.7 改写：确认载荷仍是 collect()（勾选行）的结果，但现在经 `picked` 变量中转，
+    // 且非空时才按路径档提交（空集 ⇒ 先弹二级选择，见下一条断言）。
+    assert.match(body, /const picked = collect\(\);[\s\S]{0,200}if \(picked\.length > 0\) \{ finish\(\{ paths: picked, mode: "paths" \}\); return; \}/,
+      '确认必须发 collect()（勾选行）的结果，不能发预填数组')
     assert.match(body, /const checkedRows = \(\) => rows\.filter\(\(r\) => r\.chk\.checked\);/,
       'collect 必须以勾选状态为准')
+    assert.match(body, /btnOk\.addEventListener\("click", \(ev\) => \{ ev\.stopPropagation\(\); openSecondLevel\(\); \}\)/,
+      '空集必须落到二级选择（确认键一律先走 openSecondLevel，不得自己拼一个默认档）')
     assert.doesNotMatch(body, /finish\(\{ paths: suggested/, '不得把第一组预填原样发出（勾选才是语义）')
     assert.doesNotMatch(body, /finish\(\{ paths: [^\n]*concat/, '不得把推测档并进发出结果')
     assert.equal((src.match(/function openGrantDialog\(/g) || []).length, 1, '弹框实现出现第二份（必然漂移）')
@@ -889,17 +1137,75 @@ describe('U2 宿主通道（蓝球）：grantViaDialog 行为——取消零 POS
     assert.equal(r.removed.length, 1)
   })
 
-  it('删空确认 ⇒ paths:[] 原样发出（契约：空数组＝只要工具名档）', async () => {
-    const r = build({ escalation: false, openGrantDialog: () => Promise.resolve({ paths: [] }) })
+  it('二级选「仅本次放行」⇒ 零 POST、本次放行、条目收起（一条规则都不写）', async () => {
+    // v1.12.7 改写（用户裁定）：改前这里是「删空确认 ⇒ paths:[] 原样发出」——
+    // 空数组在服务端的语义恰好是「只写工具名档」＝把授权放大到整个工具，用户明确否掉了它。
+    const r = build({ escalation: false, openGrantDialog: () => Promise.resolve({ paths: null, mode: 'once' }) })
+    assert.equal(await r.run('session'), 'allowed-once', '「仅本次」必须如实告诉按钮：只放行这一次')
+    assert.deepEqual(r.posts, [], '一条规则都不许写（不写路径档、不写工具档、不落盘）')
+    assert.deepEqual(r.answers, ['allowed-once'], '只放行本次')
+    assert.equal(r.removed.length, 1, '条目照常收起')
+  })
+
+  it('二级选「任意路径」⇒ 显式 paths:[] + toolName（会话档键用根会话）', async () => {
+    const r = build({ escalation: false, openGrantDialog: () => Promise.resolve({ paths: [], mode: 'tools' }) })
     await r.run('session')
-    assert.deepEqual(r.posts[0].payload.paths, [], '空数组必须照发，不许省略、不许回退成自动分析')
-    assert.ok('paths' in r.posts[0].payload)
+    assert.deepEqual(r.posts[0].payload, {
+      scope: 'session', sessionId: 'root-1', callId: 'call-1', paths: [], toolName: 'bash',
+    }, '空数组必须照发（显式声明＝只要工具名档），且必须带 toolName —— 缺 key 服务端会 400')
+    assert.deepEqual(r.answers, ['allowed-once'], '写规则管的是**下一次**；本次仍然只放行一次（沿用 1.12.5 行为）')
+  })
+
+  it('二级选「任意路径」的项目档也必须带 toolName（改前只在会话档带）', async () => {
+    const r = build({ escalation: false, openGrantDialog: () => Promise.resolve({ paths: [], mode: 'tools' }) })
+    await r.run('project')
+    assert.deepEqual(r.posts[0].payload, {
+      scope: 'project', sessionId: 'sess-1', callId: 'call-1', paths: [], toolName: 'bash', cwd: '/tmp/proj',
+    }, '工具名档靠 toolName 定位工具；项目档缺它就是「写了个没有键的档」')
+  })
+
+  it('全链路：一行都不勾 ⇒ 真弹框里点「仅本次放行」⇒ 零 POST；点「任意路径」⇒ paths:[]+toolName', async () => {
+    for (const pick of ['once', 'tools']) {
+      const { mod, doc } = buildGrantModule()
+      const posts = []
+      const answers = []
+      const item = {
+        callId: 'call-1', sessionId: 'sess-1', rootSessionId: 'root-1', toolName: 'Edit',
+        cwd: '/tmp/p7', paths: ['/tmp/p7/alpha/a.txt'],
+        answer: async (a) => { answers.push(a) },
+      }
+      const handler = new Function('openGrantDialog', 'dirsOfPaths', 'escalation', 'apiPost', 'item', 'removeItem',
+        'return (' + code + ')')(
+        mod.openGrantDialog, realDirsOfPaths, false,
+        (url, payload) => { posts.push({ url, payload }); return Promise.resolve({}) }, item, () => {},
+      )
+      const run = handler('session')()
+      const { rows, btnOk } = dialogParts(doc)
+      for (const r of rows) { r.chk.checked = false; r.chk.fire('change') }
+      assert.match(dialogParts(doc).hint.textContent, /点「确认」时会让你再选一次/, '一级提示必须预告二级选择')
+      btnOk.click()
+      const lv2 = secondLevelParts(doc)
+      assert.equal(lv2.layers.length, 1, `${pick}：确认必须先进二级选择`)
+      if (pick === 'once') lv2.once.click()
+      else lv2.all.click()
+      await run
+      if (pick === 'once') {
+        assert.deepEqual(posts, [], '「仅本次」绝不能发 POST')
+        assert.deepEqual(answers, ['allowed-once'])
+      } else {
+        assert.equal(posts.length, 1)
+        assert.deepEqual(posts[0].payload.paths, [])
+        assert.equal(posts[0].payload.toolName, 'Edit', '工具名档必须带 toolName')
+        assert.deepEqual(answers, ['allowed-once'], '写规则管下一次；本次照样只放行一次')
+      }
+    }
   })
 
   it('项目档 ⇒ scope=project + cwd，sessionId 用条目自身（与 1.12.5 载荷一致）', async () => {
     const r = build({ escalation: true, openGrantDialog: (o) => {
       assert.equal(o.escalation, true, '越权标志必须传进弹框，否则档位说明会说谎')
-      return Promise.resolve({ paths: ['/tmp/proj'] })
+      assert.equal(o.toolTierDisk, false, '宿主通道没有落盘工具名档，必须如实透给弹框')
+      return Promise.resolve({ paths: ['/tmp/proj'], mode: 'paths' })
     } })
     await r.run('project')
     assert.deepEqual(r.posts[0].payload, {
@@ -917,7 +1223,7 @@ describe('U2 宿主通道（蓝球）：grantViaDialog 行为——取消零 POS
     const removed = []
     const handler = new Function('openGrantDialog', 'dirsOfPaths', 'escalation', 'apiPost', 'item', 'removeItem',
       'return (' + code + ')')(
-      () => Promise.resolve({ paths: ['/x'] }), realDirsOfPaths, false,
+      () => Promise.resolve({ paths: ['/x'], mode: 'paths' }), realDirsOfPaths, false,
       () => Promise.reject(new Error('400')),
       {
         callId: 'c', sessionId: 's', rootSessionId: 'r', toolName: 'bash', paths: [],
@@ -969,16 +1275,57 @@ describe('U2 琥珀通道：sendDecision 按契约透传 paths（不传＝产品
     assert.deepEqual(posts[2].payload.paths, [], '空数组是"只要工具名"的显式声明，不能被当成没传')
   })
 
+  it('二级选择：琥珀接线行为——「仅本次」回 allow-once 且**不带** paths；否则原样透传', async () => {
+    // 从真源码里抠出琥珀 `.then((d) => {…})` 回调，注入桩 sendDecision 实跑：
+    // 断言的是「二级选了什么 ⇒ 发出什么」，不是文本长得像。
+    const at = src.indexOf('.then((d) => {\n                if (!d) return;')
+    assert.ok(at > 0, '琥珀弹框回调锚点丢失（接线被改写？）')
+    const endAnchor = 'sendDecision(a, answer, label, d.paths);'
+    const end = src.indexOf(endAnchor, at)
+    assert.ok(end > at, '琥珀回调里找不到 sendDecision(...d.paths) 调用')
+    const expr = src.slice(at + '.then('.length, end + endAnchor.length) + '\n              }'
+    const calls = []
+    const fn = new Function('sendDecision', 'answer', 'label', 'a', 'return (' + expr + ')')
+    // 记录**实参个数**：`sendDecision(a, answer, label)` 与 `(…, d.paths)` 在契约上是两件事
+    const decide = fn((...args) => calls.push({ ans: args[1], lab: args[2], paths: args[3], hasPaths: args.length > 3 }),
+      'allow-session', '本会话允许', { childId: 'c' })
+
+    await decide(null)
+    assert.deepEqual(calls, [], '取消 ⇒ 什么都不发')
+    await decide({ paths: null, mode: 'once' })
+    assert.deepEqual(calls, [{ ans: 'allow-once', lab: '仅本次放行', paths: undefined, hasPaths: false }],
+      '「仅本次放行」⇒ allow-once 且**不传** paths（传空数组会落到产品侧 mode:tools＝工具名档）')
+    calls.length = 0
+    await decide({ paths: [], mode: 'tools' })
+    assert.deepEqual(calls, [{ ans: 'allow-session', lab: '本会话允许', paths: [], hasPaths: true }],
+      '「任意路径」⇒ 显式空数组原样透传（产品侧据此写工具名档）')
+    calls.length = 0
+    await decide({ paths: ['/tmp/a'], mode: 'paths' })
+    assert.deepEqual(calls, [{ ans: 'allow-session', lab: '本会话允许', paths: ['/tmp/a'], hasPaths: true }],
+      '勾了目录 ⇒ 用户声明的 paths 原样透传（老行为一字未改）')
+  })
+
   it('琥珀「记住类」按钮先弹框后决策，取消什么都不发（源码接线）', () => {
     const from = src.indexOf('const mkBtn = (label, answer, cls, tip, grant) => {')
     assert.ok(from >= 0, '琥珀球 mkBtn 定义锚点丢失')
     const amberBtns = src.slice(from, src.indexOf('mkBtn("拒绝", "deny", "danger"'))
     assert.equal((amberBtns.match(/\{ projectTier: (?:false|true) \}/g) || []).length, 2,
       '只有两个「记住类」按钮挂 grant，允许一次/拒绝不弹框')
-    assert.match(amberBtns, /openGrantDialog\(\{[\s\S]{0,400}\}\)\.then\(\(d\) => \{\s*if \(!d\) return;\s*sendDecision\(a, answer, label, d\.paths\);/,
+    assert.match(amberBtns, /openGrantDialog\(\{[\s\S]{0,900}\}\)\.then\(\(d\) => \{\s*if \(!d\) return;[\s\S]{0,700}sendDecision\(a, answer, label, d\.paths\);/,
       '确认后才 sendDecision，且带用户声明的 paths')
-    assert.match(amberBtns, /Array\.isArray\(p\.suggestedDirs\) && p\.suggestedDirs\.length > 0[\s\S]{0,160}\? absolutizeDirs\(p\.suggestedDirs, amberCwd\)[\s\S]{0,80}: dirsOfPaths\(p\.paths, amberCwd\)/,
+    // v1.12.7（用户裁定）：二级选择「仅本次放行」必须回 allow-once 且**不带 paths**。
+    assert.match(amberBtns, /if \(d\.mode === "once"\) \{ sendDecision\(a, "allow-once", "仅本次放行"\); return; \}/,
+      '「仅本次放行」⇒ allow-once 且不带 paths（带空数组会落到产品侧 mode:tools＝工具名档）')
+    assert.match(amberBtns, /toolTierDisk: grant\.projectTier === true,/,
+      '琥珀通道必须把「工具名档是否落盘」透给弹框（allow-always ⇒ 落盘档）')
+    assert.match(amberBtns, /Array\.isArray\(p\.suggestedDirs\) && p\.suggestedDirs\.length > 0[\s\S]{0,160}\? absolutizeDirs\(p\.suggestedDirs, amberCwd, amberHome\)[\s\S]{0,80}: dirsOfPaths\(p\.paths, amberCwd, amberHome\)/,
       'ACP 通道优先用产品侧 suggestedDirs（只补绝对化、不套文件形态），缺才退回本地词法目录化')
+    // v1.12.7：`~` 展开基准必须从行载荷（/agent-api/active 逐行下发的 home）读出来、
+    // 并透给两个词法函数与弹框本身；漏一个 ⇒ ACP 通道的 `~` 行退回「原样 + 不勾选 + 警示」。
+    assert.match(amberBtns, /const amberHome = typeof p\.home === "string" && p\.home\.trim\(\) \? p\.home\.trim\(\) : null;/,
+      'ACP 通道必须从 p.home 取 `~` 展开基准（产品侧不透传 cwd/home，前端也拿不到 os.HOME）')
+    assert.match(amberBtns, /home: amberHome,/,
+      '展开基准必须一并传给弹框，否则弹框在实时重算提示时判不出 `~` 已展开')
     assert.doesNotMatch(amberBtns, /sendDecision\(a, answer, label\);\s*\n\s*\}\);\s*\n\s*openGrantDialog/,
       '不得出现"先发决策再弹框"的接线')
   })

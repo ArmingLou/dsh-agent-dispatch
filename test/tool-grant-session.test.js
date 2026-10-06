@@ -76,8 +76,12 @@ describe('isAcpTwinApproval', () => {
 // ── 纯函数：综合判据 isDisallowedAutoGrant ──
 
 describe('isDisallowedAutoGrant', () => {
-  it('沙箱越权 → 不允许直放', () => {
-    assert.equal(isDisallowedAutoGrant('bash', 'escalate sandbox to read-write: need write'), true)
+  // v1.12.7（用户裁定「工具档不受越权限制」）：这条判据被**拆开**——越权不再算
+  // 「不得用工具名档」，只剩 ACP 孪生一种来源（孪生上面还有更早的 return next()
+  // 早退门 ⇒ 生产路径上恒 false，留着是防御性冗余）。越权的唯一约束改为
+  // decide 的 sessionOnly（不写落盘项目档）。
+  it('沙箱越权 → **允许**直放（v1.12.7 拆开判据，工具档不再逐请求排除越权）', () => {
+    assert.equal(isDisallowedAutoGrant('bash', 'escalate sandbox to read-write: need write'), false)
   })
   it('ACP 孪生 → 不允许直放', () => {
     assert.equal(isDisallowedAutoGrant('product_submit', '[ACP qoder] 请求权限'), true)
@@ -172,8 +176,10 @@ describe('HostApprovalRules tool grants', () => {
     assert.equal(d.allowed, false)
   })
 
-  it('沙箱越权 → isDisallowedAutoGrant 返回 true', () => {
-    assert.equal(isDisallowedAutoGrant('bash', 'escalate sandbox to read-write: need write'), true)
+  it('沙箱越权 → isDisallowedAutoGrant 返回 false（v1.12.7：越权照吃工具名档）', () => {
+    assert.equal(isDisallowedAutoGrant('bash', 'escalate sandbox to read-write: need write'), false)
+    // 判据仍必须能识别越权本身——它只是不再关工具档，改为管 decide 的 sessionOnly
+    assert.equal(isSandboxEscalation('escalate sandbox to read-write: need write'), true)
   })
 
   it('同一根会话的兄弟子代理共享工具名授权', () => {
@@ -723,6 +729,11 @@ describe('真实审批监听器集成判定（index.js 的 ctx.on("approval/requ
     // 引用的**常量**（不是被调用的函数，所以 handlerNameDrift() 抓不到它）。
     // 漏登记的后果同样是 ReferenceError 被 handler 的 try/catch 吞掉 ⇒ 退化成放行。
     'COMMAND_TOO_LONG_RULE',
+    // v1.12.7（拆开判据 + 解耦 sessionOnly）：handler 体新增了 `isSandboxEscalation(...)`
+    // 这**第二个**判据调用点（`const sessionOnly = isSandboxEscalation(ctxInfo.reason)`）。
+    // 不登记就会被 try/catch 吞成 next()，于是「本该 allowed-once」的越权用例集体假红
+    // —— 本轮实测正是这个症状（②⑧⑨⑫ 一起红，看着像判定逻辑坏了）。
+    'isSandboxEscalation',
   ]
 
   /** 从 handler 体扒出「被当函数调用」的标识符，返回不在注入表里的那些 */
@@ -751,6 +762,7 @@ describe('真实审批监听器集成判定（index.js 的 ctx.on("approval/requ
       dangerousCommandMatch,
       boundDangerText, MAX_DANGER_TEXT_CHARS,
       COMMAND_TOO_LONG_RULE,
+      isSandboxEscalation,
       hostApproval, dispatcher, () => {},
     )
   }
@@ -809,13 +821,14 @@ describe('真实审批监听器集成判定（index.js 的 ctx.on("approval/requ
     assert.equal(nextCalled, false)
   })
 
-  it('② 已授权 bash + 越权 reason（路径可解析、未被路径规则覆盖）→ next()，不放行', async () => {
+  it('② 已授权 bash + 越权 reason（路径可解析、未被路径规则覆盖）→ allowed-once（v1.12.7 工具档不再排除越权）', async () => {
     const hostApproval = new HostApprovalRules()
     hostApproval.addToolGrant('root-1', 'bash')
     // v1.12.5：带上真实 tool/call 记录。原用例的 session 没有 toolCalls ⇒
     // resolveApprovalContext 解析不出任何路径 ⇒ handler 在「paths 为空」那条就
     // return next()，根本没走到排除门，断言等于在测一条无关分支。补记录后
-    // paths 非空、路径规则为空，next() 只能由「越权不吃工具名短路」解释。
+    // paths 非空、路径规则为空 —— v1.12.7 之前 next() 只能由「越权不吃工具名短路」
+    // 解释；拆开判据之后越权照吃工具名档 ⇒ allowed-once（本用例随裁定反转）。
     const session = mkSession('child-1', 'root-1', [
       { callId: 'call-1', name: 'bash', arguments: JSON.stringify({ command: 'cat /tmp/proj/a.txt' }) },
     ])
@@ -826,8 +839,8 @@ describe('真实审批监听器集成判定（index.js 的 ctx.on("approval/requ
       session, callId: 'call-1', toolName: 'bash',
       reason: 'escalate sandbox to danger-full-access: need unrestricted access',
     })
-    assert.equal(nextCalled, true)
-    assert.notEqual(result, 'allowed-once')
+    assert.equal(result, 'allowed-once', 'v1.12.7：越权请求必须消费工具名档')
+    assert.equal(nextCalled, false)
   })
 
   it('③ 已授权 product_submit + [ACP ...] reason → next()', async () => {
@@ -910,12 +923,16 @@ describe('真实审批监听器集成判定（index.js 的 ctx.on("approval/requ
     assert.notEqual(result, 'allowed-once')
   })
 
-  // ── v1.12.5（用户裁定）：越权的排除门按档位拆分 ──
+  // ── v1.12.5（用户裁定）：越权的排除门按档位拆分；v1.12.7 第三次裁定再收窄 ──
   // 1.12.x 把「沙箱越权」做成了无条件 return next()，读取侧连路径档一起废掉 ⇒
   // 用户在某个目录点过一次「总是允许」后，同一路径的越权仍然每次都弹。
-  // 裁定：越权**只**不适用工具名级授权，路径级记忆必须与 v1.11.24 等价。
-  // 下面四条钉的是这三条不变式：①越权不吃工具名短路、②路径规则对越权生效、
-  // ③非越权零变化（外加 ACP 孪生的早退门必须仍然先于所有档位）。
+  // v1.12.5 恢复路径档，但**同时把越权从工具名档里逐请求排除**——副作用是
+  // 「点过一次本会话总是允许该工具」写下的工具名授权永远读不到，用户本机几乎只有
+  // 越权这一类弹框 ⇒ 工具名档在实战中形同失效。
+  // v1.12.7 裁定：越权**照吃工具名档**（同一主会话内该工具对任意路径放行，含工作区外），
+  // 唯一保留的约束是「不写落盘项目档」。危险命令门排在最前，永远走交互。
+  // 下面四条钉的是：①越权吃工具名短路、②路径规则对越权仍生效、③非越权零变化
+  // （外加 ACP 孪生的早退门必须仍然先于所有档位、项目档对越权仍然抑制）。
 
   /** 越权请求的共用 fixture：真实 bash tool/call 记录 ⇒ 可解析出 /tmp/proj/a.txt */
   const mkEscalationSession = (id, parent, callId = 'c-esc') => mkSession(id, parent, [
@@ -923,7 +940,9 @@ describe('真实审批监听器集成判定（index.js 的 ctx.on("approval/requ
   ])
   const ESC_REASON = 'escalate sandbox to read-write: need to write outside the sandbox'
 
-  it('⑧ 越权 + 会话路径规则已覆盖该路径 → allowed-once（路径级记忆对越权重新生效）', async () => {
+  it('⑧ 越权 + 会话路径规则已覆盖该路径 → allowed-once（路径级记忆对越权仍然生效）', async () => {
+    // v1.12.7 注意：本 fixture **没有**工具名授权（只有 addSessionRule），否则会先被
+    // 工具名档短路，这条就测不到路径档了。路径档对越权生效是 v1.12.5 的裁定，本次不动。
     const hostApproval = new HostApprovalRules()
     hostApproval.addSessionRule('root-1', ['/tmp/proj/a.txt'])
     const handler = compileHandler(hostApproval, { activeChildren: new Map() })
@@ -935,9 +954,10 @@ describe('真实审批监听器集成判定（index.js 的 ctx.on("approval/requ
     assert.equal(nextCalled, false)
   })
 
-  it('⑨ 差分对照：同一 setup（bash 已授权、路径不被覆盖），只有 reason 越权与否决定放行', async () => {
-    // setup 完全相同，唯一变量是 reason —— 这一条同时钉住不变式①与③：
-    // 非越权照旧吃工具名短路，越权必须不吃。
+  it('⑨ 差分对照（v1.12.7 反转）：同一 setup 下越权与非越权**都**吃工具名档，只有项目档/路径档才分档', async () => {
+    // setup 完全相同，唯一变量是 reason —— v1.12.7 之后两者都命中工具名档（不变式①反转）；
+    // 「越权与非越权分档」这件事改由 ⑫ 的落盘项目档（sessionOnly）与
+    // dangerous-command-gate.test.js 的危险命令门来钉。
     const mk = () => {
       const hostApproval = new HostApprovalRules()
       hostApproval.addToolGrant('root-1', 'bash') // 工具名档命中；路径档没有任何规则
@@ -953,8 +973,8 @@ describe('真实审批监听器集成判定（index.js 的 ctx.on("approval/requ
     const esc = await callHandler(mk(), {
       session: mkEscalationSession('child-1', 'root-1'), callId: 'c-esc', toolName: 'bash', reason: ESC_REASON,
     })
-    assert.equal(esc.nextCalled, true, '越权吃了工具名短路（不变式①）')
-    assert.notEqual(esc.result, 'allowed-once')
+    assert.equal(esc.result, 'allowed-once', 'v1.12.7：越权必须照吃工具名短路（裁定「工具档不受越权限制」）')
+    assert.equal(esc.nextCalled, false)
   })
 
   it('⑩ 越权 + 解析不出路径（无 tool/call 记录可反查）→ next()，与 v1.11.24 一致', async () => {
@@ -986,9 +1006,12 @@ describe('真实审批监听器集成判定（index.js 的 ctx.on("approval/requ
     assert.notEqual(result, 'allowed-once')
   })
 
-  // v1.12.5 二次裁定（用户）：越权只能走会话路径档，**落盘项目档也不参与判定**。
-  // 这条只在 handler 层钉（decide 层的 sessionOnly 用例已另立）：handler 才是生产
-  // 唯一入口，它必须把 sessionOnly 真正带上；漏传时越权会被项目白名单静默放行。
+  // v1.12.5 二次裁定（用户）：越权**不得**走落盘项目档 —— 这是 v1.12.7 之后越权
+  // **唯一**保留的档位约束（工具档与路径档都正常消费它）。这条只在 handler 层钉
+  // （decide 层的 sessionOnly 用例已另立）：handler 才是生产唯一入口，它必须把
+  // sessionOnly 真正带上；漏传时越权会被项目白名单静默放行。
+  // v1.12.7 的解耦点：`sessionOnly: disallowToolGrant` 那个焊点必须拆开——判据拆开
+  // 后 disallowToolGrant 恒 false，焊点若还在，越权就会连项目档一起放开（跨会话提权）。
   it('⑫ 越权 + 只有落盘项目档覆盖该路径 → next()（项目档对越权不参与）', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dad-12-'))
     const prev = process.env.DSH_HOME
