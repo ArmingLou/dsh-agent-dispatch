@@ -1065,3 +1065,56 @@ describe('U3 弹框布局：滚动契约与不越视口（对齐 fab-panel-layou
     assert.match(cssRule('ad-grant-pop'), /overflow:\s*hidden/, '面板本体不滚，滚的必须是内容区')
   })
 })
+
+// ── U5：确认按钮配色守卫（v1.12.6 UI 修复）──
+//
+// 现场缺陷：`.ad-btn.primary{background:var(--ad-accent)}` 里的 `--ad-accent` 只在
+// `.ad-panel{…}` 里定义，而这个弹框是挂在 document.body 上的 —— 拿不到那层作用域 ⇒
+// `background` 进入「计算值阶段无效」(IACVT)：背景回退 transparent、border-color 回退
+// currentColor（＝该按钮的文字色 label-primary-inverted＝白）⇒ **白底白字**，真实 Chrome
+// 实测对比度 1.00:1（用户反馈「灰色的，看不清」）。
+//
+// 修法：确认按钮额外挂 `.ad-grant-ok`，由该类的规则给出**可取到**的主色。本套用例只钉
+// 三件会被改回去的事，不管样式怎么重排：
+//   ⓐ className 必须含 ad-grant-ok；
+//   ⓑ 该规则的背景/描边不得是裸 `var(--ad-accent)`（必须带逗号回退，或直接引宿主 --dsw-* token）；
+//   ⓒ 该规则的选择器 specificity 不得低于 `.ad-btn.primary`（只有 1 个类会被它反压回白底白字）。
+describe('U5 确认按钮配色：不得只依赖裸 var(--ad-accent)', () => {
+  // 只认字符串常量里的 CSS 规则（`".selector{…}"`），避免命中注释里提到的同名类
+  function okRule() {
+    const m = src.match(/"([^"{}]*\.ad-grant-ok)\{([^}]*)\}"/)
+    assert.ok(m, 'lib/client.js 的 CSS 里找不到 `.ad-grant-ok{…}` 规则（弹框确认按钮的主色规则丢了）')
+    return { sel: m[1], body: m[2] }
+  }
+  function decl(body, prop) {
+    const m = body.match(new RegExp('(?:^|;)\\s*' + prop.replace(/-/g, '\\-') + '\\s*:([^;]+)'))
+    return m ? m[1].trim() : ''
+  }
+  // 「可取到」＝带逗号回退的 var(--ad-accent, …) 或直接引用宿主主题 token（--dsw-*）。
+  // 裸 var(--ad-accent) 不算：那正是这个缺陷本身。
+  const recoverable = (v) => /var\(\s*--ad-accent\s*,/.test(v) || /var\(\s*--dsw-/.test(v)
+
+  it('① 确认按钮必须挂 .ad-grant-ok（否则落回裸 var(--ad-accent) 的透明底 + 白字）', () => {
+    const m = src.match(/btnOk\.className = "([^"]+)"/)
+    assert.ok(m, 'lib/client.js 里找不到 btnOk.className 赋值（确认按钮被改名或重写？）')
+    assert.match(m[1], /(^|\s)ad-grant-ok(\s|$)/,
+      `确认按钮的 class 必须含 ad-grant-ok，实际："${m[1]}"`)
+  })
+
+  it('② .ad-grant-ok 的背景与描边必须是可取到的色（裸 var(--ad-accent) 不算）', () => {
+    const { body } = okRule()
+    for (const prop of ['background', 'border-color']) {
+      const v = decl(body, prop)
+      assert.ok(v, `.ad-grant-ok 缺 ${prop} 声明——缺了就会回落到 .ad-btn.primary 的裸 var(--ad-accent)`)
+      assert.ok(recoverable(v),
+        `.ad-grant-ok 的 ${prop} 必须是 var(--ad-accent, …) 带回退或直接引宿主 --dsw-* token，实际：${v}`)
+    }
+  })
+
+  it('③ 规则 specificity 不得低于 .ad-btn.primary（更弱就会被反压回透明底 + 白字）', () => {
+    const { sel } = okRule()
+    const classes = (sel.match(/\./g) || []).length
+    assert.ok(classes >= 2,
+      `.ad-grant-ok 的选择器只带 ${classes} 个类（"${sel.trim()}"）——压不过 .ad-btn.primary（2 个类）就会退回白底白字`)
+  })
+})
