@@ -485,11 +485,17 @@ describe('U2 openGrantDialog：确认才生效，取消什么都不发', () => {
       { o: { projectTier: false }, session: /会话档[\s\S]*不落盘/, project: null, esc: null },
       { o: { projectTier: true }, session: null, project: /项目档[\s\S]*落盘/, esc: null },
       {
+        // v1.12.14（用户裁定「勾了路径 + 项目档 ⇒ 也落盘，越权不降级」）：项目档那一支的
+        // 越权说明必须改成「照常落盘、跨会话生效」——旧文案「只到本会话、不落盘」已成假话。
         o: { projectTier: true, escalation: true }, session: null, project: null,
+        esc: /沙箱越权[\s\S]*照常落盘[\s\S]*跨会话生效/,
+        escExtra: [/任意路径/, /危险命令[\s\S]*仍会每次询问/],
+      },
+      {
+        // 会话档那一支仍然不落盘（唯一保留的越权语义：会话档本来就不落盘）
+        o: { projectTier: false, escalation: true }, session: null, project: null,
         esc: /沙箱越权[\s\S]*只到本会话[\s\S]*不落盘/,
-        // v1.12.7：越权的档位说明必须**同时**说清两件仍然成立的事（不落盘 + 危险命令仍问）
-        // 与那件新成立的事（删空目录 = 只记工具名 ⇒ 本会话内任意路径放行）
-        escExtra: [/任意路径放行/, /危险命令[\s\S]*仍会每次询问/],
+        escExtra: [/任意路径/, /危险命令[\s\S]*仍会每次询问/],
       },
     ]
     for (const c of cases) {
@@ -511,8 +517,12 @@ describe('U2 openGrantDialog：确认才生效，取消什么都不发', () => {
           '越权全不勾时必须说清「删空目录 = 只按工具名记住 ⇒ 任意路径放行」')
         assert.match(hint.textContent, /危险命令[\s\S]{0,40}仍会每次询问/,
           '必须同时点明危险命令仍每次都问（否则用户以为连 rm -rf 都放过了）')
-        assert.match(hint.textContent, /不写落盘白名单/,
-          '必须同时点明越权仍不落盘（换会话仍要问）——这是越权唯一保留的约束')
+        // toolTierDisk 未给（= 该通道的工具档不落盘）⇒ 仍须如实写「不写落盘白名单」；
+        // 落盘那一档（宿主项目档）的说明由上面 esc / 专门的 toolTierDisk 用例覆盖。
+        if (c.o.toolTierDisk !== true) {
+          assert.match(hint.textContent, /不写落盘白名单/,
+            '工具档不落盘的通道必须点明越权/本档不落盘（换会话仍要问）')
+        }
         assert.doesNotMatch(hint.textContent, /不走工具名档/,
           'v1.12.7 已失效的旧说法不得回来（面板说谎是用户专门抓到过的问题）')
       }
@@ -917,14 +927,17 @@ describe('U4 两组预填：实际触达默认勾选、文本推测默认不勾�
     lv2b.all.click()
     assert.deepEqual(await p2, { paths: [], mode: 'tools' })
 
-    // 宿主通道的项目档：工具名档**没有**落盘档 ⇒ 必须点明「要落盘请填目录」
+    // toolTierDisk=false（该通道的工具档不落盘；宿主项目档现在恒 true，这一档只剩
+    // 防御性/其它通道组合）⇒ 文案必须如实说「不落盘」，不许说成落盘
     const hostProject = buildGrantModule()
     const p3 = hostProject.mod.openGrantDialog({ product: 'qoder', toolName: 'Bash', projectTier: true, toolTierDisk: false, suggestedDirs: ['/tmp/x'] })
     dialogParts(hostProject.doc).rows[0].chk.checked = false
     dialogParts(hostProject.doc).rows[0].chk.fire('change')
     dialogParts(hostProject.doc).btnOk.click()
     const txt3 = secondLevelParts(hostProject.doc).notes.map((n) => n.textContent).join(' ')
-    assert.match(txt3, /宿主通道的工具名档只有会话级/, '宿主项目档必须如实说「工具名档不落盘」')
+    // v1.12.14：旧的「宿主通道的工具名档只有会话级——要落盘请勾目录」提示已删
+    // （宿主项目档现在真的落盘工具档）。这里钉「不落盘」这个事实口径本身。
+    assert.match(txt3, /不落盘/, 'toolTierDisk=false 的通道必须如实说「不落盘」')
     secondLevelParts(hostProject.doc).once.click()
     await p3
   })
@@ -1204,7 +1217,10 @@ describe('U2 宿主通道（蓝球）：grantViaDialog 行为——取消零 POS
   it('项目档 ⇒ scope=project + cwd，sessionId 用条目自身（与 1.12.5 载荷一致）', async () => {
     const r = build({ escalation: true, openGrantDialog: (o) => {
       assert.equal(o.escalation, true, '越权标志必须传进弹框，否则档位说明会说谎')
-      assert.equal(o.toolTierDisk, false, '宿主通道没有落盘工具名档，必须如实透给弹框')
+      // v1.12.14（用户裁定）：项目档这一支**真的会落盘工具档**（服务端
+      // appendProjectToolRule 写共用 allowlist.json）⇒ toolTierDisk 必须如实透 true，
+      // 二级说明才敢写「落盘档，同工作目录跨会话生效」。改前这里恒 false（旧缺陷）。
+      assert.equal(o.toolTierDisk, true, '宿主项目档必须把「工具档会落盘」如实透给弹框')
       return Promise.resolve({ paths: ['/tmp/proj'], mode: 'paths' })
     } })
     await r.run('project')

@@ -37,6 +37,15 @@ const logRows = (home) => {
   return existsSync(f) ? readFileSync(f, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []
 }
 
+/** 决策日志里 kind=host-approval 的行（可按 action 过滤；v1.12.14 起多个 describe 共用） */
+const grantRows = (home, action) =>
+  logRows(home).filter((r) => r.kind === 'host-approval' && (!action || r.action === action))
+/** 共用落盘白名单（与 product-subagents 同文件）里的 rules 数组 */
+const allowlistRules = (home) => {
+  const f = path.join(home, 'data', 'dsh-plugin-product-subagents', 'allowlist.json')
+  return existsSync(f) ? JSON.parse(readFileSync(f, 'utf8')).rules : []
+}
+
 const writeCall = (callId, file) => [{ callId, name: 'write', arguments: { file_path: file } }]
 
 /**
@@ -397,82 +406,81 @@ describe('沙箱越权：工具名档**适用**、路径级记忆仍生效、落
   })
 })
 
-describe('沙箱越权不得写落盘项目白名单（v1.12.5 二次裁定：只允许会话档）', () => {
-  // 用户口径：同一主代理会话内同一路径不再弹，但**新会话仍要问**——不允许把
-  // 「某路径可以被提权到 danger-full-access」静默落盘长期留存。
-  // 端点侧的落盘写入点只有一个（index.js 的 appendProjectRule），且它只能在
-  // scope==='project' 分支到达；这里用真实临时 DSH_HOME（harness 已注入）断言
-  // allowlist.json 的**存在性与字节内容**，不碰用户 ~/.dsh。
+describe('v1.12.14（用户裁定，放开 v1.12.5 二次裁定的越权写侧守卫）：显式点项目档 ⇒ 越权也照落盘、读侧同样消费', () => {
+  // 用户裁定（原话意）：「勾了路径 + 「本项目」 ⇒ 也落盘，真的写进项目 allowlist」。
+  // 这**有意放开**了「越权请求不得写项目白名单」：放开条件＝用户在授权界面显式点项目档
+  // （蓝球「总是允许(项目)」）；其余守卫保留：全非法声明 400 什么都不写、「仅本次放行」
+  // 客户端根本不发 POST、危险命令门排在所有档位之前、落盘失败仍 400。
+  // 读侧同批放开（decide 的 sessionOnly 下线）——否则「写盘了但读不到」= 用户点完重载
+  // 后又弹，正是本次要修的缺口。
+  // 端点侧的落盘写入点只有两个（index.js 的 appendProjectRule / appendProjectToolRule），
+  // 且都只在 scope==='project' 分支到达；这里用真实临时 DSH_HOME（harness 已注入）断言
+  // allowlist.json 的存在性与字节内容，不碰用户 ~/.dsh。
   const ESC = 'escalate sandbox to read-write: need to write outside the sandbox'
   const bashCall = (callId, file) => [{ callId, name: 'bash', arguments: { command: `cat ${file}` } }]
   const allowlist = (home) => path.join(home, 'data', 'dsh-plugin-product-subagents', 'allowlist.json')
   const allowlistSha = (home) => (existsSync(allowlist(home)) ? createHash('sha256').update(readFileSync(allowlist(home))).digest('hex') : '<absent>')
   const allowlistRules = (home) => (existsSync(allowlist(home)) ? JSON.parse(readFileSync(allowlist(home), 'utf8')).rules : [])
 
-  it('越权点「总是允许(项目)」：不落盘、只写会话路径规则，同会话第二次不再弹、换会话仍弹', async () => {
+  it('越权点「总是允许(项目)」：落盘路径档、响应 scope=project、跨会话（重载后）不再弹', async () => {
     const b = await boot()
     try {
       const s1 = mkSession({ id: 'child-1', parentSession: 'R', toolCalls: bashCall('ce1', '/tmp/proj/a.txt') })
       assert.equal((await approve(b, s1, { callId: 'ce1', toolName: 'bash', reason: ESC })).nextCalled, true)
 
       const { status, json } = await postRule(b, { scope: 'project', sessionId: 'child-1', callId: 'ce1', toolName: 'bash' })
-      assert.equal(status, 200, '越权的项目档 POST 不该被拒（用户点了就得有等效的会话内记忆）')
-      // 落盘证据排在响应字段之前：放开落盘的变异要在「文件被创建了」这条上转红，
-      // 而不是先在响应字段上转红（响应只是披露，文件才是事实）。
-      assert.equal(existsSync(allowlist(b.home)), false, '越权的项目档 POST 仍然落盘了')
-      assert.equal(allowlistSha(b.home), '<absent>')
-      assert.deepEqual(allowlistRules(b.home), [])
-      // 响应必须如实报生效档位，不能照着用户点的标签回 'project'
-      assert.equal(json.scope, 'session', '响应谎报档位：写下去的其实是会话规则')
-      assert.equal(json.projectSuppressed, true, '响应没披露项目档被抑制')
+      assert.equal(status, 200)
+      // 事实优先：先断言文件，再断言响应字段（响应只是披露，文件才是事实）
+      assert.equal(existsSync(allowlist(b.home)), true, '显式点项目档却没落盘（本次要修的缺口）')
+      const rules = allowlistRules(b.home)
+      assert.equal(rules.length, 1)
+      assert.equal(rules[0].cwd, '/home/test')
+      assert.ok(rules[0].paths.includes('/tmp/proj/a.txt'))
+      assert.equal(json.scope, 'project', '响应谎报档位：写下去的其实是会话规则')
+      assert.equal(json.projectSuppressed, undefined, '降级已放开，不得再回 projectSuppressed')
+      assert.equal(grantRows(b.home, 'rule-downgraded').length, 0, '越权降级留痕还在（守卫没真正放开）')
+      const written = grantRows(b.home, 'rule-project-written').at(-1)
+      assert.ok(written, '显式点项目档的留痕丢失')
+      assert.equal(written.escalation, true, '越权场景必须留痕标出')
+      assert.match(written.message, /不降级/)
 
-      // ② 会话内记忆生效：同一路径的越权第二次自动放行，且来自路径档
-      const again = await approve(b, s1, { callId: 'ce1', toolName: 'bash', reason: ESC })
-      assert.equal(again.res, 'allowed-once', '降级写入的会话规则没被判定侧读到（键不一致）')
-      const row = logRows(b.home).filter((r) => r.kind === 'host-approval').at(-1)
-      assert.equal(row.action, 'auto-grant')
-      assert.equal(row.scope, 'session')
-
-      // ③ 换会话（另一个根）同路径越权 → 仍要问：没有任何跨会话留存
+      // ② 换会话（另一个根）同路径 ⇒ 由**落盘**项目档放行（读侧对称放开的靶子）
       const s2 = mkSession({ id: 'child-9', parentSession: 'R2', toolCalls: bashCall('ce9', '/tmp/proj/a.txt') })
       const otherRoot = await approve(b, s2, { callId: 'ce9', toolName: 'bash', reason: ESC })
-      assert.equal(otherRoot.nextCalled, true, '越权的项目档抑制不彻底：后续会话被静默放行了')
-      assert.notEqual(otherRoot.res, 'allowed-once')
+      assert.equal(otherRoot.res, 'allowed-once', '越权请求没吃到用户显式落盘的项目档')
+      assert.equal(grantRows(b.home, 'auto-grant').at(-1).scope, 'project')
 
-      // ④ 同一根下、路径之外的**非越权**请求也不能因此被放行：
-      // scope==='project' 分支从来只写路径规则，越权降级后同样不该写出工具名授权
+      // ③ 未声明的目录仍要问（规则不是通配）
       const s3 = mkSession({ id: 'child-3', parentSession: 'R', toolCalls: bashCall('ce3', '/tmp/elsewhere/y.txt') })
-      const off = await approve(b, s3, { callId: 'ce3', toolName: 'bash', reason: 'tool requires approval' })
-      assert.equal(off.nextCalled, true, '项目档 POST 被降级时顺带写出了工具名授权')
+      const off = await approve(b, s3, { callId: 'ce3', toolName: 'bash', reason: ESC })
+      assert.equal(off.nextCalled, true, '落盘规则外溢到了未声明的目录')
     } finally { await b.close() }
   })
 
-  it('已有项目白名单条目时，越权的项目档 POST 让落盘文件逐字节不变', async () => {
+  it('只追加不覆盖：已有条目原样保留，越权的项目档 POST 追加一条', async () => {
     const b = await boot()
     try {
-      // 先用一条**非越权**请求正常落盘（这条同时也是回归守卫：正常路径仍能写文件）
       const w = mkSession({ id: 'R', toolCalls: writeCall('w1', '/tmp/proj/base.txt') })
       await approve(b, w, { callId: 'w1', toolName: 'write' })
       const okPost = await postRule(b, { scope: 'project', sessionId: 'R', callId: 'w1', toolName: 'write' })
       assert.equal(okPost.status, 200)
       assert.equal(okPost.json.scope, 'project')
-      assert.equal(existsSync(allowlist(b.home)), true, '非越权的项目档连文件都不建，回归守卫先失败')
-      const before = allowlistRules(b.home).length
-      const shaBefore = allowlistSha(b.home)
+      const before = allowlistRules(b.home)
+      assert.equal(before.length, 1, '前置：先有一条既有条目')
 
-      // 再来一条越权，点同一个按钮 → 文件必须一个字节都不动
-      const e = mkSession({ id: 'R', toolCalls: bashCall('ce1', '/tmp/proj/a.txt') })
+      const e = mkSession({ id: 'R', toolCalls: bashCall('ce1', '/tmp/proj/esc.txt') })
       await approve(b, e, { callId: 'ce1', toolName: 'bash', reason: ESC })
       const escPost = await postRule(b, { scope: 'project', sessionId: 'R', callId: 'ce1', toolName: 'bash' })
-      // 事实优先：先断言文件一个字节没动，再断言响应的披露
-      assert.equal(allowlistSha(b.home), shaBefore, '越权的项目档 POST 改动了落盘白名单内容')
-      assert.equal(allowlistRules(b.home).length, before, '越权的项目档 POST 追加了条目')
       assert.equal(escPost.status, 200)
-      assert.equal(escPost.json.scope, 'session')
+      assert.equal(escPost.json.scope, 'project')
+      const after = allowlistRules(b.home)
+      assert.equal(after.length, 2, '越权的项目档没有追加条目')
+      assert.deepEqual(after[0], before[0], '既有条目被改写了（必须只追加不覆盖）')
+      assert.ok(after[1].paths.includes('/tmp/proj/esc.txt'))
     } finally { await b.close() }
   })
 
-  it('非越权请求的落盘行为与 1.12.4 一致：项目档写文件、跨会话放行；同一条规则不替越权放行', async () => {
+  it('非越权请求的落盘行为与 1.12.4 一致：项目档写文件、跨会话放行（对照，零回归）', async () => {
     const b = await boot()
     try {
       const s1 = mkSession({ id: 'child-1', parentSession: 'R', toolCalls: writeCall('c1', '/tmp/proj/a.txt') })
@@ -490,14 +498,7 @@ describe('沙箱越权不得写落盘项目白名单（v1.12.5 二次裁定：�
       const s2 = mkSession({ id: 'child-8', parentSession: 'R8', toolCalls: writeCall('c8', '/tmp/proj/a.txt') })
       const nextSession = await approve(b, s2, { callId: 'c8', toolName: 'write' })
       assert.equal(nextSession.res, 'allowed-once', '落盘项目档不再跨会话生效——正常路径的持久白名单被本轮改动废掉了')
-      const projRow = logRows(b.home).filter((r) => r.action === 'auto-grant').at(-1)
-      assert.equal(projRow.scope, 'project')
-
-      // 同一条落盘规则对越权不算数（读取侧的 sessionOnly）
-      const e = mkSession({ id: 'child-8', parentSession: 'R8', toolCalls: bashCall('ce8', '/tmp/proj/a.txt') })
-      const esc = await approve(b, e, { callId: 'ce8', toolName: 'bash', reason: ESC })
-      assert.equal(esc.nextCalled, true, '越权被跨会话的项目白名单放行了（读取侧没抑制）')
-      assert.notEqual(esc.res, 'allowed-once')
+      assert.equal(grantRows(b.home, 'auto-grant').at(-1).scope, 'project')
     } finally { await b.close() }
   })
 })
@@ -558,37 +559,37 @@ describe('B1（阻断项）：写侧落盘抑制只认沙箱越权，ACP 孪生�
     } finally { await control.close() }
   })
 
-  it('沙箱越权 POST scope=project ⇒ 仍然不落盘，只写会话档 + 如实披露（B1 的另一半）', async () => {
+  it('沙箱越权 POST scope=project ⇒ 照落盘 + 留痕标出 escalation（B1 的另一半，v1.12.14 已放开）', async () => {
+    // 改前（v1.12.5–1.12.13）这条叫「仍然不落盘，只写会话档 + 如实披露」。
+    // v1.12.14 用户裁定：显式点项目档 ⇒ 越权也照落盘（放开条件仅此一条），本用例随之翻面。
     const b = await boot()
     try {
       const w = mkSession({ id: 'R', toolCalls: writeCall('w1', '/tmp/dad-b1/base.txt') })
       await approve(b, w, { callId: 'w1', toolName: 'write' })
       await postRule(b, { scope: 'project', sessionId: 'R', callId: 'w1' })
-      const shaBefore = existsSync(allowlist(b.home)) ? createHash('sha256').update(readFileSync(allowlist(b.home))).digest('hex') : '<absent>'
-      const bytesBefore = existsSync(allowlist(b.home)) ? readFileSync(allowlist(b.home)).length : -1
+      const rulesBefore = existsSync(allowlist(b.home)) ? JSON.parse(readFileSync(allowlist(b.home), 'utf8')).rules.length : 0
 
       const e = mkSession({ id: 'R', toolCalls: bashCall('ce1', '/tmp/dad-b1/alpha/a.txt') })
       await approve(b, e, { callId: 'ce1', toolName: 'bash', reason: ESC })
       const { status, json } = await postRule(b, { scope: 'project', sessionId: 'R', callId: 'ce1' })
       assert.equal(status, 200)
-      assert.equal(
-        createHash('sha256').update(readFileSync(allowlist(b.home))).digest('hex'),
-        shaBefore,
-        'B1 修复把越权的落盘也放开了（判据收得太宽）',
-      )
-      assert.equal(readFileSync(allowlist(b.home)).length, bytesBefore, '落盘文件字节数变了')
-      assert.equal(json.scope, 'session')
-      assert.equal(json.projectSuppressed, true)
+      const rulesAfter = JSON.parse(readFileSync(allowlist(b.home), 'utf8')).rules
+      assert.equal(rulesAfter.length, rulesBefore + 1, '越权 + 项目档没有追加落盘条目（守卫没真正放开）')
+      assert.equal(json.scope, 'project')
+      assert.equal(json.projectSuppressed, undefined)
+      assert.equal(grantRows(b.home, 'rule-downgraded').length, 0, '越权降级留痕还在')
 
-      const rows = logRows(b.home).filter((r) => r.kind === 'host-approval' && r.action === 'rule-downgraded')
-      assert.equal(rows.length, 1, '越权降级没有留痕')
-      // 同源 Minor：文案与判据一致——只有真越权才会打印「越权」
-      assert.match(rows[0].message, /沙箱越权/, `降级日志文案没写明判据（实际: ${rows[0].message}）`)
-      assert.match(rows[0].message, /isSandboxEscalation/, `降级日志没标判据（实际: ${rows[0].message}）`)
+      const rows = grantRows(b.home, 'rule-project-written')
+      assert.equal(rows.length, 1, '显式点项目档没有留痕')
+      // 文案与判据一致：只有真越权的场景才打 escalation 标记并写「不降级」
+      assert.equal(rows[0].escalation, true, '越权场景没被标出（排障分不清是普通还是越权落盘）')
+      assert.match(rows[0].message, /沙箱越权/, `留痕文案没写明判据（实际: ${rows[0].message}）`)
+      assert.match(rows[0].message, /不降级/, `留痕没写「不降级」（实际: ${rows[0].message}）`)
 
-      // 会话档确实写到了：同路径的越权第二次不再弹（不变量①的后半）
+      // 落盘即生效：同路径的越权第二次不再弹（现在来自 project 档而非会话档）
       const again = await approve(b, e, { callId: 'ce1', toolName: 'bash', reason: ESC })
-      assert.equal(again.res, 'allowed-once', '降级写入的会话规则没被判定侧读到')
+      assert.equal(again.res, 'allowed-once', '落盘的项目规则没被判定侧读到')
+      assert.equal(grantRows(b.home, 'auto-grant').at(-1).scope, 'project')
     } finally { await b.close() }
   })
 })
@@ -644,8 +645,6 @@ describe('U2（v1.12.6）：body.paths 三态——声明是用户意志，服�
   const ESC = 'escalate sandbox to read-write: need to write outside the sandbox'
   const bashCall = (callId, file) => [{ callId, name: 'bash', arguments: { command: `cat ${file}` } }]
   const allowlist = (home) => path.join(home, 'data', 'dsh-plugin-product-subagents', 'allowlist.json')
-  const grantRows = (home, action) =>
-    logRows(home).filter((r) => r.kind === 'host-approval' && (!action || r.action === action))
 
   it('未给 paths ⇒ 走服务端自动分析：工具名档 + 路径档一起写（老客户端零漂移）', async () => {
     const b = await boot()
@@ -716,7 +715,7 @@ describe('U2（v1.12.6）：body.paths 三态——声明是用户意志，服�
     } finally { await b.close() }
   })
 
-  it('空声明 + scope=project ⇒ 不落盘，档位如实回 session 并披露 toolOnly', async () => {
+  it('空声明 + scope=project ⇒ **落盘工具档**（v1.12.14：二级选择②真的落盘）', async () => {
     const b = await boot()
     try {
       const s = mkSession({ id: 'R', toolCalls: bashCall('c1', '/tmp/dad-u2-toolonly/alpha/a.txt') })
@@ -725,11 +724,23 @@ describe('U2（v1.12.6）：body.paths 三态——声明是用户意志，服�
         scope: 'project', sessionId: 'R', callId: 'c1', paths: [], cwd: '/tmp/dad-u2-toolonly',
       })
       assert.equal(status, 200)
-      assert.equal(existsSync(allowlist(b.home)), false, '删空路径却落盘了项目白名单')
-      assert.equal(json.scope, 'session', '项目档没落盘却回 scope=project')
+      assert.equal(existsSync(allowlist(b.home)), true,
+        '「落盘工具放行任意路径」没落盘（用户实测：只落一条 rule-tool-only、文件一字未动）')
+      assert.equal(json.scope, 'project', '工具档已落盘 ⇒ 不得再谎报 session')
       assert.equal(json.toolOnly, true)
+      assert.equal(json.toolPersisted, true)
       assert.equal(json.projectSuppressed, undefined, 'toolOnly 不是越权抑制，两个标记不能混用')
-      assert.equal(grantRows(b.home, 'rule-tool-only').length, 1, '删空 ⇒ 只写工具名档要留痕')
+      const rules = allowlistRules(b.home)
+      assert.equal(rules.length, 1)
+      assert.deepEqual(rules[0].paths, [], '工具档条目不得写任何路径')
+      assert.deepEqual(rules[0].tools, ['main:bash'], '落盘工具键必须是 product:tool 形态')
+      assert.equal(grantRows(b.home, 'rule-tool-only').length, 0, '已落盘的那一支不该再留 rule-tool-only')
+      assert.equal(grantRows(b.home, 'rule-tool-disk').length, 1, '落盘工具档必须留痕')
+      // 落盘即跨会话：换一个根会话（内存工具档按根键存 ⇒ 只有盘上的条目能命中）
+      const other = mkSession({ id: 'R9', toolCalls: bashCall('c9', '/outside/workspace/z.txt') })
+      const hit = await approve(b, other, { callId: 'c9', toolName: 'bash' })
+      assert.equal(hit.res, 'allowed-once', '另一个根会话没吃到落盘工具档')
+      assert.equal(grantRows(b.home, 'auto-grant').at(-1).scope, 'project-tool')
     } finally { await b.close() }
   })
 
@@ -852,7 +863,7 @@ describe('U2（v1.12.6）：body.paths 三态——声明是用户意志，服�
     } finally { await b.close() }
   })
 
-  it('越权 + 声明目录 + scope=project ⇒ 不落盘，降级写会话档并覆盖同目录兄弟', async () => {
+  it('越权 + 声明目录 + scope=project ⇒ **照落盘**（v1.12.14 用户裁定：显式点项目档不降级）并覆盖同目录兄弟', async () => {
     const b = await boot()
     try {
       const s = mkSession({ id: 'R', toolCalls: bashCall('c1', '/tmp/dad-u2-esc/alpha/a.txt') })
@@ -861,15 +872,16 @@ describe('U2（v1.12.6）：body.paths 三态——声明是用户意志，服�
         scope: 'project', sessionId: 'R', callId: 'c1', paths: ['/tmp/dad-u2-esc/alpha'], cwd: '/tmp/dad-u2-esc',
       })
       assert.equal(status, 200)
-      assert.equal(existsSync(allowlist(b.home)), false, '越权的声明目录被落盘了（B1 收窄后又放宽）')
-      assert.equal(json.scope, 'session')
-      assert.equal(json.projectSuppressed, true)
+      assert.equal(existsSync(allowlist(b.home)), true, '用户显式点项目档却没落盘（v1.12.14 的靶子）')
+      assert.equal(json.scope, 'project', '已放开降级，响应必须照用户点的那一档回')
+      assert.equal(json.projectSuppressed, undefined, '降级已放开，不得再回 projectSuppressed')
       assert.equal(json.pathsSource, 'user')
+      assert.ok(allowlistRules(b.home)[0].paths.includes('/tmp/dad-u2-esc/alpha'))
 
       const sib = mkSession({ id: 'R', toolCalls: bashCall('c2', '/tmp/dad-u2-esc/alpha/b.txt') })
       const hit = await approve(b, sib, { callId: 'c2', toolName: 'bash', reason: ESC })
       assert.equal(hit.res, 'allowed-once', '声明的目录没覆盖到兄弟路径')
-      assert.equal(grantRows(b.home, 'auto-grant').at(-1).scope, 'session')
+      assert.equal(grantRows(b.home, 'auto-grant').at(-1).scope, 'project')
     } finally { await b.close() }
   })
 

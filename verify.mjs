@@ -885,14 +885,15 @@ if (!c.includes('uiSubs')) throw new Error('v0.9.29: 持久化状态应有订阅
   if (!dEscYes.allowed || dEscYes.scope !== 'session')
     throw new Error(`v1.12.5: 越权应被会话路径规则放行，实际 allowed=${dEscYes.allowed} scope=${dEscYes.scope}`)
 
-  // v1.12.5 二次裁定（用户）：越权的路径级记忆只到本会话为止，落盘项目档不得替越权放行。
+  // v1.12.14（用户裁定，放开 v1.12.5 的读侧守卫）：用户显式在授权界面点项目档 ⇒ 写侧照落盘、
+  // 读侧照消费 ⇒ 越权（reason 判据）**不再**抑制落盘项目档；decide 的 sessionOnly 参数下线。
   // 落盘写在 verify 自己的临时 DSH_HOME（见本文件 :45），不碰用户 ~/.dsh。
   // 非越权用另一个根键（无会话规则、无工具名授权）⇒ 放行只可能来自项目档，用来守住
   // 「别把正常路径的持久白名单一起关掉」。
   rules.appendProjectRule({ cwd: '/home/v', paths: ['/proj/x.txt'] })
   const dEscProj = rules.decide({ sessionId: 'child-1', rootSessionId: 'root-1', cwd: '/home/v', paths: ['/proj/x.txt'], toolName: 'bash', disallowToolGrant: true, sessionOnly: true })
-  if (dEscProj.allowed)
-    throw new Error(`v1.12.5: 越权被落盘项目档放行（二次裁定：只允许会话档）scope=${dEscProj.scope}`)
+  if (!dEscProj.allowed || dEscProj.scope !== 'project')
+    throw new Error(`v1.12.14: 落盘项目档没被消费（读侧放开未生效）allowed=${dEscProj.allowed} scope=${dEscProj.scope}`)
   const dPlainProj = rules.decide({ sessionId: 'c-p', rootSessionId: 'r-p', cwd: '/home/v', paths: ['/proj/x.txt'], toolName: 'write' })
   if (!dPlainProj.allowed || dPlainProj.scope !== 'project')
     throw new Error(`v1.12.5: 非越权的项目档放行被误伤 allowed=${dPlainProj.allowed} scope=${dPlainProj.scope}`)
@@ -1086,10 +1087,10 @@ if (!c.includes('uiSubs')) throw new Error('v0.9.29: 持久化状态应有订阅
   if (!ha.isDisallowedAutoGrant('product_submit', '[ACP qoder] 请求权限'))
     throw new Error('v1.12.7-1: ACP 孪生不再被排除（孪生会吃工具名档，违反「完全绕过、不动它」）')
   if (!ha.isSandboxEscalation(ESC))
-    throw new Error('v1.12.7-1: isSandboxEscalation 自身必须仍能识别越权（它只剩 sessionOnly 与文案两个用途）')
+    throw new Error('v1.12.7-1: isSandboxEscalation 自身必须仍能识别越权（v1.12.14 起只剩写侧留痕用途）')
 
-  // ② 两档开关**解耦**：越权只关项目档、不关工具档；焊点回去（sessionOnly: disallowToolGrant）
-  //    的后果是「判据一拆，越权连项目档一起放开 ⇒ 跨会话静默提权」。
+  // ② 两档开关**解耦**（v1.12.14 起只剩 disallowToolGrant 一个）：越权请求照吃工具档，
+  //    落盘项目档也不再被抑制（用户裁定：显式点项目档 ⇒ 写侧照落盘、读侧照消费）。
   const rv7 = new ha.HostApprovalRules()
   rv7.addToolGrant('root-v7', 'bash')
   const toolHit = rv7.decide({ sessionId: 'child-v7', rootSessionId: 'root-v7', paths: ['/v7/a.txt'], toolName: 'bash', disallowToolGrant: false, sessionOnly: true })
@@ -1098,24 +1099,22 @@ if (!c.includes('uiSubs')) throw new Error('v0.9.29: 持久化状态应有订阅
   const projRule = rv7.appendProjectRule({ cwd: '/v7cwd', paths: ['/v7/outside'] })
   if (!projRule.ok) throw new Error('v1.12.7-2: 项目档夹具写入失败')
   const projOnly = rv7.decide({ sessionId: 'root-v7b', rootSessionId: 'root-v7b', cwd: '/v7cwd', paths: ['/v7/outside/x.txt'], toolName: null, sessionOnly: true })
-  if (projOnly.allowed)
-    throw new Error('v1.12.7-2: sessionOnly=true 仍走了落盘项目档——越权可被跨会话白名单静默放行')
-  const projOn = rv7.decide({ sessionId: 'root-v7b', rootSessionId: 'root-v7b', cwd: '/v7cwd', paths: ['/v7/outside/x.txt'], toolName: null, sessionOnly: false })
+  if (!projOnly.allowed || projOnly.scope !== 'project')
+    throw new Error(`v1.12.14-2: 落盘项目档没被消费（读侧放开未生效）allowed=${projOnly.allowed} scope=${projOnly.scope}`)
+  const projOn = rv7.decide({ sessionId: 'root-v7b', rootSessionId: 'root-v7b', cwd: '/v7cwd', paths: ['/v7/outside/x.txt'], toolName: null })
   if (!projOn.allowed || projOn.scope !== 'project')
     throw new Error('v1.12.7-2: 非越权的项目档被一起关掉了（超出裁定范围）')
 
-  // ③ 生产调用点：`sessionOnly` 必须是 isSandboxEscalation 单独一条、**不得**与
-  //    disallowToolGrant 焊在一起（解耦点在 index.js，纯函数层测不到）。
-  if (!idx.includes('const sessionOnly = isSandboxEscalation(ctxInfo.reason)'))
-    throw new Error('v1.12.7-3: index.js 找不到 `const sessionOnly = isSandboxEscalation(ctxInfo.reason)`（解耦点丢失）')
-  // 查**调用行本身**（不是整份源码）：index.js 的注释里刻意写着改前的焊点写法做历史说明，
-  // 整份 includes 会把那段说明当成复发。锚定 decide 调用行，两个开关必须是**两个独立实参**。
+  // ③ 生产调用点（v1.12.14 订正）：越权不再是档位级排除 ⇒ handler 里既不许再算 sessionOnly，
+  //    也不许把它传给 decide；写侧只留 disallowToolGrant 一个开关。
+  if (idx.includes('const sessionOnly = isSandboxEscalation(ctxInfo.reason)'))
+    throw new Error('v1.12.14-3: index.js 还在算 sessionOnly（读侧放开未生效）')
   const decideLine = idx.split('\n').find((l) => l.includes('const hit = hostApproval.decide('))
   if (!decideLine) throw new Error('v1.12.7-3: index.js 找不到 decide 的调用点')
-  if (/sessionOnly:\s*disallowToolGrant/.test(decideLine))
-    throw new Error('v1.12.7-3: 两档开关又焊死在一起（sessionOnly: disallowToolGrant）——越权会被放进落盘项目档')
-  if (!/\bdisallowToolGrant,\s*sessionOnly\b/.test(decideLine))
-    throw new Error(`v1.12.7-3: decide 调用行必须同时传两个独立开关：${decideLine.trim()}`)
+  if (/sessionOnly/.test(decideLine))
+    throw new Error(`v1.12.14-3: decide 调用行还在传 sessionOnly：${decideLine.trim()}`)
+  if (!/\bdisallowToolGrant\s*\}/.test(decideLine) && !/\bdisallowToolGrant,/.test(decideLine))
+    throw new Error(`v1.12.14-3: decide 调用行必须仍传 disallowToolGrant（工具两档的开关）：${decideLine.trim()}`)
   if (!/const disallowToolGrant = isDisallowedAutoGrant\(ctxInfo\.toolName, ctxInfo\.reason\)/.test(idx))
     throw new Error('v1.12.7-3: disallowToolGrant 的判据被改名/移位（工具名档的开关来源变了）')
   // 危险命令门 / 超长门 / 执行类无正文门必须仍排在工具名短路之前（顺序哨兵，位置敏感）
@@ -1266,12 +1265,16 @@ if (!c.includes('uiSubs')) throw new Error('v0.9.29: 持久化状态应有订阅
     throw new Error('v1.12.7-6: 琥珀通道「仅本次」必须 sendDecision(allow-once) 且不传 paths')
   if (/sendDecision\(a, "allow-once", "仅本次放行", /.test(clientV7))
     throw new Error('v1.12.7-6: 琥珀通道「仅本次」传了 paths —— 产品侧会据此写档（路径档或工具名档）')
-  // toolTierDisk：宿主恒 false（只有会话级工具档）、琥珀 = 该按钮是否落盘
-  if (!clientV7.includes('toolTierDisk: false,')) throw new Error('v1.12.7-6: 宿主通道没把 toolTierDisk=false 透给弹框')
+  // toolTierDisk：v1.12.14 起宿主**项目档**这一支真的落盘工具档（toolTierDisk = scope === "project"），
+  // 会话档那一支仍会话级；琥珀通道 = 该按钮是否落盘
+  if (!clientV7.includes('toolTierDisk: scope === "project",'))
+    throw new Error('v1.12.14: 宿主通道没把「项目档会落盘工具档」透给弹框（二级说明会说谎）')
+  if (clientV7.includes('toolTierDisk: false,'))
+    throw new Error('v1.12.14: 宿主通道仍硬编码 toolTierDisk=false（旧缺陷回来了）')
   if (!clientV7.includes('toolTierDisk: grant.projectTier === true,'))
     throw new Error('v1.12.7-6: 琥珀通道没把「工具名档是否落盘」透给弹框（二级说明会说谎）')
-  if (!clientV7.includes('宿主通道的工具名档只有会话级'))
-    throw new Error('v1.12.7-6: 项目档 + 宿主通道时必须点明「要落盘请勾目录」（否则用户以为已落盘）')
+  if (clientV7.includes('宿主通道的工具名档只有会话级'))
+    throw new Error('v1.12.14: 已失效的旧提示「宿主通道的工具名档只有会话级」回来了（面板会说谎）')
 
   // ── ③ 跨仓展示：grantTier/Reason/Dropped 三键（0.7.10）──
   if (!dispatchV7.includes("|| outcome === 'granted-once-fallback'"))
@@ -1939,6 +1942,102 @@ if (!c.includes('uiSubs')) throw new Error('v0.9.29: 持久化状态应有订阅
       rmSync(home2, { recursive: true, force: true })
     }
   }
+}
+
+// ── v1.12.14：显式点项目档不再降级 ⇒ 落盘工具档（与 product-subagents 共用 schema）──
+{
+  const home14 = mkdtempSync(path.join(os.tmpdir(), 'dsh-verify-v1214-'))
+  const origHome14 = process.env.DSH_HOME
+  const ha14 = await import('./lib/host-approval.js')
+  process.env.DSH_HOME = home14
+  try {
+    const { HostApprovalRules, NATIVE_PRODUCT, toolGrantKey, compileRuleTools, sameCwd } = ha14
+    if (NATIVE_PRODUCT !== 'main') throw new Error('v1.12.14: NATIVE_PRODUCT 必须是 main（与 ACP 产品维度隔离）')
+    // 键格式：与 product-subagents 的 toolGrantKey/compileRuleTools 逐字同构
+    if (toolGrantKey('main', 'Write') !== 'main:write') throw new Error('v1.12.14: 工具键没做小写/trim 归一')
+    if (toolGrantKey('', 'bash') !== null || toolGrantKey('main', 'other') !== null)
+      throw new Error('v1.12.14: 空产品维度或占位类别竟能造出工具键（会写成通配授权）')
+    if (JSON.stringify(compileRuleTools(['main:Bash'], null)) !== '["main:bash"]')
+      throw new Error('v1.12.14: 带前缀的规则工具键没有原样归一')
+    if (compileRuleTools(['Bash'], null).length !== 0)
+      throw new Error('v1.12.14: 裸工具名 + 无 product 竟被接受（应丢弃，不许当通配）')
+    if (JSON.stringify(compileRuleTools([':x', 'x:', 'a:b:c'], 'main')) !== '[]')
+      throw new Error('v1.12.14: 脏工具键没被丢弃')
+    if (!sameCwd('/tmp', '/tmp/')) throw new Error('v1.12.14: sameCwd 对同一目录的两种写法判成不同')
+
+    const r14 = new HostApprovalRules()
+    const w14 = r14.appendProjectToolRule({ cwd: '/proj14', toolName: 'write' })
+    if (!w14.ok || w14.key !== 'main:write') throw new Error(`v1.12.14: 落盘工具档失败 ${JSON.stringify(w14)}`)
+    const env14 = JSON.parse(rf(r14.filePath, 'utf8'))
+    const rule14 = env14.rules[0]
+    if (JSON.stringify(Object.keys(rule14)) !== '["cwd","product","paths","tools","grantedAt","note"]')
+      throw new Error(`v1.12.14: 工具档条目键序/schema 变了 ${JSON.stringify(Object.keys(rule14))}`)
+    if (rule14.product !== 'main' || !Array.isArray(rule14.paths) || rule14.paths.length !== 0 ||
+        JSON.stringify(rule14.tools) !== '["main:write"]' || !rule14.grantedAt || typeof rule14.note !== 'string')
+      throw new Error(`v1.12.14: 工具档条目字段不合 schema ${JSON.stringify(rule14)}`)
+    // 幂等（同 cwd + 归一化键 ⇒ 不新增），不同工具 ⇒ 追加
+    r14.appendProjectToolRule({ cwd: '/proj14/', toolName: 'WRITE', note: '再来一次' })
+    if (JSON.parse(rf(r14.filePath, 'utf8')).rules.length !== 1)
+      throw new Error('v1.12.14: 同 (cwd, 归一化键) 重复写入新增了条目（幂等被破）')
+    r14.appendProjectToolRule({ cwd: '/proj14', toolName: 'bash' })
+    if (JSON.parse(rf(r14.filePath, 'utf8')).rules.length !== 2) throw new Error('v1.12.14: 不同工具没追加条目')
+    // 无 cwd / 相对 cwd / 占位工具名 ⇒ 拒绝
+    if (r14.appendProjectToolRule({ toolName: 'write' }).ok) throw new Error('v1.12.14: 缺 cwd 竟写成了工具档')
+    if (r14.appendProjectToolRule({ cwd: 'rel', toolName: 'write' }).ok) throw new Error('v1.12.14: 相对 cwd 竟写成了工具档')
+    if (r14.appendProjectToolRule({ cwd: '/proj14', toolName: 'other' }).ok) throw new Error('v1.12.14: 占位工具名竟写成了工具档')
+    // 读取侧（清空内存态：新实例 = 宿主重载后的形态）
+    const fresh14 = new HostApprovalRules()
+    const d14 = fresh14.decide({ sessionId: 'S', rootSessionId: 'S', cwd: '/proj14', paths: ['/outside/x.txt'], toolName: 'write' })
+    if (!d14.allowed || d14.scope !== 'project-tool')
+      throw new Error(`v1.12.14: 落盘工具档没被消费 allowed=${d14.allowed} scope=${d14.scope}`)
+    if (fresh14.decide({ sessionId: 'S', rootSessionId: 'S', cwd: '/proj14', paths: ['/outside/x.txt'], toolName: 'read' }).allowed)
+      throw new Error('v1.12.14: 未授权的工具被落盘工具档放行（键匹配过宽）')
+    if (fresh14.decide({ sessionId: 'S', rootSessionId: 'S', cwd: '/other', paths: ['/outside/x.txt'], toolName: 'write' }).allowed)
+      throw new Error('v1.12.14: 不同 cwd 被落盘工具档放行（项目隔离被破）')
+    if (fresh14.decide({ sessionId: 'S', rootSessionId: 'S', cwd: null, paths: ['/outside/x.txt'], toolName: 'write' }).allowed)
+      throw new Error('v1.12.14: 请求无 cwd 竟命中项目级工具档')
+    if (fresh14.projectToolRulesCover('/proj14', 'write', 'qoder'))
+      throw new Error('v1.12.14: ACP 产品维度吃到了主代理工具档（两链路应互不误放）')
+    if (fresh14.decide({ sessionId: 'S', rootSessionId: 'S', cwd: '/proj14', paths: ['/outside/x.txt'], toolName: 'write', disallowToolGrant: true }).allowed)
+      throw new Error('v1.12.14: disallowToolGrant 没关掉落盘工具档（工具两档必须同门）')
+    // sessionOnly 已下线：传了也不再抑制任何档
+    if (!fresh14.decide({ sessionId: 'S', rootSessionId: 'S', cwd: '/proj14', paths: ['/outside/x.txt'], toolName: 'write', sessionOnly: true }).allowed)
+      throw new Error('v1.12.14: 旧的 sessionOnly:true 仍在抑制落盘档（读侧放开未生效）')
+  } finally {
+    if (origHome14 === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = origHome14
+    rmSync(home14, { recursive: true, force: true })
+  }
+
+  // 源码级：写侧分流 + 留痕 + 读侧放开的锚点（改回去即抛）
+  const idx14 = rf(path.join(root, 'index.js'), 'utf8')
+  for (const [pat, msg] of [
+    [/const persistToolRule = scope === 'project'/, 'v1.12.14: index.js 缺「按 scope 分流」判据'],
+    [/hostApproval\.appendProjectToolRule\(\{/, 'v1.12.14: 项目档那一支没调用落盘工具档'],
+    [/action: 'rule-tool-disk'/, 'v1.12.14: 落盘工具档没有留痕'],
+    [/action: 'rule-tool-disk-failed'/, 'v1.12.14: 落盘失败没有回退留痕'],
+    [/action: 'rule-project-written'/, 'v1.12.14: 显式点项目档没有如实留痕'],
+  ]) {
+    if (!pat.test(idx14)) throw new Error(msg)
+  }
+  if (/action: 'rule-downgraded'/.test(idx14)) throw new Error('v1.12.14: 越权降级分支还在（守卫没真正放开）')
+  // 写侧降级门的行为级牙：`if (sandboxEscalated) { … addSessionRule … }` 形状 = 显式点项目档又被降级
+  if (/if\s*\(\s*sandboxEscalated\s*\)\s*\{[^}]{0,200}addSessionRule/.test(idx14))
+    throw new Error('v1.12.14: 越权降级门被加回来了（显式点项目档又被降级成会话档）')
+  const projWriteAt = idx14.indexOf('writeResult = hostApproval.appendProjectRule(')
+  if (projWriteAt < 0) throw new Error('v1.12.14: 找不到项目档落盘调用点（appendProjectRule）')
+  if (/if\s*\(\s*sandboxEscalated\s*\)/.test(idx14.slice(Math.max(0, projWriteAt - 300), projWriteAt)))
+    throw new Error('v1.12.14: 项目档落盘调用被 sandboxEscalated 条件包住（降级门复活）')
+  if (/const sessionOnly =/.test(idx14)) throw new Error('v1.12.14: handler 里还在算 sessionOnly')
+  if (/sessionOnly\s*[:,]/.test(idx14)) throw new Error('v1.12.14: decide 调用点还在传 sessionOnly')
+  const lib14 = rf(path.join(root, 'lib', 'host-approval.js'), 'utf8')
+  if (!lib14.includes('fs.renameSync(tmp, this.#file)')) throw new Error('v1.12.14: 工具档没走原子写')
+  if (!lib14.includes('scope: \'project-tool\'')) throw new Error('v1.12.14: decide 缺落盘工具档分支')
+  if (/!sessionOnly/.test(lib14)) throw new Error('v1.12.14: 读侧 sessionOnly 抑制还在')
+  const cli14 = rf(path.join(root, 'lib', 'client.js'), 'utf8')
+  if (!cli14.includes('toolTierDisk: scope === "project",')) throw new Error('v1.12.14: 宿主项目档没透「会落盘」')
+  if (!cli14.includes('落盘一条工具档')) throw new Error('v1.12.14: 二级说明没写「落盘一条工具档」')
+  if (!cli14.includes('照常落盘')) throw new Error('v1.12.14: 越权 + 项目档的说明没写「照常落盘」')
 }
 
 console.log(`OK: ${PKG_NAME} v${pkg.version} 一致性链（无内置 Agent）+ ${tools.length} 工具 + /${commands.join('/')} 命令`)

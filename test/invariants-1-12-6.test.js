@@ -99,8 +99,8 @@ function tempRules() {
 }
 
 // ─────────────────────────────────────────────────────────────────
-describe('不变量①：沙箱越权——工具名档与落盘项目档都不适用，会话路径档照旧', () => {
-  it('decide 真值表：两个开关各管一档，互不牵连', () => {
+describe('不变量①：v1.12.14 起本插件不再做「档位级排除」（用户裁定：显式点项目档不降级 ⇒ 写侧照落盘、读侧照消费）', () => {
+  it('decide 真值表：只剩 disallowToolGrant 一个开关（关工具两档），项目档照常参与', () => {
     const t = tempRules()
     try {
       const r = t.rules
@@ -109,24 +109,31 @@ describe('不变量①：沙箱越权——工具名档与落盘项目档都不�
       r.appendProjectRule({ cwd: '/proj', paths: ['/tmp/inv1/gamma'], note: '项目档' })
 
       const base = { sessionId: 'root-1', rootSessionId: 'root-1', cwd: '/proj', paths: ['/tmp/inv1/gamma/x.txt'], toolName: 'bash' }
-      // A 三档全开：工具名档先短路（越权请求**不该**走到这里，见 index.js 的早退与 disallow 门）
-      assert.equal(r.decide({ ...base, disallowToolGrant: false, sessionOnly: false }).scope, 'session-tool')
-      // B 只关工具名档：落到落盘项目档
-      const b1 = r.decide({ ...base, disallowToolGrant: true, sessionOnly: false })
+      // A 全开：内存工具档先短路
+      assert.equal(r.decide({ ...base, disallowToolGrant: false }).scope, 'session-tool')
+      // B 只关工具档：落到落盘项目档
+      const b1 = r.decide({ ...base, disallowToolGrant: true })
       assert.equal(b1.allowed, true)
       assert.equal(b1.scope, 'project', 'disallowToolGrant 把项目档也一起关了（两档开关串味）')
-      // C 只关项目档：工具名档照旧（证明 sessionOnly 不牵连别的档）
-      assert.equal(r.decide({ ...base, disallowToolGrant: false, sessionOnly: true }).scope, 'session-tool')
-      // D 双开关 + 项目档覆盖但会话路径不覆盖 ⇒ 必须不放行（越权不落盘的语义就是这条）
-      const d = r.decide({ ...base, disallowToolGrant: true, sessionOnly: true })
-      assert.equal(d.allowed, false, 'sessionOnly 没跳过落盘项目档（越权可被长期白名单静默放行）')
-      // E 双开关 + 会话路径档覆盖得到 ⇒ 只剩这一档命中（越权的真实形态）
-      const e = r.decide({ ...base, paths: ['/tmp/inv1/alpha/c.txt'], disallowToolGrant: true, sessionOnly: true })
-      assert.equal(e.allowed, true, '越权把会话路径记忆也废了（1.12.x 一刀切回归）')
-      assert.equal(e.scope, 'session', '越权命中不该来自别的档位')
-      // F 双开关 + 无任何覆盖 ⇒ 不放行
-      const f = r.decide({ ...base, paths: ['/tmp/other/q.txt'], disallowToolGrant: true, sessionOnly: true })
-      assert.equal(f.allowed, false, '越权请求被通配规则白嫖了')
+      // C 项目档覆盖、会话路径不覆盖 ⇒ **放行**（v1.12.14 读侧对称放开的靶子）
+      const d = r.decide({ ...base, disallowToolGrant: true })
+      assert.equal(d.allowed, true, '落盘项目档没被消费（读侧 sessionOnly 若被加回来，这里转红）')
+      assert.equal(d.scope, 'project')
+      // E 会话路径档覆盖得到 ⇒ 只剩这一档命中
+      const e = r.decide({ ...base, paths: ['/tmp/inv1/alpha/c.txt'], disallowToolGrant: true })
+      assert.equal(e.allowed, true, '会话路径记忆被废了（1.12.x 一刀切回归）')
+      assert.equal(e.scope, 'session', '命中不该来自别的档位')
+      // F 无任何覆盖 ⇒ 不放行
+      const f = r.decide({ ...base, paths: ['/tmp/other/q.txt'], disallowToolGrant: true })
+      assert.equal(f.allowed, false, '请求被通配规则白嫖了')
+      // G 落盘工具档（v1.12.14 新档）：disallowToolGrant 必须关得住它
+      r.appendProjectToolRule({ cwd: '/proj', toolName: 'write' })
+      const gBase = { sessionId: 'root-1', rootSessionId: 'root-1', cwd: '/proj', paths: ['/tmp/other/q.txt'], toolName: 'write' }
+      const g1 = r.decide({ ...gBase, disallowToolGrant: false })
+      assert.equal(g1.allowed, true, '落盘工具档没被消费（二级选择②的靶子）')
+      assert.equal(g1.scope, 'project-tool')
+      assert.equal(r.decide({ ...gBase, disallowToolGrant: true }).allowed, false,
+        'disallowToolGrant 没关掉落盘工具档（工具两档必须同门）')
     } finally { t.restore() }
   })
 

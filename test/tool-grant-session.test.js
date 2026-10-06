@@ -592,7 +592,11 @@ describe('decide disallowToolGrant（越权只跳工具名档，路径档照旧�
   // 「这个工作目录里这些路径」的长期白名单，用它替越权放行等于把「某路径可以提权到
   // danger-full-access」静默留存到后续会话——明确否决。sessionOnly 因此必须在
   // disallowToolGrant 之外再关一档。
-  it('sessionOnly=true（越权二次裁定）→ 落盘项目档即使覆盖该路径也不放行', () => {
+  // v1.12.14（用户裁定，放开 v1.12.5 的读侧守卫）：用户在授权界面显式点项目档时，
+  // 写侧照落盘、读侧照消费 ⇒ decide 的 sessionOnly 参数随之下线。本用例保留同一个
+  // 夹具、只把期望翻面：越权（reason 判据）**不再**影响落盘项目档；传旧的
+  // sessionOnly:true 也不再有任何抑制效果（参数已删，多余键被解构忽略）。
+  it('越权不再抑制落盘项目档（v1.12.14 读侧对称放开；旧 sessionOnly:true 已成无效键）', () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dad-esconly-'))
     const prev = process.env.DSH_HOME
     process.env.DSH_HOME = home
@@ -600,15 +604,16 @@ describe('decide disallowToolGrant（越权只跳工具名档，路径档照旧�
       const rules = new HostApprovalRules()
       const wr = rules.appendProjectRule({ cwd: '/home/test', paths: ESC_PATHS })
       assert.equal(wr.ok, true, '项目规则本身要能落盘，否则这条用例是在测空集')
-      // 前置确认：项目档确实覆盖这些路径（否则"不放行"可能只是因为没覆盖）
+      // 前置确认：项目档确实覆盖这些路径（否则"放行"可能只是因为别的档命中）
       assert.equal(rules.projectRulesCover('/home/test', ESC_PATHS), true)
       assert.deepEqual(rules.sessionRules('root-1'), [], '会话档必须为空，命中与否只能由项目档解释')
+      assert.deepEqual(rules.toolGrants('root-1'), [], '工具档必须为空，命中与否只能由项目档解释')
       const d = rules.decide({
         sessionId: 'child-1', rootSessionId: 'root-1', cwd: '/home/test', paths: ESC_PATHS,
         toolName: 'bash', disallowToolGrant: true, sessionOnly: true,
       })
-      assert.equal(d.allowed, false, '越权被落盘项目档放行了（二次裁定被破）')
-      assert.notEqual(d.scope, 'project')
+      assert.equal(d.allowed, true, '落盘项目档没被消费（读侧 sessionOnly 若被加回来，这里转红）')
+      assert.equal(d.scope, 'project')
     } finally {
       if (prev === undefined) delete process.env.DSH_HOME
       else process.env.DSH_HOME = prev
@@ -616,31 +621,33 @@ describe('decide disallowToolGrant（越权只跳工具名档，路径档照旧�
     }
   })
 
-  it('sessionOnly 只影响越权：非越权请求的落盘项目档放行照旧（回归守卫）', () => {
+  it('落盘项目档对越权与非越权一视同仁（v1.12.14；旧 sessionOnly 键不再改变结果）', () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dad-normalproj-'))
     const prev = process.env.DSH_HOME
     process.env.DSH_HOME = home
     try {
       const rules = new HostApprovalRules()
       rules.appendProjectRule({ cwd: '/home/test', paths: ESC_PATHS })
-      // 同一份落盘规则、同一个根键，只把 sessionOnly 翻掉：必须放行在 project 档
       const d = rules.decide({
         sessionId: 'child-2', rootSessionId: 'root-2', cwd: '/home/test', paths: ESC_PATHS,
-        toolName: 'write', sessionOnly: false,
+        toolName: 'write',
       })
-      assert.equal(d.allowed, true, '非越权的项目档放行被一起关掉了（超出裁定范围）')
+      assert.equal(d.allowed, true, '非越权的项目档放行被关掉了（超出裁定范围）')
       assert.equal(d.scope, 'project')
+      // 同一条规则、同一请求，只把旧的 sessionOnly/disallowToolGrant 组合加上 ⇒ 必须同样放行
       const esc = rules.decide({
         sessionId: 'child-2', rootSessionId: 'root-2', cwd: '/home/test', paths: ESC_PATHS,
         toolName: 'write', disallowToolGrant: true, sessionOnly: true,
       })
-      assert.equal(esc.allowed, false, '同一规则下越权仍不该吃到项目档')
+      assert.equal(esc.allowed, true, '落盘项目档仍被越权判据排除（v1.12.14 读侧放开没生效）')
+      assert.equal(esc.scope, 'project')
     } finally {
       if (prev === undefined) delete process.env.DSH_HOME
       else process.env.DSH_HOME = prev
       fs.rmSync(home, { recursive: true, force: true })
     }
   })
+
 })
 
 // ── v1.12.1 修复：路径规则写入键与判定键一致性 ──
@@ -1012,7 +1019,11 @@ describe('真实审批监听器集成判定（index.js 的 ctx.on("approval/requ
   // sessionOnly 真正带上；漏传时越权会被项目白名单静默放行。
   // v1.12.7 的解耦点：`sessionOnly: disallowToolGrant` 那个焊点必须拆开——判据拆开
   // 后 disallowToolGrant 恒 false，焊点若还在，越权就会连项目档一起放开（跨会话提权）。
-  it('⑫ 越权 + 只有落盘项目档覆盖该路径 → next()（项目档对越权不参与）', async () => {
+  // v1.12.14（用户裁定）：v1.12.5 的「越权不得走落盘项目档」读侧守卫被放开——
+  // 写侧既然按用户显式选择照落盘，读侧再抑制就等于「落盘了也读不到」。本用例保留
+  // 同一个 handler 层夹具（生产唯一入口），把期望翻面：越权由落盘项目档放行，
+  // 非越权对照照旧放行（证明项目档没被整个废掉）。
+  it('⑫ 越权 + 只有落盘项目档覆盖该路径 → allowed-once（项目档对越权同样参与，v1.12.14）', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dad-12-'))
     const prev = process.env.DSH_HOME
     process.env.DSH_HOME = home
@@ -1028,11 +1039,10 @@ describe('真实审批监听器集成判定（index.js 的 ctx.on("approval/requ
       const esc = await callHandler(mk(), {
         session: mkEscalationSession('child-1', 'root-1'), callId: 'c-esc', toolName: 'bash', reason: ESC_REASON,
       })
-      assert.equal(esc.nextCalled, true, '越权被落盘项目档放行了（二次裁定：只允许会话档）')
-      assert.notEqual(esc.result, 'allowed-once')
+      assert.equal(esc.result, 'allowed-once', '越权没吃到落盘项目档（v1.12.14 读侧对称放开的靶子）')
+      assert.equal(esc.nextCalled, false)
 
-      // 差分对照：同一份落盘规则、同一 fixture，只把 reason 换成非越权 → 必须放行，
-      // 证明 handler 没把项目档整个废掉（那会误伤非越权请求）。
+      // 差分对照：同一份落盘规则、同一 fixture，非越权请求同样必须放行
       const plain = await callHandler(mk(), {
         session: mkEscalationSession('child-1', 'root-1'), callId: 'c-esc', toolName: 'bash',
         reason: 'tool requires approval',
@@ -1045,4 +1055,5 @@ describe('真实审批监听器集成判定（index.js 的 ctx.on("approval/requ
       fs.rmSync(home, { recursive: true, force: true })
     }
   })
+
 })

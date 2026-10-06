@@ -1,3 +1,140 @@
+## 1.12.14（2026-10-06）
+
+> 一句话：**修「二级选择『落盘工具放行任意路径』没落盘」的缺口**，并按用户裁定**放开
+> v1.12.5/v1.12.7 的越权写侧与读侧守卫**（放开条件只有一条：用户在授权界面**显式点项目档**）。
+> 危险命令门 / 超长门 / 执行类无正文门与全部判据**一字未动** —— 84,672 条语料对照
+> 1.12.13 冻结树 **diff = 0**（旧 HIT 56,343 = 新 HIT 56,343，无一例转松或转紧）。
+
+### 现场（用户实测，装的是 1.12.13）
+
+原生工具审批弹框里选「总是允许（本项目）」、**一条路径都不勾** ⇒ 弹框给两个二级选择：
+①「允许一次」、②「落盘工具放行任意路径」。用户选 ② 之后：
+
+- `~/.dsh/data/dsh-agent-dispatch/dispatches.jsonl` 只落一条
+  `2026-10-06T14:42:01.344Z kind=host-approval action=rule-tool-only scope=session tool=write dropped=0`（内存态）；
+- 共用落盘文件 `~/.dsh/data/dsh-plugin-product-subagents/allowlist.json` **md5/mtime 一字未动、无新增条目**。
+
+用户预期：选 ② 就该落盘一条工具档，重载宿主后同工具在工作区外仍然免弹；选 ① 才是不落盘的一次性放行。
+
+**根因**（`index.js`，改前行号）：`if (useDeclared && paths.length === 0)`（`:2191`）这条空声明短路
+**与 scope 无关** —— 无论客户端报 `scope:'session'`（本会话档）还是 `'project'`（项目档），都只调
+`hostApproval.addToolGrant(rootSessionId, toolName)`（`:2200`，**仅内存**）并落 `action:'rule-tool-only',
+scope:'session'`（`:2213`），随后把响应档位改写回 `scope:'session'`（`:2272-2275`）⇒
+`appendProjectRule` 那条落盘分支根本不可达。客户端也确实把「要不要落盘」编码在 scope 上
+（`lib/client.js:1268-1352` 的二级选择：①`{paths:null, mode:'once'}` 不发 POST、②`{paths:[],
+mode:'tools'}` 走项目档），只是服务端没有据此分流。
+
+### 改动（两项语义 + 一条有意放开的守卫）
+
+**① 空路径集 + 二级选择② ⇒ 真的落盘工具档**（`index.js` 的 `persistToolRule` 分流 +
+`lib/host-approval.js` 的 `appendProjectToolRule` / `projectToolRulesCover` / `decide` 的 `scope:'project-tool'` 档）
+
+- 落盘条目：`{cwd, product:'main', paths:[], tools:['main:<工具名>'], grantedAt, note}`；
+  `paths: []` 是刻意的（schema 要求 `paths` 存在，同时表达「不写任何路径档」）。
+- **只追加不覆盖**：幂等键 = `(cwd 真身, 归一化工具键)`；同键二次写只更新 `grantedAt`/`note`，
+  既有条目（含 ACP 侧写在同一条目上的 `product`/`tools`）一律原样保留；原子写沿用 tmp+rename。
+- 读取侧：`decide` 在内存工具档之后新增**落盘工具档**档（`scope:'project-tool'`），
+  判据与 product-subagents `ruleCoversRequest` 的 tools 分支逐字同语义：
+  `cwdOk`（真身全等）+ 请求工具键 ∈ `compileRuleTools(rule.tools, rule.product)`。
+- 落盘失败（或取不到 cwd/工具名）⇒ 回退会话工具档并在响应里如实回 `toolPersisted:false`，
+  日志落 `action:'rule-tool-disk-failed'`（**不许静默降级**：用户以为落盘了、实际没有 = 必须可见）。
+
+**② 勾了 ≥1 个绝对目录 + 点项目档 ⇒ 照旧落盘路径档，且不再因沙箱越权降级**
+
+> **放开守卫登记（有意为之，用户 2026-10-06 裁定）**：v1.12.5 二次裁定的
+> 「沙箱越权请求不得写项目白名单」（写侧）与 `decide` 的 `sessionOnly`（读侧）**双双下线**。
+> **放开条件只有一条**：用户在授权界面**显式点项目档**（蓝球「总是允许(项目)」）。
+> 用户的理由是「勾了路径 + 本项目 ⇒ 也落盘，真的写进项目 allowlist」；读侧必须同批放开，
+> 否则「写盘了但读不到」= 用户点完重载后又弹，正是本次要修的缺口。
+> 留痕：`action:'rule-project-written'` + `escalation:true` + message 注明「用户显式选择项目档 ⇒ 不降级」；
+> 旧的 `action:'rule-downgraded'` 与 `projectSuppressed` 字段**不再出现**。
+
+**其余守卫一个都没放松**（`test/invariants-1-12-14.test.js` 逐条钉住）：
+
+- 全非法/全丢弃声明 ⇒ 400，且 `allowlist.json` **一个字节都不变**；
+- 「仅本次放行」（`paths:null`）⇒ 200 `written:false`，不写任何档；
+- 会话档那一支（`scope:'session'`）⇒ 仍然**不落盘**（只写内存工具档 + `rule-tool-only` 留痕）；
+- `cwd` 缺失/相对路径 ⇒ 拒绝写工具档；请求无 `cwd` ⇒ 不命中项目级工具档（项目隔离）；
+- 未授权的工具 / 不同 cwd / ACP 产品维度 ⇒ 一律不命中（`main:<工具>` 与 `<provider>:<工具>` 不可能相等）；
+- `disallowToolGrant` 仍关**工具两档**（内存 + 落盘），路径两档照旧；
+- **危险命令门仍排在所有档位之前**：`rm -rf` / `git push` / `npm publish` 命中时 `next()`、
+  且**不写任何档**（用例：门命中后 allowlist 字节不变、无 `auto-grant`/`rule-*` 留痕）。
+
+### 键格式与跨仓对应（**需与 product-subagents 同批上线**）
+
+- 工具键 = `` `${product}:${toolName}` ``（两侧各 `trim().toLowerCase()`；空值或占位类别
+  `other/unknown/default/misc/''` ⇒ 不写键）。主代理（宿主审批链路）的产品维度固定
+  `NATIVE_PRODUCT = 'main'`，ACP 侧是 provider 名（`qoder`/`deveco`/…）⇒ 两链路互不误放。
+- A 仓自己的读取侧用 `projectToolRulesCover(cwd, toolName, 'main')` 消费；
+  B 仓（product-subagents `lib/permission-rules.js`）的 `ruleCoversRequest` 的 **tools 分支优先**
+  语义可直接读回同一条目：`compileRuleTools(['main:<工具>'], 'main')` 归一成键，
+  `sameCwd`（真身全等）判 cwd。**本版没有改 B 仓任何文件**；上线时必须两仓同批，
+  否则共享文件里出现 `tools` 字段时老版 B 仓不认（它只认路径档，会静默忽略 ⇒ 工具档不生效）。
+- schema 只做加法：条目仍是 `{version, rules:[…]}`，新条目多一个 `tools` 键、`paths` 为空数组；
+  路径档条目的字节形态与 1.12.13 逐字一致（`test/invariants-1-12-6.test.js` 的字节形态守卫仍绿）。
+
+### 用例与读数（v1.12.14）
+
+- `node --test test/*.test.js` ⇒ `# tests 713 / # suites 173 / # pass 713 / # fail 0 / # cancelled 0 / # skipped 0 / # todo 0`，exit 0（连跑两次同值）。
+- 新增 `test/invariants-1-12-14.test.js` **12 条**（①端点级落盘工具档 + 清空内存态后命中、②越权 + 项目档照落盘、
+  ③保留守卫四项（仅本次 / 全丢弃 400 且字节不变 / 危险门命中不写档 / 会话档不落盘）、
+  ④键与 cwd 的两仓共识语义（`toolGrantKey` / `compileRuleTools` 同构、软链真身、幂等与只追加、三种拒绝）、
+  ⑤源码级守卫 3 条）。
+- 语义翻转的既有用例（按用户裁定翻面，保留原夹具 + 注明改前行为）：
+  `test/host-approval-endpoint.test.js` 4 条、`test/invariants-1-12-7.test.js` 3 → 4 条、
+  `test/invariants-1-12-6.test.js` 真值表 1 条、`test/tool-grant-session.test.js` 3 条、
+  `test/grant-dialog.test.js` 2 条文案断言。
+- `node verify.mjs` ⇒ `OK: @kiligzzz/dsh-agent-dispatch v1.12.14 一致性链（无内置 Agent）+ 11 工具 + / 命令`，exit 0
+  （新增 v1.12.14 块：键格式/幂等/schema 键序/隔离/`disallowToolGrant`/旧 `sessionOnly` 不再是有效键 +
+  源码锚点，**并含一条写侧降级门的反向守卫**）。
+- **1.12.7 存量套件**（`/tmp/hd-repro/inc10/head7`，1.12.7 的测试 + 本版源码）⇒
+  `# tests 593 / # pass 567 / # fail 26`，exit 1。26 条失败**逐条**归因：
+  **16 条**是本轮**有意**的语义翻转（越权 + 项目档 ⇒ 不落盘 / `sessionOnly` 读侧抑制 /
+  空声明 ⇒ 不落盘 / `toolTierDisk: false` 文案 / 真值表「两个开关」），
+  **10 条**是 1.12.12 起就存在、与本版无关的既有语义变化（1.12.11 → 1.12.12 的全文判定层：
+  误伤守卫 2 条、`find -exec` / `yarn npm publish` / 反斜杠转义引号 / 包装递归上限 2 条 /
+  `args` 全字符串 / 分段起点 / `wrapper-option-ambiguity` 兜底）。
+  **1.12.13 时的同一套件读数是 583/593（10 fail）** ⇒ 差值恰好是上面那 16 条。
+- CI：`.github/workflows/ci.yml` 的 `MIN_TESTS 698 → 711`（留 2 条余量；
+  `test/host-0.2-compat.test.js:333` 硬编码 macOS 路径的用例在 ubuntu 必然 skip ⇒ CI 期望 pass 712）。
+
+### 变异（转红）自证
+
+基线：`lib/host-approval.js` md5 `a6293a6bb8b48d420d49cfc4d5595162`、`index.js` md5
+`72fa5b18fadeddd7fa4396340a604408`。每条变异跑完都 `cp -p` 恢复 + `cmp` 逐字节相同 +
+md5 等于基线 + `shasum -a 256 -c` OK + `grep -c 'MUT-'` = 0（全绿，无残留）。
+
+| 变异 | 靶子（改了什么） | tests / pass / fail | 转红（叶子） | test exit | verify exit |
+| --- | --- | --- | --- | --- | --- |
+| `control` | 不改 | 713 / 713 / 0 | 0 | 0 | 0 |
+| `tool-session-only` | ① 改回只写会话档（`persistToolRule = false`） | 713 / 708 / 5 | 空声明+project落盘档 / 端点级清空内存态命中 / 危险门不写档 / index.js 分流源码 / 越权+空声明落盘 | 1 | 1 |
+| `downgrade-back` | ② 把越权降级门加回（`if (sandboxEscalated) … addSessionRule`） | 713 / 707 / 6 | 越权项目档落盘×4 / 只追加不覆盖 / 沙箱越权照落盘 | 1 | 1 |
+| `read-suppress` | 读侧 `sessionOnly` 抑制加回 | 713 / 710 / 3 | lib 源码守卫 / 越权不再抑制落盘档 / 越权一视同仁 | 1 | 1 |
+| `no-tool-persist-read` | 删掉落盘工具档读取分支 | 713 / 707 / 6 | 空声明落盘档×2 / 软链真身 / lib 源码守卫 / 真值表 / 越权+空声明 | 1 | 1 |
+| `overwrite-rules` | 工具档改成覆盖式写（`rules.length = 0`） | 713 / 712 / 1 | 只追加不覆盖 + 归一化幂等 | 1 | 1 |
+
+- `verify.mjs` 的首个失败断言（供复核对齐）：`tool-session-only` ⇒ `v1.12.14: index.js 缺「按 scope 分流」判据`；
+  `read-suppress` ⇒ `v1.12.14: 落盘项目档没被消费（读侧放开未生效）allowed=false scope=null`；
+  `no-tool-persist-read` ⇒ `v1.12.14: 落盘工具档没被消费 allowed=false scope=null`；
+  `overwrite-rules` ⇒ `v1.12.14: 不同工具没追加条目`；
+  `downgrade-back` ⇒ `v1.12.14: 越权降级门被加回来了（显式点项目档又被降级成会话档）`。
+- **订正登记**：`downgrade-back` 首次跑时 `verify.mjs` 仍是 exit 0（当时 verify 只对**读侧**有牙），
+  随即补了写侧反向守卫（`if (sandboxEscalated) { … addSessionRule … }` 形状 + `appendProjectRule`
+  调用点前 300 字符不许出现 `if (sandboxEscalated)`），复跑 ⇒ verify exit 1（上表已是补后的读数）。
+
+### 未做 / 未验证
+
+- **未改 B 仓**（`dsh-plugin-product-subagents`）：按任务约束只改 A 仓；B 仓读取侧的兼容性用只读探针
+  （导入 B 的 `ruleCoversRequest`）验证：`{product:'main', toolName:'write'}` ⇒ `via:'tools'` 命中，
+  `{product:'qoder', toolName:'write'}` ⇒ MISS，路径请求不会被工具档放行。**上线需两仓同批**。
+- 未做安装级/实机链路验证（不碰 `~/.dsh`、不 commit、不打包）；文件级断言全部走临时 `DSH_HOME`。
+- 未验证多进程并发写同一 `allowlist.json`（沿用既有 tmp+rename 原子写；A/B 两仓同时写仍是
+  「后写覆盖前写」的既有语义，本版未改）。
+- 未实现工具档的过期/回收（与路径档一样是长期条目，只能手工删 `allowlist.json` 条目后重载）——
+  登记为已知能力缺口。
+- 未验证「重载宿主」这一动作本身（探针用**新建 `HostApprovalRules` 实例 + 清空内存态**等价模拟；
+  宿主真实重载路径不在本仓测试面内）。
+
 ## 1.12.13（2026-10-06）
 
 > 一句话：**修 1.12.12 的缺陷**（独立终审：3 阻断 / 3 主要 / 8 次要），**判据方向不动** ——

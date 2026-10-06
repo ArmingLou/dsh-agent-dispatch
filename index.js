@@ -364,8 +364,10 @@ export function apply(ctx, config = {}) {
         }
         // 排除门按档位拆分（v1.12.5 用户裁定 + 二次裁定；v1.12.7 第三次裁定收窄）：
         //   ACP 孪生 → 本插件一档都不判，直接交回宿主与琥珀球（v1.11.4 语义完全不变）；
-        //   沙箱越权 → **v1.12.7 起只剩「禁用落盘项目级白名单」这一条约束**
-        //     （sessionOnly，见下面的档位判定）。用户裁定：**工具档不受越权限制**——
+        //   沙箱越权 → v1.12.14 起**本插件对越权请求不再做任何「档位级排除」**（用户裁定：
+        //     显式点项目档不降级 ⇒ 写侧照落盘、读侧照消费；v1.12.5 的「越权不得写项目白名单」
+        //     与读侧 sessionOnly 双双下线，登记见 CHANGELOG）。危险命令门/超长门/无正文门
+        //     仍在最前面，与档位无关。用户裁定：**工具档不受越权限制**——
         //     语义是同一工作区内该工具任意路径（含工作区外）直接放行；危险命令门、
         //     超长门、执行类无正文门在最前面，与档位无关，永远走交互。
         // 为什么改（用户本机实测）：几乎只有「沙箱越权」这一类请求会产生授权弹框
@@ -492,23 +494,21 @@ export function apply(ctx, config = {}) {
         if (ctxInfo.paths.length === 0) return next()
         // 两个开关**各管一档，判据同源但不再焊死**（v1.12.7 的关键解耦）：
         //   disallowToolGrant = isDisallowedAutoGrant（拆开后只剩 ACP 孪生 ⇒ 生产路径恒 false）
-        //     ⇒ 关「工具名档」；
-        //   sessionOnly = isSandboxEscalation(reason) 单独一条
-        //     ⇒ 关「落盘项目档」。
-        // 改前是 `sessionOnly: disallowToolGrant`：一旦把越权从 disallowToolGrant 里摘出去，
-        // 这个焊点会**顺带把越权放进项目档**（跨会话静默提权，用户明确否决过）——
-        // 所以拆判据必须同时拆这个焊点，两件事是同一次改动。
-        const sessionOnly = isSandboxEscalation(ctxInfo.reason)
-        const hit = hostApproval.decide({ sessionId, rootSessionId, cwd: ctxInfo.cwd, paths: ctxInfo.paths, toolName: ctxInfo.toolName, disallowToolGrant, sessionOnly })
+        //     ⇒ 关「工具名档」与「落盘工具档」；
+        //   v1.12.14（用户裁定「显式点项目档不降级」的读侧对称）：`sessionOnly` 参数下线 ——
+        //     落盘项目档（路径档与工具档）对沙箱越权请求**同样生效**。不加这条，
+        //     用户在弹框里点的「总是允许(项目)」写到盘上却对制造它的那类请求（工作区外写入）
+        //     永远不可见，重载宿主后照样弹，正是本次要修的缺口。
+        //     硬底线不变：危险命令门/超长门/执行类无正文门都在**更上面**，与档位无关。
+        const hit = hostApproval.decide({ sessionId, rootSessionId, cwd: ctxInfo.cwd, paths: ctxInfo.paths, toolName: ctxInfo.toolName, disallowToolGrant })
         if (hit.allowed) {
-          // v1.12.4：这里的 scope 只可能是 'session'（会话路径规则）或 'project'（项目规则）——
-          // 'session-tool' 档在上面已短路，永远到不了这里，故不再列进文案（v1.12.2 m2 是死文案）。
-          // v1.12.5 二次裁定：越权请求到这里只可能是 'session'——落盘项目档被 sessionOnly 跳过
-          // （工具名档在更上面就短路了，越权也一样）。
+          // v1.12.4：这里的 scope 可能是 'session'（会话路径规则）、'project'（落盘路径规则）
+          // 或 'project-tool'（v1.12.14 落盘工具档）——'session-tool' 档在更上面已短路，
+          // 永远到不了这里。
           // 留痕**不带 paths 数组**（用户裁决：单行要精炼）：完整路径既撑爆日志又没有排查价值，
           // 要看具体是哪几个路径，按 sessionId + callId 回宿主会话记录查。
           logApproval(
-            `宿主审批自动放行（${hit.scope === 'session' ? '本会话路径规则' : '项目规则'}命中）: ` +
+            `宿主审批自动放行（${hit.scope === 'session' ? '本会话路径规则' : hit.scope === 'project-tool' ? '落盘工具档' : '项目规则'}命中）: ` +
             `tool=${ctxInfo.toolName ?? '?'} scope=${hit.scope} session=${sessionId} ` +
             `root=${rootSessionId} pathCount=${ctxInfo.paths.length}`,
             {
@@ -2188,6 +2188,8 @@ export function apply(ctx, config = {}) {
             const isConfirmedRoot = rootSessionId !== sid || !!approvalCtx?.rootSessionId
             let writeResult
             let toolOnly = false
+            // v1.12.14：工具档真的落盘了吗（决定响应回 scope='project' 还是如实降级回 'session'）
+            let toolPersisted = false
             if (useDeclared && paths.length === 0) {
               // 弹框里**真删空**（`paths: []`，`dropped === []`）⇒ 「只要工具名」（用户明确定的
               // 语义）。v1.12.6 第五轮（终审 M-B）之后，**「给了但全非法」到不了这里** ——
@@ -2197,23 +2199,73 @@ export function apply(ctx, config = {}) {
               // purgeSession 清），读取侧现在会消费它：同一主会话内该工具任意路径
               // （含工作区外）直接放行；危险命令仍永远弹（门排在档位判定之前）。
               // 越权唯一被抑制的仍是**落盘项目档**（下面的 sandboxEscalated 分支）。
-              if (toolName && isConfirmedRoot) writeResult = hostApproval.addToolGrant(rootSessionId, toolName)
-              if (!writeResult) {
-                return send(res, 400, {
-                  ok: false,
-                  error: '路径已全部删空 ⇒ 本次只写工具名档，但工具名档写不出去'
-                    + `（toolName=${toolName ?? '未解析出'}${isConfirmedRoot ? '' : '，且无法确认根会话 id'}）`,
+              //
+              // v1.12.14（缺口修复）：客户端的二级选择把「要不要落盘」编码在 scope 上——
+              //   ①「允许一次」⇒ 客户端根本不发 POST（`d.mode==='once'`，paths:null 那条）;
+              //   ②「落盘工具放行任意路径」⇒ scope='project' + `paths: []` + toolName：
+              //      **必须落盘**一条工具档（`{cwd, product:'main', paths:[], tools:['main:<工具>'],
+              //      note}`，与 product-subagents 共用同一份 allowlist.json + 同一判定语义）；
+              //   · scope='session'（「本会话总是允许该工具」的二级选择）⇒ 只写内存档，
+              //     语义与本版之前逐字一致（不落盘）。
+              // 改前两条都只写内存档 —— 现场证据（按 ts+action）：`2026-10-06T14:42:01.344Z
+              // action=rule-tool-only scope=session tool=write dropped=0`，而共用
+              // allowlist.json md5/mtime 一字未动 ⇒ 用户以为「落盘」了、重载宿主后照样弹。
+              // 落盘失败（或取不到 cwd/toolName）时**回退内存档**并在响应里如实回
+              // `toolPersisted:false` + 日志 `rule-tool-disk-failed`（不许静默降级）。
+              const persistToolRule = scope === 'project'
+              let persistedToolRule = null
+              if (persistToolRule && toolName && cwd) {
+                persistedToolRule = hostApproval.appendProjectToolRule({
+                  cwd,
+                  toolName,
+                  note: '用户在授权界面选择「落盘工具放行任意路径」（该工具对本项目任意路径放行）',
                 })
               }
-              toolOnly = true
-              logApproval(
-                `宿主审批规则：路径声明为空 ⇒ 只写工具名档: ` +
-                `tool=${toolName} scope=session root=${rootSessionId} session=${sid} dropped=${declared.dropped.length}`,
-                {
-                  action: 'rule-tool-only', scope: 'session', tool: toolName, rootSessionId, sessionId: sid,
-                  requested: (body && Array.isArray(body.paths) ? body.paths.length : 0), droppedCount: declared.dropped.length,
-                },
-              )
+              if (persistedToolRule && persistedToolRule.ok) {
+                writeResult = persistedToolRule
+                toolOnly = true
+                toolPersisted = true
+                logApproval(
+                  `宿主审批规则：项目档 + 路径声明为空 ⇒ 落盘工具档: ` +
+                  `tool=${toolName} key=${persistedToolRule.key} cwd=${persistedToolRule.cwd} ` +
+                  `session=${sid} dropped=${declared.dropped.length}`,
+                  {
+                    action: 'rule-tool-disk', scope: 'project', tool: toolName, toolKey: persistedToolRule.key,
+                    cwd: persistedToolRule.cwd, rootSessionId, sessionId: sid,
+                    requested: (body && Array.isArray(body.paths) ? body.paths.length : 0), droppedCount: declared.dropped.length,
+                  },
+                )
+              } else {
+                if (persistToolRule) {
+                  logApproval(
+                    `宿主审批规则：落盘工具档失败 ⇒ 回退会话工具档（用户以为落盘了、实际只在本次会话生效，必须可见）: ` +
+                    `tool=${toolName ?? '未解析出'} cwd=${cwd ?? '无'} session=${sid} reason=${persistedToolRule?.error ?? '缺少 cwd 或工具名'}`,
+                    {
+                      action: 'rule-tool-disk-failed', scope: 'session', tool: toolName ?? null,
+                      cwd: cwd ?? null, rootSessionId, sessionId: sid,
+                      error: persistedToolRule?.error ?? '缺少 cwd 或工具名',
+                    },
+                  )
+                }
+                if (toolName && isConfirmedRoot) writeResult = hostApproval.addToolGrant(rootSessionId, toolName)
+                if (!writeResult) {
+                  return send(res, 400, {
+                    ok: false,
+                    error: '路径已全部删空 ⇒ 本次只写工具名档，但工具名档写不出去'
+                      + `（toolName=${toolName ?? '未解析出'}${isConfirmedRoot ? '' : '，且无法确认根会话 id'}`
+                      + `${persistToolRule ? `；落盘工具档也失败：${persistedToolRule?.error ?? '缺少 cwd 或工具名'}` : ''}）`,
+                  })
+                }
+                toolOnly = true
+                logApproval(
+                  `宿主审批规则：路径声明为空 ⇒ 只写工具名档: ` +
+                  `tool=${toolName} scope=session root=${rootSessionId} session=${sid} dropped=${declared.dropped.length}`,
+                  {
+                    action: 'rule-tool-only', scope: 'session', tool: toolName, rootSessionId, sessionId: sid,
+                    requested: (body && Array.isArray(body.paths) ? body.paths.length : 0), droppedCount: declared.dropped.length,
+                  },
+                )
+              }
             } else if (scope === 'session') {
               if (useDeclared) {
                 // 用户声明了目录 ⇒ 只写路径档（契约「paths 与 tools 互斥」）
@@ -2248,34 +2300,41 @@ export function apply(ctx, config = {}) {
               if (paths.length === 0) {
                 return send(res, 400, { ok: false, error: '无法解析请求路径（可能无 callId 或工具调用记录未落盘）' })
               }
+              // v1.12.14（用户裁定，有意放开 1.12.5/1.12.7 的守卫）：**用户在授权界面显式选择
+              // 项目档**（蓝球「总是允许(项目)」）时不再按沙箱越权降级——勾了 ≥1 个绝对目录就
+              // 照旧落盘路径档。放开条件**仅此一条**（用户点了项目档按钮），其余守卫全部保留：
+              //   · 全非法/全丢弃声明仍 400 且什么档都不写（上面那道门）；
+              //   · 「仅本次放行」仍绝不落盘（客户端不发 POST；`paths:null` 那条也仍 200 written:false）；
+              //   · 危险命令门命中仍照旧弹窗，写侧不受影响（门在读取侧排在最前）；
+              //   · 落盘失败仍 400（不改）；工具档写不出去时仍回退会话档并如实降级。
+              // 改前的行为（现场证据）：越权 + 项目档 ⇒ `action=rule-downgraded` +
+              // 「沙箱越权请求不得写项目白名单」⇒ 用户显式点了项目档却只拿到会话档。
+              writeResult = hostApproval.appendProjectRule({ cwd, paths, expand, note: '用户在授权球点击总是允许(项目)' })
               if (sandboxEscalated) {
-                // 越权点「总是允许(项目)」不落盘，降级为会话路径规则（v1.12.5 二次裁定）。
-                // 这里的判据只可能是沙箱越权（B1 收窄后），日志才敢直接写「越权」；
-                // 1.12.5 用含 ACP 孪生的判据时，ACP 场景会打出「越权」字样误导排障。
-                // 客户端 1.12.6 起会在弹框里如实说明越权只到会话为止，但响应仍必须
-                // ① 如实回 scope='session' + projectSuppressed，② 留痕写明降级。
-                writeResult = hostApproval.addSessionRule(rootSessionId, paths, { expand })
                 logApproval(
-                  `宿主审批规则降级落会话档（沙箱越权请求不得写项目白名单，判据 isSandboxEscalation）: ` +
-                  `tool=${toolName ?? '?'} scope=session root=${rootSessionId} session=${sid} pathCount=${paths.length}`,
-                  { action: 'rule-downgraded', scope: 'session', tool: toolName ?? null, rootSessionId, sessionId: sid, pathCount: paths.length },
+                  `宿主审批规则：沙箱越权请求 + 用户显式选择项目档 ⇒ 不降级，照旧落盘（v1.12.14 用户裁定，有意放开该守卫）: ` +
+                  `tool=${toolName ?? '?'} scope=project root=${rootSessionId} session=${sid} pathCount=${paths.length}`,
+                  {
+                    action: 'rule-project-written', scope: 'project', tool: toolName ?? null,
+                    rootSessionId, sessionId: sid, pathCount: paths.length, escalation: true,
+                  },
                 )
-              } else {
-                writeResult = hostApproval.appendProjectRule({ cwd, paths, expand, note: '用户在授权球点击总是允许(项目)' })
               }
             }
             if (!writeResult.ok) {
               return send(res, 400, { ok: false, error: writeResult.error || '写入规则失败' })
             }
-            // 实际生效档位：越权的项目档被降级、删空路径的项目档只落到工具名会话档——
-            // 两种情况都不能照着用户点的标签回 'project'
-            const downgraded = scope === 'project' && (sandboxEscalated || toolOnly)
+            // 实际生效档位（v1.12.14 订正）：
+            //   · 越权 + 项目档**不再**降级——用户显式点了项目档 ⇒ 照落盘（上面那支）；
+            //   · 「落盘工具放行任意路径」真的落了盘 ⇒ 如实回 scope='project' + toolPersisted；
+            //   · 唯一如实降级的是「空路径 + 项目档但工具档没落成 ⇒ 只拿到会话工具档」。
+            const downgraded = scope === 'project' && toolOnly && !toolPersisted
             out = {
               written: true,
               scope: downgraded ? 'session' : scope,
               paths, toolName, rootSessionId, count: writeResult.count,
-              ...(sandboxEscalated && scope === 'project' ? { projectSuppressed: true } : {}),
-              ...(toolOnly && scope === 'project' ? { toolOnly: true } : {}),
+              ...(toolOnly && scope === 'project' ? { toolOnly: true, toolPersisted } : {}),
+              ...(toolPersisted ? { toolRule: { cwd: writeResult.cwd ?? cwd, key: writeResult.key ?? null } } : {}),
               ...(useDeclared ? { pathsSource: 'user', dropped: declared.dropped } : {}),
             }
             break

@@ -16,7 +16,8 @@
 //   ③ 危险命令 + 工具档命中 ⇒ 仍弹（门在最前，压过工具档）
 //   ④ 危险命令的等价写法 / 超长兜底 / 执行类无正文 也在门前（③ 的补充）
 //   ⑤ ACP 孪生 + 工具档命中 ⇒ 仍 next()（孪生退化为防御性冗余，语义不变）
-//   ⑥ 越权授权仍不落项目档（projectSuppressed + 跨会话不生效）
+//   ⑥ 【v1.12.14 起已被用户裁定取代】原「越权授权仍不落项目档」——现在：显式点项目档
+//      ⇒ 越权也照落盘（路径档/工具档），读侧同样消费；见本文件末的 v1.12.14 describe
 //   ⑦ `~/xxx` 拼成 home 绝对路径；拿不到 home ⇒ 原样保留（弹框侧的不勾选见 grant-dialog）
 //
 // 运行：node --test test/invariants-1-12-7.test.js
@@ -210,12 +211,12 @@ describe('v1.12.7 不变量④：ACP 孪生 + 工具档命中 ⇒ 仍 next()（�
     const ha = await import('../lib/host-approval.js')
     assert.equal(ha.isDisallowedAutoGrant('bash', ESC), false, '越权又被算进「不得用工具名档」')
     assert.equal(ha.isDisallowedAutoGrant('product_submit', '[ACP qoder] 请求权限'), true, '孪生不再被排除')
-    assert.equal(ha.isSandboxEscalation(ESC), true, '越权识别本身必须保留（它现在只管 sessionOnly）')
+    assert.equal(ha.isSandboxEscalation(ESC), true, '越权识别本身必须保留（v1.12.14 起只用于写侧留痕 escalation:true）')
   })
 })
 
-describe('v1.12.7 不变量⑤：越权授权仍**不**落项目档（不落盘、跨会话不生效）', () => {
-  it('越权 + scope=project + 声明目录 ⇒ projectSuppressed、allowlist 不创建、换会话仍要问', async () => {
+describe('v1.12.14（用户裁定，放开 v1.12.5/v1.12.7 的越权守卫）：显式点项目档 ⇒ 越权也照落盘、读侧照消费', () => {
+  it('越权 + scope=project + 声明目录 ⇒ 落盘路径档、响应 scope=project、换会话（重载）仍命中', async () => {
     const b = await boot()
     try {
       const s = mkSession({ id: 'R', toolCalls: bashCall('c1', 'cat /tmp/dad-v7/alpha/a.txt') })
@@ -224,82 +225,116 @@ describe('v1.12.7 不变量⑤：越权授权仍**不**落项目档（不落盘�
         scope: 'project', sessionId: 'R', callId: 'c1', paths: ['/tmp/dad-v7/alpha'], cwd: '/tmp/dad-v7',
       })
       assert.equal(status, 200)
-      assert.equal(json.scope, 'session', '越权的项目档没被降级成会话档')
-      assert.equal(json.projectSuppressed, true, '越权必须如实回 projectSuppressed')
+      assert.equal(json.scope, 'project', '用户显式点项目档仍被降级成会话档（本次要修的缺口）')
+      assert.equal(json.projectSuppressed, undefined, '降级已放开，不得再回 projectSuppressed')
       assert.equal(json.pathsSource, 'user')
-      assert.equal(existsSync(allowlistFile(b.home)), false, '越权把声明目录落盘了（跨会话静默提权）')
+      assert.equal(existsSync(allowlistFile(b.home)), true, '用户显式点项目档却没落盘（v1.12.14 的靶子）')
+      const rules = JSON.parse(readFileSync(allowlistFile(b.home), 'utf8')).rules
+      assert.equal(rules.length, 1)
+      assert.ok(rules[0].paths.includes('/tmp/dad-v7/alpha'), '落盘条目里没有用户声明的目录')
+      // 留痕必须如实：action=rule-project-written + escalation=true，且不再有 rule-downgraded
+      const row = grantRows(b.home, 'rule-project-written').at(-1)
+      assert.ok(row, '显式点项目档的留痕丢失（排障要能看出「用户显式选择 ⇒ 不降级」）')
+      assert.equal(row.escalation, true, '越权场景必须在留痕里标出来')
+      assert.match(row.message, /不降级/)
+      assert.equal(grantRows(b.home, 'rule-downgraded').length, 0, '越权降级留痕还在（守卫没真正放开）')
 
-      // 换一个根会话、同 cwd、同目录 ⇒ 必须仍然弹（会话档不外溢；落盘白名单里也没有它）
+      // 换一个根会话、同 cwd、同目录 ⇒ 落盘档必须命中（读侧对称放开 + 跨会话复用）
       const other = mkSession({ id: 'R2', toolCalls: bashCall('c2', 'cat /tmp/dad-v7/alpha/b.txt') })
       const r2 = await approve(b, other, { callId: 'c2', toolName: 'bash', reason: ESC })
-      assert.equal(r2.nextCalled, true, '越权的声明目录跨会话生效了（等同于落盘）')
-      assert.notEqual(r2.res, 'allowed-once')
-
-      // 非越权对照：同一份落盘白名单机制本身必须还是通的（否则上面那条是空转）
-      const s3 = mkSession({ id: 'R3', toolCalls: bashCall('c3', 'cat /tmp/dad-v7/alpha/c.txt') })
-      await approve(b, s3, { callId: 'c3', toolName: 'bash', reason: 'tool requires approval' })
-      const w = await postRule(b, {
-        scope: 'project', sessionId: 'R3', callId: 'c3', paths: ['/tmp/dad-v7/alpha'], cwd: '/tmp/dad-v7',
-      })
-      assert.equal(w.json.scope, 'project')
-      assert.equal(existsSync(allowlistFile(b.home)), true, '非越权的项目档没落盘（对照失真）')
-      const back = mkSession({ id: 'R4', toolCalls: bashCall('c4', 'cat /tmp/dad-v7/alpha/d.txt') })
-      const hit = await approve(b, back, { callId: 'c4', toolName: 'bash', reason: 'tool requires approval' })
-      assert.equal(hit.res, 'allowed-once', '落盘白名单对非越权请求没生效（跨会话复用断了）')
+      assert.equal(r2.res, 'allowed-once', '越权请求没吃到用户显式落盘的项目档（读侧仍被抑制）')
       assert.equal(grantRows(b.home, 'auto-grant').at(-1).scope, 'project')
     } finally { await b.close() }
   })
 
-  it('越权 + 删空声明（只写工具名档）同样不落盘', async () => {
+  it('越权 + 删空声明（二级选择②）⇒ 落盘工具档 {paths:[], tools:["main:bash"]}，清空内存态后仍命中', async () => {
     const b = await boot()
     try {
       const s = mkSession({ id: 'R', toolCalls: bashCall('c1', 'cat /tmp/dad-v7b/alpha/a.txt') })
       await approve(b, s, { callId: 'c1', toolName: 'bash', reason: ESC })
-      const { status } = await postRule(b, { scope: 'project', sessionId: 'R', callId: 'c1', toolName: 'bash', paths: [] })
+      const { status, json } = await postRule(b, {
+        scope: 'project', sessionId: 'R', callId: 'c1', toolName: 'bash', paths: [], cwd: '/tmp/dad-v7b',
+      })
       assert.equal(status, 200)
-      assert.equal(existsSync(allowlistFile(b.home)), false, '删空声明（工具名档）不该产生任何落盘')
+      assert.equal(json.scope, 'project', '「落盘工具放行任意路径」仍被降级成会话档（用户实测的缺口）')
+      assert.equal(json.toolOnly, true)
+      assert.equal(json.toolPersisted, true, '工具档没落盘（响应必须如实披露）')
+      assert.equal(json.toolRule.key, 'main:bash', '落盘工具键不是两仓共识的 product:tool 形态')
+      const rules = JSON.parse(readFileSync(allowlistFile(b.home), 'utf8')).rules
+      assert.equal(rules.length, 1)
+      assert.deepEqual(rules[0].tools, ['main:bash'])
+      assert.deepEqual(rules[0].paths, [], '工具档条目的 paths 必须是空数组（不写任何路径档）')
+      assert.equal(rules[0].product, 'main')
+      // cwd 取**服务端审批上下文**里的会话工作目录（不信任 body 里的 cwd）——本夹 session 默认 /home/test
+      assert.equal(rules[0].cwd, '/home/test', '落盘条目的 cwd 不是服务端解析出的工作目录')
+      assert.match(rules[0].note, /落盘工具放行任意路径/)
+      assert.ok(grantRows(b.home, 'rule-tool-disk').length === 1, '落盘工具档必须留痕（action=rule-tool-disk）')
+
+      // ① 同进程、**另一个根会话**（内存工具档按 rootSessionId 存 ⇒ 只有落盘档能命中）
+      const other = mkSession({ id: 'R2', toolCalls: bashCall('c2', 'cat /tmp/anywhere/else.txt') })
+      const hit = await approve(b, other, { callId: 'c2', toolName: 'bash', reason: ESC })
+      assert.equal(hit.res, 'allowed-once', '另一个根会话没吃到落盘工具档')
+      assert.equal(grantRows(b.home, 'auto-grant').at(-1).scope, 'project-tool')
+
+      // ② 清空内存态（新实例 = 宿主重载后的形态）：只凭盘上的条目就必须命中
+      const ha = await import('../lib/host-approval.js')
+      const fresh = new ha.HostApprovalRules()
+      const d = fresh.decide({
+        sessionId: 'S-new', rootSessionId: 'R-new', cwd: '/home/test',
+        paths: ['/tmp/outside/whatever.txt'], toolName: 'bash',
+      })
+      assert.equal(d.allowed, true, '宿主重载后落盘工具档不再命中（本次要修的缺口原样复发）')
+      assert.equal(d.scope, 'project-tool')
+      // 反向：cwd 不同 / 工具不同 / 产品不同 ⇒ 一律不命中（防越权）
+      assert.equal(fresh.decide({ sessionId: 'S', rootSessionId: 'R', cwd: '/tmp/other', paths: ['/x'], toolName: 'bash' }).allowed, false)
+      assert.equal(fresh.decide({ sessionId: 'S', rootSessionId: 'R', cwd: '/home/test', paths: ['/x'], toolName: 'write' }).allowed, false)
+      assert.equal(fresh.projectToolRulesCover('/home/test', 'bash', 'qoder'), false, 'ACP 产品维度不该吃到主代理工具档')
     } finally { await b.close() }
   })
 
-  // 读取侧的 sessionOnly：**已落盘的**项目档不得替越权放行。
-  // 这是本轮最容易被「顺手简化」掉的一格——`sessionOnly: disallowToolGrant` 那个焊点
-  // 一旦留着（或 sessionOnly 被写成 false），判据拆开之后越权就会**连项目档一起放开**，
-  // 等于把「某路径可提权到 danger-full-access」静默落盘长期留存（用户明确否决过）。
-  it('越权请求**不得**被已落盘的项目档放行（sessionOnly 读取侧；非越权对照必须仍放行）', async () => {
+  it('会话档那一支（scope=session）仍然不落盘：删空声明只写内存工具档', async () => {
     const b = await boot()
     try {
-      // ① 先用**非越权**请求在同一 cwd 下落盘一条项目规则（把落盘链路本身走通）
+      const s = mkSession({ id: 'R', toolCalls: bashCall('c1', 'cat /tmp/dad-v7d/alpha/a.txt') })
+      await approve(b, s, { callId: 'c1', toolName: 'bash', reason: ESC })
+      const { status, json } = await postRule(b, { scope: 'session', sessionId: 'R', callId: 'c1', toolName: 'bash', paths: [] })
+      assert.equal(status, 200)
+      assert.equal(json.scope, 'session')
+      assert.equal(existsSync(allowlistFile(b.home)), false, '会话档（本会话总是允许该工具）不该产生任何落盘')
+      assert.equal(grantRows(b.home, 'rule-tool-only').length, 1, '会话档留痕应仍是 rule-tool-only')
+      // 会话档仍然生效（本会话内任意路径）
+      const sib = mkSession({ id: 'R', toolCalls: bashCall('c2', 'cat /tmp/anywhere/x.txt') })
+      const hit = await approve(b, sib, { callId: 'c2', toolName: 'bash', reason: ESC })
+      assert.equal(hit.res, 'allowed-once')
+      assert.equal(grantRows(b.home, 'auto-grant').at(-1).scope, 'session-tool')
+    } finally { await b.close() }
+  })
+
+  it('读取侧对称放开：已落盘的路径档对越权请求也生效（非越权对照同样命中）', async () => {
+    const b = await boot()
+    try {
+      // ① 非越权请求落盘（把落盘链路走通；同时也是「正常路径零回归」的对照）
       const n = mkSession({ id: 'N', toolCalls: bashCall('n1', 'cat /tmp/dad-v7c/alpha/a.txt') })
       await approve(b, n, { callId: 'n1', toolName: 'bash', reason: 'tool requires approval' })
       const w = await postRule(b, {
         scope: 'project', sessionId: 'N', callId: 'n1', paths: ['/tmp/dad-v7c/alpha'], cwd: '/tmp/dad-v7c',
       })
-      assert.equal(w.status, 200)
-      assert.equal(w.json.scope, 'project', '前置：非越权请求必须能落盘（否则本用例测不到项目档）')
+      assert.equal(w.json.scope, 'project', '前置：非越权请求必须能落盘')
       assert.equal(existsSync(allowlistFile(b.home)), true, '前置：allowlist.json 确实创建了')
 
-      // ② 对照组：同一 cwd、被覆盖的路径、**非越权** reason ⇒ 项目档放行（跨会话复用仍通）
+      // ② 非越权对照：同 cwd、被覆盖路径、新会话 ⇒ 项目档放行
       const p = mkSession({ id: 'P', toolCalls: bashCall('p1', 'cat /tmp/dad-v7c/alpha/b.txt') })
       const ok = await approve(b, p, { callId: 'p1', toolName: 'bash', reason: 'tool requires approval' })
-      assert.equal(ok.res, 'allowed-once', '非越权的项目档放行被一起关掉了（超出裁定范围）')
+      assert.equal(ok.res, 'allowed-once', '非越权的项目档放行被关掉了（超出裁定范围）')
       assert.equal(ok.nextCalled, false)
-      assert.equal(grantRows(b.home, 'auto-grant').at(-1).scope, 'project')
 
-      // ③ 同一 setup，只把 reason 换成越权 ⇒ **必须仍然弹**（sessionOnly 读取侧；工具档此时未命中）
+      // ③ 同一 setup，只把 reason 换成越权 ⇒ **同样放行**（v1.12.14 读侧对称放开：
+      //    写侧既然按用户裁定照落盘，读侧再抑制就等于「落盘了也不生效」）
       const e = mkSession({ id: 'E', toolCalls: bashCall('e1', 'cat /tmp/dad-v7c/alpha/c.txt') })
       const esc = await approve(b, e, { callId: 'e1', toolName: 'bash', reason: ESC })
-      assert.equal(esc.nextCalled, true,
-        '越权吃了已落盘的项目档——授权放大到跨会话落盘（v1.12.5 二次裁定被推翻）')
-      assert.notEqual(esc.res, 'allowed-once')
-
-      // ④ 反向哨兵：同一条越权请求，只要工具档命中（同一主会话）就必须放行 ——
-      //    证明 ③ 的 next() 来自 sessionOnly，而不是「越权一律不放行」。
-      const s0 = mkSession({ id: 'child-0', parentSession: 'E', toolCalls: bashCall('g0', 'echo hi') })
-      await grantTool(b, s0, { callId: 'g0', toolName: 'bash' })
-      const e2 = mkSession({ id: 'child-1', parentSession: 'E', toolCalls: bashCall('e2', 'cat /tmp/dad-v7c/alpha/d.txt') })
-      const viaTool = await approve(b, e2, { callId: 'e2', toolName: 'bash', reason: ESC })
-      assert.equal(viaTool.res, 'allowed-once', '同一主会话的工具档没有优先于 sessionOnly（档位顺序反了）')
-      assert.equal(grantRows(b.home, 'auto-grant').at(-1).scope, 'session-tool')
+      assert.equal(esc.res, 'allowed-once', '越权没吃到已落盘的项目路径档（读侧仍被 sessionOnly 抑制）')
+      assert.equal(esc.nextCalled, false)
+      assert.equal(grantRows(b.home, 'auto-grant').at(-1).scope, 'project')
     } finally { await b.close() }
   })
 })
