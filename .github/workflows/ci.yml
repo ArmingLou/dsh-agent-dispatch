@@ -84,10 +84,76 @@ jobs:
       #      无该键时 legacy 逐字不变）、test/permission-pending.test.js 新增 1 条（超长
       #      value/reason 必须截断）；verify.mjs 新增 v1.12.7-8 端点门守卫 + 
       #      `~` 基准来源行的反向断言 + 截断守卫（均不占用例条数）。
+      # v1.12.10（**没有任何载荷豁免**：内容规则 + 形状判据对整段文本的每个段/行全量生效）：
+      #   ① test/dangerous-command-gate.test.js 的 v1.12.9 describe 整体改写为 v1.12.10：
+      #      现场 commit 的期望**翻面**成「必须弹（代价）」；新增 B1 的 11 条算术假起始、
+      #      B2 的续行、7 个 shell/su 名 tag、先内容后形状归因；掩码/豁免断言整块删除；
+      #      监听器层补 B1/B2/tag 三条 e2e（66 条，与 1.12.9 同数）；
+      #   ② 删除 test/invariants-1-12-9.test.js（18 条，为已删机器服务）；
+      #      新增 test/invariants-1-12-10.test.js 15 条（5 条不变式：全量判定（数字/标识符两档 +
+      #      续行 + 7 tag + 有界截断）/ 不放宽（21 条回归表 + 9 条对照 MISS）/ 先内容后形状 /
+      #      **两套豁免机器不得复活**（20 个符号的源码级反向守卫 + matchText 无 continue）/
+      #      接线 + 监听器层）；
+      #   ③ verify.mjs 的 v1.12.9 断言块（142 行）换成 v1.12.10 块（172 行）：20 个废弃符号
+      #      反向守卫、matchText 无跳过、A 组 16 条必须 HIT、B1 11 条（两档）、B2 3 条、
+      #      代价 3 类 + 7 tag、对照 5 条 MISS、D 组反放宽 16 条 + argsText、归因顺序 5 条
+      #      （不占用例条数）。
+      #   ④ 用例条数：593（1.12.7 基线）→ 625（1.12.9）→ **622**（本版：gate 66 不变，
+      #      invariants 18→15，删掉 1.12.9 那一份）。
+      # v1.12.11（用户裁定：判定前先做**文本归一化**；`contentRuleOf` 加 256 token 归因窗口）：
+      #   ① test/dangerous-command-gate.test.js 66 → **74**：B2 从「形状判据」翻成「续行合并 ⇒
+      #      内容规则」（`rm -rf` / `git push`）；matchText 标记改链式（`normalized` + 双读）；
+      #      新增 v1.12.11 describe 8 条 —— Major 1 续行（含 CRLF / 行尾 `\` 带空格 / 转义边缘）、
+      #      Major 2 多行 `-c`/`-Command`、细则⑤ 空白折叠、行首语义不许抹平 + 现场代价、
+      #      「双读」不许变松、Blocker 窗口语义、Blocker 性能封顶（32768 包装词 < 500ms）、
+      #      Minor 1 大写 tag 两档；
+      #   ② test/invariants-1-12-10.test.js 15 条（条数不变）：B2 期望翻成 `rm -rf`/`git push`、
+      #      `splitSubCommands` 结构守则更新为「HEAD 骨架 + 换行一律切段」、ban-list 改注释感知；
+      #      新增 test/invariants-1-12-11.test.js **15 条**（6 条不变式：归一化函数形状 / 判定在归一化
+      #      之后（七条验收 + 空白折叠 + 行首语义 + 反放宽回归表 + 问②未翻面）/ 归因窗口只粗不放
+      #      （含性能封顶）/ 大写 tag / 源码级守卫（接线链、换行分支、无按 flag 解析、旧符号不复活）/
+      #      监听器层 e2e（续行与多行 `-c` ⇒ next() + 各 1 行门名；无害多行 ⇒ 自动放行 0 留痕））；
+      #   ③ verify.mjs：v1.12.10 块的两处标记改链式（规范化 + 双读），新增 v1.12.11 块
+      #      （窗口语义与「超限仍拦」、续行 / 多行 / 折叠 / 行首语义 / 大写 tag / 接线 + 双读 +
+      #      无按 flag 解析的反向守卫；不占用例条数）；
+      #   ④ 用例条数：593（1.12.7 基线）→ 625（1.12.9）→ 622（1.12.10）→ **645**（本版：
+      #      gate 66→74，invariants-1-12-10 仍 15，新增 invariants-1-12-11 15）。
+      # v1.12.12（用户裁定：**全文子串判定**「文本里出现危险字样就弹」+ 可配置追加串，只增不减）：
+      #   ① test/dangerous-command-gate.test.js 74 → **76**：误伤守卫拆成真负例 + 代价两条、
+      #      分段测试、`find -exec echo rm -rf`、`yarn info npm publish`、argv 拆词残留边界两条、
+      #      监听器层误伤守卫改为 next() + 1 行留痕；
+      #   ② 新增 test/invariants-1-12-12.test.js **14 条**（预设三串 × 三位置 / 非预设边界 /
+      #      配置项（路径·回退·trim·去重·动态生效·归因名）/ 容差·词边界·字面匹配 / 结构判据不动 /
+      #      只做加法回归表 / 代价 / 性能 / 源码级守卫）；
+      #   ③ 新增 test/no-relaxation-1-12-12.test.js（「只加不减」常驻反退化回归表 G1–G4）；
+      #   ④ verify.mjs 新增 v1.12.12 块（常量与路径口径、预设三串 × 位置、词边界反例、配置四项、
+      #      不 reset 的动态生效、字面非正则、结构判据不动、既有覆盖不丢；不占用例条数）；
+      # v1.12.13（独立终审 3 阻断 / 3 主要 / 8 次要 —— 只修缺陷，判据方向不动）：
+      #   ① test/dangerous-command-gate.test.js 76 → **79**：B1（裸 CR / CRLF / 字面 `\r` 作词间
+      #      分隔）、M3（词内引号拼接 `r"m" -rf /tmp/x` ⇒ HIT + 反向不误伤）、M3 边界三条；
+      #   ② 新增 test/invariants-1-12-13.test.js **20 条**（B1 最小复现 + 混排、B2 特殊文件
+      #      （FIFO / `/dev/zero` 软链 / 目录 ⇒ <50ms 回退）、B3（32,768 字符与 `'a b'×20000`
+      #      模式 ⇒ 不抛 + 内置三串照常）、M3、Minor 5 字面转义追加模式、Minor 7 规模上限、
+      #      Minor 4 告警口径、源码级守卫）；
+      #   ③ test/no-relaxation-1-12-12.test.js 新增 **G5 组 2 条**：CR 家族（生成式 672 条）对
+      #      1.12.11 冻结期望位图逐条比对 ⇒ relaxed 必须 0（位图命中数 396 也钉住）；
+      #   ④ verify.mjs 新增 v1.12.13 块（B1/B2/B3 的源码 + 行为守卫、M3、Minor 4/5/7；
+      #      不占用例条数）；
+      #   ⑤ 追加（跨仓纪律三条）：gate +2（`MAX_DANGER_TEXT_CHARS` 恰好等值边界 + 大小写折叠口径）、
+      #      invariants-1-12-13 +4（特殊文件八档 + fd 不泄漏 + TOCTOU 子进程探针 + 「类型判定只靠 fd」）；
+      #   ⑥ 追加（跨仓常量对齐 256→1024）：invariants-1-12-13 +1（「上限值必须是 1024」）；1025 条用例改写。
+      #   ⑦ 追加（终审 M-b/M-c）：invariants-1-12-13 +1（B3 威胁模型「构造不抛、首次 exec 抛 too large」；
+      #      M-d 的负缓存**本轮取消实现** ⇒ 不加用例，只订正注释与文档）；
+      #      「类型判定只靠 fd」那条改成**源码守卫 + 计数行为牙**（FIFO 档 readSync=0 / statSync=1、
+      #      正常档 readSync≥1）；`no-relaxation` 的 G5 与 gate 的 B1 组不动。
+      #   ⑧ 用例条数：593（1.12.7 基线）→ … → 667（1.12.12）→ **700**（本版：gate 81、inv13 26）。
+      #   **MIN_TESTS 故意留 2 条余量（700 - 2 = 698）**：`test/host-0.2-compat.test.js` 里有一条硬编码
+      #   macOS 路径的用例，在 ubuntu runner 上会 **skip**（`SKIPPED_ALLOWED: 1` 正是为它留的）⇒
+      #   CI 实际 pass 期望 699；若把 MIN_TESTS 钉到 700 会因这条 skip 直接红（余量 0 太脆）。
       # 新增用例时请一起把这个数抬上去。
       - name: 单元 / 集成测试（含用例条数守卫）
         env:
-          MIN_TESTS: 593
+          MIN_TESTS: 698
           SKIPPED_ALLOWED: 1
         run: |
           set -uo pipefail

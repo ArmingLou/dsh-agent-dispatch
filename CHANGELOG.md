@@ -1,3 +1,834 @@
+## 1.12.13（2026-10-06）
+
+> 一句话：**修 1.12.12 的缺陷**（独立终审：3 阻断 / 3 主要 / 8 次要），**判据方向不动** ——
+> 这一版**没有新增任何拦截语义**，只把「变松 / 挂死 / 抛异常 / 日志噪声 / 上限」这几处收口。
+
+### 阻断修复（3 条）
+
+**B1 裸 CR 丢掉 1.12.11 的读法 ⇒ 变松（`relaxed > 0` 被证伪）**
+
+- 证据（终审自造语料）：45,734 条 `1.12.11 → 1.12.12` **relaxed = 1**；CR 专项 4,421 条 relaxed = **40**；
+  危险命令 × CR 7,488 条 relaxed = **640**（`rm -rf` / `git push` / `npm publish` / `pnpm publish` /
+  `yarn publish` 各 128）。
+- 最小复现（JS 源 `'\\trm\r-r\r-f\r/tmp/x'`）：1.12.7 = `null`；**1.12.11 = `rm -rf`**；1.12.12 = `null`。
+- 根因：1.12.12 把**裸 CR** 无条件当段分隔符，而 `literalEscapeAsSpace`（旧口径读）只管**字面**
+  `\n`/`\r` 两字符 ⇒ `matchText` 的三份变体里没有任何一份等于 1.12.11 的读法。
+- 修法：**旧口径读也把裸 CR / CRLF 折空格**（`lib/host-approval.js` 的 `if (literalEscapeAsSpace) pushSpace(out)`）
+  ⇒ 与 1.12.11 的规范化**逐字等价**；新口径不变（裸 CR 仍是段分隔符）。
+- 常驻守卫：`test/no-relaxation-1-12-12.test.js` 新增 **G5**（生成式 **840 条** CR 家族 × **1.12.11 冻结期望位图**，
+  位图里 `1` 的个数 **540** 钉死 ⇒ `relaxed > 0` 直接转红；其中「**字面 `\t`** + 裸 CR 分隔」那两族
+  只有旧口径读能判出，`no-cr-legacy` 变异实测 **24 条变 MISS** ⇒ 本组对本次修复是 load-bearing 的）
+  + `test/invariants-1-12-13.test.js` 不变量①。
+- 收口读数（84,684 条语料，三方对照 1.12.7 HEAD / 1.12.11 冻结树 / 本版）：
+  **相对 1.12.11 relaxed = 0**（tightened 12,981）；相对 1.12.7 relaxed = 388，其中
+  **388/388 是 1.12.11 就已 MISS 的继承边界**（「1.12.11 会 HIT 而本版 MISS」= **0**）。
+
+**B2 配置路径是 FIFO / 指向 `/dev/zero` 的软链 ⇒ `readFileSync` 无限阻塞（拖垮整个审批路径）**
+
+- 证据（终审）：`mkfifo $DSH_HOME/data/dsh-danger-patterns.json` ⇒ `dangerTextPatterns()` **永不返回**
+  （`execFileSync{timeout:3000}` ⇒ ETIMEDOUT）；`ln -s /dev/zero` ⇒ `timeout 8 node --max-old-space-size=96`
+  **exit = 124**。链路：`index.js` 审批 → `matchText` → `fullTextDangerMatch` → `dangerTextPatterns`，
+  全是**同步**调用 ⇒ 任何能写 `$DSH_HOME/data` 的命令放个 FIFO，之后**每次审批都挂死**。
+- 修法：`readDangerConfigText()` —— `openSync(O_RDONLY | O_NONBLOCK)` + `fstatSync` **只接受普通文件**
+  （`!st.isFile() ⇒ null`）+ 有界 `readSync`（≤ `MAX_DANGER_CONFIG_BYTES` = 1MiB）；非普通文件一律
+  等价于「没有追加项」+ 告警一次。
+- 实测（本版）：FIFO 首次判定 **2.7ms**、`/dev/zero` 软链 **0.4ms**、`/dev/null` 软链 0.6ms、目录 0.2ms
+  （第二次走缓存 0.14–0.25ms）；三种情形下内置三串照常命中。
+- 守卫：`test/invariants-1-12-13.test.js` 不变量②（FIFO / `/dev/zero` / `/dev/null` / 目录 ⇒ <50ms 回退）
+  + verify.mjs 的 v1.12.13 块。
+- **承重件写准（终审 M-b 订正）**：真正救命的是「**`O_NONBLOCK` fd + 有界 `readSync`**」，
+  **不是**「按 fd 判类型」本身 —— 只把 `fstatSync(fd)` 换成 `statSync(file)`（变异 `stat-typing`）
+  时，TOCTOU 子进程用例**照样通过**（仍是 NONBLOCK fd + 有界读，谎报类型的 stat 不会阻塞）；
+  真正致命的是退回 `readFileSync`（变异 `no-fd-type-check` ⇒ 挂死 124）。
+  因此本轮补了**计数行为牙**：非普通文件档 `readSync` 调用数必须 **0**、`openSync` **1**；
+  正常文件档 `readSync` **≥1**（退回 `readFileSync` ⇒ 0 ⇒ 转红）。「按**路径** stat 判类型」
+  这一点由**源码守卫**（`readDangerConfigText` 内禁 `(?<!f)statSync`）+ 上面这条计数断言
+  （路径 stat 会让 `statSync` 次数从 1 变 2）双重覆盖 —— 它本身没有独立的行为后果，如实登记。
+
+**B3 ≥32,768 字符的模式串让 `new RegExp` 抛 ⇒ 一次抛出跳过所有守卫**
+
+- 证据（**第二阶段订正，见「终审收尾」的 M-c**）：本机（Node v22.22.2）复现出来的真实现象是
+  **V8 正则编译惰性** —— `new RegExp(源)` 对 32,768 字符模式串（源 32,803）**不抛**；**首次 `exec()`**
+  才抛 `SyntaxError: Invalid regular expression …: Regular expression too large`；对照 32,700 字符
+  （源 32,735）⇒ 构造与 exec 都 OK；跨度形态 `a b c …` 的最小抛错点 = 11,345 字符（源 51,084）。
+  抛出同样会穿出 `matchText` ⇒ 落进 `index.js` 决策体的 catch ⇒ `console.error(...)` 后 **`return next()`**
+  ⇒ 同时跳过危险命令门、`commandText` 超长门、「解析不出正文不转放行」守卫与三档路径档。
+- 修法：**两处承重件** —— ①单串 ≤ `MAX_DANGER_PATTERN_CHARS`（4096）把最坏正则源钉在 **20,507** 字符
+  （实测该形态构造与 exec 都 OK）；②`fullTextDangerMatch` 的**外层 `try/catch` 覆盖 `re.exec()`**
+  （`dangerPatternRegExp` 里那个 try/catch 只能挡构造失败，**抓不到执行期抛错**）。
+  另加：`new RegExp` 失败置 `re = null` 且**缓存 null**、追加条数 ≤ `MAX_DANGER_PATTERN_COUNT`
+  （**1024**，与 B 仓统一）；这一层是纯加法层，绝不允许它把决策链打断。
+- 实测：32,768 字符模式与 `'a b'×20000` 模式 ⇒ **本层不抛、内置三串照常命中**（超限**不等于**关闭内置三串）。
+
+### 主要项（3 条）
+
+- **M1 声明改准**：`CHANGELOG.md` 1.12.12 段原写「既有命中的**规则名与优先级一字不变**」——**不成立**。
+  终审 45,734 条语料里 353 条「命中但**规则名变了**」（全部仍 HIT、0 条变 null）：`shell-nesting → shell-stdin`
+  ×30、`wrapper-option-ambiguity → rm -rf / git push / npm publish` ×52。本版口径见下方
+  「**判定不变、归因可能变化**」。另：`codeBoundaryContentRule`（`lib/host-approval.js` 里定义、
+  `matchText` 前接线）**在 1.12.11 冻结树里不存在**（属本系列新增），上次改动表漏登 ⇒ 本版补登进
+  1.12.12 段与本文。
+- **M2 变异读数订正**：`struct-as-fulltext` 与 `config-can-disable` 的定义/读数重报（见下方变异表，
+  定义逐字给在表中，可按同一串复现）；`config-can-disable` 另给「只有配置文件存在时才清空」的第二种定义
+  （`config-empty-only`）以便与终审读数对齐。
+- **M3 词内引号拼接（既有真旁路）**：`r"m" -rf /tmp/x` 在 `/bin/sh` 里**真的执行 `rm`**
+  （终审用 PATH 劫持假 rm 实证 `RM_INVOKED argv=[-rf /tmp/x]`），但 1.12.7 / 1.12.11 / 1.12.12 **三版全 MISS**
+  （`stripOuterQuotes` 不处理**词内**引号拼接）。
+  **选择：加规范化**（不是登记边界）—— 新增「**去词内引号**」变体：把**两侧都紧邻非空白**的引号去掉
+  （`r"m"` → `rm`、`git"push"` → `gitpush`），**贴着空白的引号原样保留**（`echo "never run rm -rf /x"`
+  的文本不变）。仅**加法**（多一份变体）⇒ 不会让任何既有命中变 MISS。
+
+### 判定不变、归因可能变化（M1 的准确口径）
+
+- **判定方向**：相对 1.12.11 **relaxed = 0**（84,684 条；见 B1 收口读数）。这一条是硬约束。
+- **归因（`rule` 名）可能变化**：同一段文本命中后报哪条规则，取决于「哪一份变体先命中」——
+  本版在变体链里插入了「词内引号拼接」那一遍，并让全文层扫**全部**变体 ⇒ 归因会漂移。
+  84,684 条语料里 **2,566 条**归因变化（全部仍 HIT）。代表性的两类：
+  - `wrapper-option-ambiguity → rm -rf`（例：`x="git -C /tmp push`；976 条）
+  - `shell-nesting → shell-stdin`（例：`"sh\n-c\n\"sh\n-c\n\\\"sh\n-c\nls\\\""`；终审语料 ×30）
+  其余如 `git push → rm -rf`、`npm publish → rm -rf` 等（同一段文本里同时含多个危险字样时的先后）。
+  影响面：只影响排除故障时看 `dispatches.jsonl` 的 `rule` 字段，**不影响拦/不拦**。
+
+### 次要项（8 条，逐条处置）
+
+1. **六处过期注释**（`lib/host-approval.js` 的 `CODE_BOUNDARY_CHARS` / `boundaryGluedLeft` /
+   `codeBoundaryContentRule` / 判定循环注释）：原文写 `curl 'a=1&rm -rf'` 必须保持 MISS、
+   `echo "never run rm -rf /x by hand"` 仍 MISS —— 实测 1.12.12 起**都会 HIT**（归因来自**全文层**
+   `text:rm -rf`）⇒ 全部刷新为现行行为，并注明「本判据只决定是否按内容规则**提前**归因」。
+2. **`ci.yml` 缺 v1.12.12 条目 + 「本版 645」过期** ⇒ 补 v1.12.12 与 v1.12.13 两段注释条目，
+   `MIN_TESTS: 667 → 699`（收尾轮再抬到 **701**，见「终审收尾」的 Nit 2）。
+3. **A 比 B 多出的容差一格**：`rm"-rf"` / `rm'-rf'` / ``rm `-rf` `` / `git"push"` ⇒ A **HIT**、B MISS
+   （A 的容差类 `[\s"'`]+` 允许「只有引号」的分隔并认反引号）。按 `/bin/sh` 语义这些其实是
+   `rm-rf` / `gitpush`（**误报方向**）⇒ 在容差表里登记这一格，本版**不缩**（缩会变松）。
+4. **缺失文件静默**（与 B 仓对齐）：文件**缺失**（ENOENT / stat 失败）⇒ **0 条告警**（这是「没配过」的
+   正常状态）；坏 JSON / `patterns` 非数组 / 非普通文件 / 超限才告警**一次**。改动前后读数：
+   实测（5 次调用）：**缺失** 1.12.12 = **1 条** → 本版 = **0 条**；**坏 JSON** 1.12.12 = 1 条 →
+   本版 = **1 条**；`patterns` 非数组 = **1 条**（语义不回退，「只告警一次」保留）。
+5. **自定义串含字面转义配了永不生效**（`{"patterns":["foo\\nbar"]}` 只扫变体① ⇒ 那串字面字符只在
+   **原文**那一份里）⇒ 全文层改为扫**全部变体** ⇒ 该模式现在生效（归因 `text:custom:foo\nbar`）。
+6. **性能数字按实测改**（本文件 1.12.12 段的旧数字保留为历史；**收尾轮再订正一次**，见「终审收尾」的 M-d）：
+   `statSync` 单次：**文件存在 3.26µs / ENOENT 14.90µs**（终审 3.81 / 25.12µs，同量级）——
+   原稿只报「4.83µs」是把「文件存在」那一档当成了默认档，**没配过配置时走的是 ENOENT 档**；
+   `dangerousCommandMatch('echo hi')`（无配置文件）：1.12.11 = 3.93µs（终审 7 轮中位）→ 1.12.12 = 26.02µs
+   → 1.12.13 = **28.30µs**（终审 7 轮交错中位；本机 33.34µs）—— 其中「每次判定的失败 `statSync`」那一份
+   见 M-d 的**下版本待办**（未采用负缓存）；典型 commit 文本 20.99µs；
+   293KB `rm` × 100000（单字符分隔的极端形状）：1.12.11 = 88.4ms / 1.12.12 = 79.7ms / 本版 = **75.6ms**
+   —— 仍 <100ms；终审在 500KB 同形状下实测 1.12.12 = 103.7ms（**越过 100ms 线**）⇒ 该格是
+   病态文本的既有开销（每段都要判），本版**没有**让它变差（同形状下 79.7 → 75.6ms）；
+   256KB 多段（31k 段）1.12.11 = 140.7ms / 本版 = 131.3ms —— 同样是既有开销，如实登记。
+7. **配置规模无上限** ⇒ 三类上限：单串 ≤4096 字符、追加条数 **≤1024**、配置文件读取 ≤1MiB；
+   超限条目按「没有追加项」处理 + 告警一次。理由（终审实测）：5,000 条 +99~137ms/次、10,000 条 334ms/次、
+   50MB 文件首次读 188ms。（条数上限的最终取值由「跨仓常量对齐」一节裁定为 1024。）
+8. **`dangerTextPatterns` 的告警分类**（与第 4 条同源）：非普通文件 / 读不出来才告警一次，缺失静默。
+
+### 测试与断言变更
+
+- 用例条数：667 → **699** →（收尾轮）**700**（`MIN_TESTS` 同步 `667 → 699 → **698**`，`SKIPPED_ALLOWED` 仍 1；
+  收尾轮的 `+1` 条（B3 威胁模型）与 `MIN_TESTS` 留 2 条余量的理由见「终审收尾」节）：
+  - `test/dangerous-command-gate.test.js` 76 → **81**：B1（裸 CR / CRLF / 字面 `\r` 作词间分隔；
+    CRLF 那格由全文层归因 `text:rm -rf`）+ 反向不误伤、M3（6 条形态 + 4 条反向 + 2 条边界）；
+  - 新增 `test/invariants-1-12-13.test.js` **25 条**（9 条不变式：B1 最小复现与混排 / B2 特殊文件 /
+    B3 超长模式串 / M3 / Minor 5 / Minor 7 / Minor 4 告警口径 / 源码级守卫 /
+    ⑨ 特殊文件八档 + fd 不泄漏 + TOCTOU 子进程探针 + 「类型判定只靠 fd」）；
+  - `test/no-relaxation-1-12-12.test.js` **+2 条**（G5：CR 家族生成式 **840 条** × 冻结位图 + 最小复现精确归因）；
+  - 三处**源码级守卫**随接线更新（`dangerous-command-gate` 不放宽③、`invariants-1-12-10` 判定循环、
+    `invariants-1-12-11` 接线），断言从「单行三变体」改为「多读 + 旧口径读 + 逐段」结构断言。
+- `verify.mjs`：新增 v1.12.13 块（B1/B2/B3 的源码 + 行为守卫、M3、Minor 4/5/7；不占用例条数）。
+
+### 变异实验（逐条自证；pristine 恢复后 `cmp` + md5 + `MUT-grep` 全过）
+
+| 变异体 | 定义（逐字可复现） | 全量读数（基线 = 700 用例树） | 转红面 |
+| --- | --- | --- | --- |
+| `control` | 不改（基线，md5 `ccfd2548…`） | `# tests 700 / # suites 168 / # pass 700 / # fail 0`，test exit 0；verify exit 0 | —（全绿） |
+| `no-cr-legacy` | 删掉旧口径读里的裸 CR 折空格分支（`/* MUT-NO-CR-LEGACY */`） | `# tests 700 / # pass 695 / # fail 5`，test exit 1；verify exit 1 | gate B1 / `不变量①` / `不变量⑧` / **G5 两条**（9 个叶子） |
+| `stat-typing`（**M-b 口径**） | **只**把类型判据从 fd 换成路径：`fs.fstatSync(fd)` → `fs.statSync(file)`（保留 NONBLOCK + 有界读） | `# tests 700 / # pass 698 / # fail 2`，test exit 1；verify exit 0 | **新增的计数行为牙**（`statSync` 1→2）+ `不变量⑨`（4 个叶子） |
+| `no-bounded-read`（新） | 保留 `open`/`fstat`，把**有界 `readSync`** 换回 `readFileSync` | `# tests 700 / # pass 698 / # fail 2`，test exit 1；verify exit 1 | **正常文件档 `readSync ≥ 1`** 计数断言 + `不变量⑧`（4 个叶子） |
+| `no-fd-type-check`（= 原 `unbounded-read`） | 配置读取整体退回 `fs.readFileSync(file, 'utf8')`（无 `isFile` / 无 `O_NONBLOCK` / 无有界读） | **挂死**：`node --test test/invariants-1-12-13.test.js` timeout 150s ⇒ **124** | `不变量②（B2）` 的 FIFO 档（无界读冻死） |
+| `config-throws` | 去掉 `new RegExp` 的 try/catch、单串长度上限、条数上限与外层兜底（3 处替换） | `# tests 700 / # pass 696 / # fail 4`，test exit 1；verify exit 1 | `不变量③（B3）` / `不变量⑥` / `不变量⑧` + gate B3 组（7 个叶子） |
+| `config-can-disable` | `const patterns = [...DEFAULT_DANGER_PATTERNS]` → `const patterns = []`（缺文件也空表） | `# tests 700 / # pass 667 / # fail 33`，test exit 1；verify exit 1 | 51 个叶子（含 `no-relaxation` G4a/G4b、监听器层代价两条） |
+| `config-empty-only` | `const patterns = exists ? [] : [...DEFAULT_DANGER_PATTERNS]`（只要路径存在就空表） | `# tests 700 / # pass 688 / # fail 12`，test exit 1；verify exit 1 | 20 个叶子（`不变量②/③/④`、1.12.12 配置项、动态生效） |
+| `struct-as-fulltext` | 把 5 类结构/形状规则的返回点整块置 `null`（`shell-nesting` / `su-shell` / `wrapper-nesting` / `shell-stdin` / `shell-depth`） | `# tests 700 / # pass 673 / # fail 27`，test exit 1；verify exit 1 | `no-relaxation` G1 反退化组 + 结构判据用例（38 个叶子） |
+| `count-cap-256` | 条数上限改回旧值 256 | `# tests 700 / # pass 697 / # fail 3`，test exit 1；verify exit 1 | `不变量⑥` + 「上限值必须是 1024」+ gate B3 组（5 个叶子） |
+| `no-count-cap` | 去掉追加条数上限（只留单串长度上限） | `# tests 700 / # pass 698 / # fail 2`，test exit 1；verify exit 1 | `不变量⑥` + gate B3 组（4 个叶子） |
+
+> 说明：上表每条都是**本轮重跑**的读数（基线 = 700 用例树，lib md5 `ccfd25483b8c9cc3d4bde5bd9b29d35a`）；
+> 每条跑完都用 pristine 覆盖回去并自证 `cmp` 逐字节一致 + md5 等于基线 + `MUT-grep = 0`（输出见
+> `/tmp/hd-repro/inc13b/mut3.txt`）。`692` 系旧表把源码 `it(` 计数当成了 TAP 读数（终审 M-a），已全部换掉。
+> `no-fd-type-check` 是**挂死型**（无界读），只跑 `invariants-1-12-13` 一条文件并记 `timeout 150s ⇒ 124`。
+
+### 追加（跨仓纪律三条，来自 B 仓最新一轮终审）
+
+**① 大小写折叠的「已知边界」表述：A 仓按实测核对（没有假断言；顺手把口径补进 lib 注释）**
+
+- A 仓**没有** B 仓那种「`ẞ` 折叠后不折成 `ß` ⇒ 二者永不互命」的断言（全仓 `grep` 无
+  「永不互命 / 折叠后不折」这类表述）⇒ 无需更正错话；把两条**实测事实**写进
+  `lib/host-approval.js` 的 `basenameOf` 注释，并与用例、本文三处对齐：
+  - `'ẞ'(U+1E9E).toLowerCase() === 'ß'(U+00DF)` 为 **true** ⇒ 二者**互命**；
+  - `'İ'(U+0130).toLowerCase().length === 2` ⇒ 折叠**会改变长度** ⇒ 任何「折叠后与原文同区间」的
+    假设都是错的。A 仓的 `toLowerCase()` **只用于程序名比较**、不参与切分；命中回报的 `segment`
+    一律从**原文**切出（用例逐条断言 `cmd.includes(hit.segment)`）。
+- 折叠电池（`'İ'.repeat(5)` / `'aİb'` / `'ß'` / `'ẞ'` / `'e\u0301'` / `'ﬁ'` / `'ǅ'`）逐项跑通，
+  危险名比较（`RM -RF` / `Sudo RM -rf`）照旧命中，非危险同形名（`ẞ` / `İ` / `ß` / `ﬁ` + `-rf`）照旧不误伤。
+
+**② `MAX_DANGER_TEXT_CHARS` 的「恰好等值」边界钉住**
+
+- 新增用例（判据层 + 监听器层）：**恰好 262144 字符**、末尾跟 `; rm -rf /tmp/x` ⇒
+  `boundDangerText().omitted === 0`、走**正常扫描**（`rm -rf`）、监听器层留 `danger-command-block`
+  门名 `rm -rf` 且**不留** `danger-text-truncated` 痕；**262145** ⇒ `omitted === 1` ⇒ 门名
+  `command-too-long`（两者都拦）。
+- 变异证明：`cap-strict`（`<=` → `<`）**不可观测**（如实登记）；可观测的 `cap-plus-one` /
+  `cap-slice-minus-one` 各让该用例 **2 条转红**。也就是说：本版形状下「边界差一个字符」只有
+  **放宽上限**或**少切一个字符**才暴露，单改比较符是等价变换 —— 与 B 仓那条「改了也全绿」
+  属同一现象，现已被两个可观测变异覆盖。
+
+**③ fd 判类型：`openSync(O_NONBLOCK)` → `fstatSync(fd)` → 只有 `isFile()` 才继续**
+
+- 读配置的实现里**没有** `fs.statSync`（只有 `fstatSync(fd)`），顺序 `open → fstat → isFile → read`
+  由源码级守卫逐条钉住；`statSync` 只在**缓存键**那一处出现，不参与类型判定。
+- 八档验收（每档：普通文本判定 ≤1s、危险门恒拦 `rm -rf`、非普通文件不许把内置三串也回退掉）：
+  **FIFO / `/dev/zero` / `/dev/urandom` / 目录 / 悬空软链 / 自指软链 / 缺失 / 正常（追加串生效）**
+  —— 实测全部 <10ms。
+- **fd 不泄漏**：FIFO 配置下判 200 次（每次 `resetDangerPatternCache()`），`/dev/fd` 计数不变（±2 断言）。
+- **TOCTOU 复现**：用**子进程 + 5s 超时**模拟「`statSync` 谎报普通文件 100B、路径实为 FIFO」——
+  本版子进程 5s 内正常退出（`PROBE-OK text:rm -rf`）；变异 `stat-typing`（按路径 stat 判类型）
+  ⇒ 子进程挂在 `readFileSync` 上被杀（即终审那条 `timeout 6 ⇒ exit 124`）⇒ 用例转红。
+  用子进程的原因：`readFileSync` 的同步阻塞没法用同进程定时器救，放进套件会把整套测试挂住。
+
+### 追加·跨仓常量对齐（条数上限 256 → 1024）
+
+- **背景**：`~/.dsh/data/dsh-danger-patterns.json` 是**两仓共用**的同一个文件，但两仓分别在不同通道
+  把关（A = 宿主/原生通道，B = ACP/product 通道）。改前上限不一致：A 追加 ≤**256** 条（单串 ≤4096、
+  文件 ≤1MiB）、B 追加 ≤4096 条（同单串/文件上限）⇒ 用户加 1000 条模式时**原生侧只认 256 条、
+  ACP 侧认 4096 条**，同一份配置两个门行为不同，会被当成 bug。
+- **裁定（两仓统一）**：文件 **≤1MiB**、单串 **≤4096 字符**、**追加条数 ≤1024**。
+  A 侧改动：`const MAX_DANGER_PATTERN_COUNT = 256 → 1024`（`lib/host-approval.js`），
+  超限语义不变（只取前 1024 条 + **告警一次**，内置三串恒生效，**绝不变成不判**）。
+
+| 配置条数 | `dangerTextPatterns()` 表长 | 告警 |
+| --- | --- | --- |
+| 1025 条 | **1027**（内置 3 + 追加 **1024**） | 1 条：`… 有 1 条追加模式被忽略（单串 ≤4096 字符、追加条数 ≤1024 条；超限**不等于**关闭内置 3 条）` |
+| 5000 条 | **1027**（内置 3 + 追加 **1024**） | 1 条：`… 有 3976 条追加模式被忽略（… 追加条数 ≤1024 条 …）` |
+
+**每次调用成本实测（1024 条追加项生效；A 走 `new RegExp` 逐条扫描，成本 ≈ 条数 × 文本长度）**
+
+| 文本 | 1 份变体 | 4 份变体（含引号 / 裸 CR / 字面 `\n` / 双空格） |
+| --- | --- | --- |
+| `echo hi` | 0.266ms | — |
+| 1KB | 0.8ms（无配置基线 0.079ms） | 2.3ms |
+| 20KB | 13.4ms | — |
+| 100KB | 69.3ms（无配置基线 5.5ms） | **189.2ms** |
+| 256KB（判据上限） | 171.2ms | **538.0ms** |
+
+- **判定：典型审批文本（≤1KB）2.3ms 可接受**；但 **≥20KB 起明显变慢，100KB/256KB 在多变体下
+  已越过既有「500KB 对抗输入 <100ms」这条线（189 / 538ms）**。按裁定本轮**按 1024 执行**，
+  数据与可选缓解手段一并上报（不自行改数）：
+  1. **单趟预过滤**：把 1024 条模式合成**一条 alternation 正则**（或按首字符建索引/AC 自动机）⇒
+     一趟扫完文本，成本与条数解耦（预计 100KB ≲ 10ms 量级；语义不变，仍是字面 + 词边界 + 空白/引号容差）；
+  2. **变体扫描收敛**：全文层目前对**全部变体**各扫一遍（Minor 5 的修复），可改为「只有 ① 未命中
+     且文本确实含引号/CR/转义时再扫其余变体」（多数文本只有 1 份变体，收益最大 4×）；
+  3. **按总量设二级上限**（如「模式总字符数 ≤ 64KB」），与条数上限并用。
+- 若采纳 1（或 1+2），1024 条在本机 256KB 极值下预计回到 100ms 以内；需要我实现请单独下派。
+
+### 终审收尾（第 2 轮独立只读终审：0 阻断 / 4 Major / 7 Nit）
+
+> 上一轮的 3 阻断修复、变松证明、G5 位图、变异残留都被独立复现（`relaxed vs 1.12.11 / 1.12.12 / 1.12.7 = 0`、
+> `v7 HIT & v11 HIT & v13 MISS = 0`）。本节只登记**增量**处置。
+
+**M-a 变异表读数是过期基线（692 是源码 `it(` 计数，不是 TAP 读数）**
+
+- 事实：整表写 `# tests 692 / control = 692/692/0`；冻结树实跑是 **`# tests 700 / # pass 700 / # fail 0`**。
+  `692` = 源码里 `it(` 的个数，**不是任何一次 TAP 读数**（TAP 的 `# tests` 还含 `test()` 与子测试）。
+- 处置：**整表按 700 基线重跑**（不靠标注），定义逐字照旧；同时修掉本文档里同源的两处
+  （`MIN_TESTS: 667 → 692` ⇒ `667 → 699`；`用例条数 … 699` ⇒ `700 / MIN_TESTS 698`）。
+- 复核方按同一变异定义复跑的**失败叶子数与本版一致**（方向结论没错，只有基线数字错）——新读数见下方变异表。
+
+**M-b `stat-typing` 的因果归因不成立 + TOCTOU 用例对它没有牙（真问题）**
+
+- 事实（独立复现）：只把 `fs.fstatSync(fd)` 换成 `fs.statSync(file)` ⇒ **唯一红的是源码文本守卫**，
+  行为层的 TOCTOU 子进程用例**照样通过**。机制：该变异仍保留 `open(O_NONBLOCK)` + **fd 上的有界 `readSync`**，
+  谎报类型的 stat 不会阻塞；真正致命的是退回 `readFileSync`（变异 `no-fd-type-check` ⇒ **挂死**）。
+- 处置：①承重件写准（见上面 B2 段的「承重件写准」条目 + 源码注释）；②`CHANGELOG` 与本用例注释同改；
+  ③补**计数行为牙**（本轮新增）：非普通文件档 `readSync = 0` / `openSync = 1`，正常文件档 `readSync ≥ 1`
+  ⇒ 杀掉「退回 `readFileSync`」这类真凶；④明确登记：「按路径 stat 判类型」**只由源码守卫 + 计数断言覆盖**，
+  它本身没有独立行为后果（有界的 NONBLOCK fd 读已把风险兜住）。
+
+**M-c 「≥32,768 字符模式串 ⇒ `new RegExp` 抛」——阶段订正：抛点在**首次执行期**（确实可复现）**
+
+- 复核方按同款构造在 Node v22.22.2 实扫：32,768 / 60,000 / 300,000 字符 **构造期一档都没抛** ⇒ 原稿「THROW」与
+  「32768 ⇒ 无异常」互相矛盾。复核方的提示是对的：**V8 正则编译是惰性的，抛点在首次执行期** ——
+  本轮按这个提示把「构造 + 首次 `exec()`」都测了，**威胁模型可复现**（保留修法，不降级为「未能复现」）。
+- 本轮实测（`/tmp/hd-repro/inc13b/b3probe3.mjs`，同一构造 `(?<![A-Za-z0-9_-])` + `[\s"\`']+` 连接 + 词边界）：
+
+  | 模式串 | 正则源 | `new RegExp` | **首次 `exec()`** |
+  | --- | --- | --- | --- |
+  | `'a' × 32,700` | 32,735 | OK | **OK** |
+  | `'a' × 32,768`（最小复现） | 32,803 | **OK（不抛）** | **THROW** `SyntaxError: … Regular expression too large` |
+  | `'a b c …'` 跨度形态（最小抛错点） | 51,084 | OK | THROW（11,344 字符 / 源 51,075 ⇒ OK） |
+  | 上限内最坏形态 `'* * * …'`（4,096 字符） | **20,507** | OK | **OK** |
+
+- 结论：**B3 是真风险、可复现**（原稿的修法方向正确，只是把阶段写成了构造期）。**两处承重件**：
+  ①单串 4096 上限把最坏源钉在 20,507 字符（< 触发点 32,803 / 51,084）；
+  ②`fullTextDangerMatch` 的**外层 try/catch 覆盖 `re.exec()`**（`dangerPatternRegExp` 里那个 try/catch
+  抓不到执行期抛错）。守卫：`invariants-1-12-13` 的 ③ 新增「构造不抛 / 首次 exec 抛 / 上限内最坏形态可用」
+  三格行为断言 + verify.mjs 的收尾块同断言。
+
+**M-d 性能数字两处不符 + 一条注释与实现矛盾（本轮只订正注释与文档，不改热路径）**
+
+- 真问题（注释 vs 实现）：`dangerTextPatterns()` 在**缓存判定之前**无条件 `statSync(file)`，而紧邻注释写
+  「文件不存在也是缓存住，免得每次判定都 stat 失败」——**注释不成立**：缓存键本身要靠 stat 才能算出来 ⇒
+  **没配过配置时，每次审批都付一次失败的 `statSync`**。
+- **本轮处置（用户裁定：不为纯文档类问题反复复核 + 不动审批热路径）**：只把注释改成与实现一致；
+  「把缺失态也纳入缓存（负缓存 + 重检间隔）」**降为下版本待办**（见文末「下版本待办」），**本版不加代码、不加用例**。
+- 实测（本机 APFS；`/tmp/hd-repro/inc13b/md-perf.mjs`）：
+
+  | 指标 | 1.12.11 | 1.12.13（本版 = 冻结版行为） |
+  | --- | --- | --- |
+  | `dangerousCommandMatch('echo hi')`（无配置，7 轮交错取中位） | **3.93µs**（终审实测） | **28.30µs**（终审 ×6.8）／本机 33.34µs |
+  | 典型 `git commit … <<'EOF'` 文本 | — | 20.99µs |
+  | `statSync` 单次：**文件存在** / **ENOENT（配置缺失，默认档）** | — | 3.26µs（终审 3.81µs）／**14.90µs（终审 25.12µs）** |
+
+  ⇒ 「`echo hi` 判定 ×6.8~7.2」= 全文层 + 多一份变体 + **每次判定的失败 `statSync`**；最后一项就是
+  M-d 的下版本待办（本机试装负缓存后 33.34 → 7.17µs，**本版不采用**）。
+  撤掉负缓存后再测：冻结版 30.53µs / 本版（= 冻结版 + 仅注释）30.77µs ⇒ **本轮注释改动零运行时影响**。
+- 守卫：verify.mjs 收尾块断言「注释必须写明缺失态每次判定都付一次失败 `statSync`」+「**不许出现负缓存实现**」
+  （本轮裁定的落地检查）；不变量⑨ 的 `readSync`/`openSync` 计数行为牙见 M-b。
+
+**7 条 Nit**
+
+1. **`MIN_TESTS: 667 → 692` 与 `:112`/`ci.yml` 的 699 矛盾** ⇒ 统一：本轮 700 用例、`MIN_TESTS = 698`
+   （`ci.yml` 注释里写明来源与理由）。**与 M-a 同批修**。
+2. **CI 余量为 0** ⇒ `MIN_TESTS: 699 → 698`（700 − 2）：`host-0.2-compat.test.js` 有一条硬编码 macOS 路径的
+   用例在 ubuntu 上必 **skip**（`SKIPPED_ALLOWED: 1` 就是为它登记的）⇒ CI 期望 pass 703，留 2 条余量；
+   `ci.yml` 注释里写清这段算术，避免下次又钉到刚好相等。
+3. **`dangerPatternReCache` 无上限、配置键变化不清** ⇒ **本轮不改代码**（长驻进程反复改写配置才会累积，
+   影响面小）⇒ 登记为**下版本待办**：配置键变化时 `dangerPatternReCache.clear()`；本轮不加用例。
+4. **反引号拼接属误报方向**（`` r`m` -rf /tmp/x `` 在 `/bin/sh` 里是**命令替换**，不是 `rm`）⇒ 单独登记一行：
+   `stripWordInternalQuotes` 连反引号一起去 ⇒ **方向：多弹，不放行**（安全侧；与 A/B 容差差异同源，见 Nit 5）。
+5. **A/B 容差差异只在 CHANGELOG 登记、README 未登记** ⇒ README 补一段（`rm"-rf"` / `` rm`-rf` `` / `git"push"`
+   ⇒ A **HIT**、B MISS；`/bin/sh` 语义下这些是 `rm-rf` / `gitpush` ⇒ **误报方向**；反引号那格同上）。
+6. **`MAX_DANGER_PATTERN_COUNT` 未导出** ⇒「上限值本身」用例是源码正则断言（行为层 1025 条 ⇒ 表长 1027 已把数值
+   钉住，不算假绿）⇒ 在测试注释里写明这一点。
+7. **G5 位图是内嵌字面量** ⇒ 在 `no-relaxation-1-12-12.test.js` 的 G5 处加注释：位图由 **1.12.11 冻结树**生成，
+   复核方已用该冻结树重算 **0/840 不一致、loses = 0**；改小 `assert.equal(frozen, 540)` 就等于把洞固化成绿灯。
+
+**本轮读数（收尾）**
+
+- `node --test test/*.test.js`：`# tests 700 / # suites 168 / # pass 700 / # fail 0 / # skipped 0`，exit 0；
+- `node verify.mjs`：exit 0；1.12.7 存量套件：`593 tests / 583 pass / 10 fail`，exit 1（10 条均为已知语义变化）；
+- 差分（`node /tmp/hd-repro/inc13b/diff4.mjs`，84,684 条 = 前缀 32 × 命令 21 × 分隔 13 × 后缀 9 + CR 专项；
+  原始输出 `/tmp/hd-repro/inc13b/diff4.txt`）：`1.12.11 HIT 41,876 → 1.12.13 HIT 54,857`、
+  **`relaxed (11→13) = 0` / `tightened = 12,981` / `归因变化 = 2,566`**、**`relaxed (12→13) = 0`**、
+  **`v7 HIT & v11 HIT & v13 MISS = 0`**；`relaxed (7→13) = 388`，其中 **388/388 都是「1.12.11 也已 MISS」的继承边界**
+  （`1.12.11 会 HIT 而 13 MISS = 0`）⇒ 本轮**新增丢失 = 0**；
+- 变异（新基线 `ccfd2548…`）：见下方变异表（每条 pristine 恢复后 `cmp` + md5 + `MUT-grep=0`；
+  原始输出 `/tmp/hd-repro/inc13b/mut3.txt`）。
+
+**读数来源（本轮每个数字的命令 → 原始输出）**
+
+| 数字 | 命令 | 原始输出 |
+| --- | --- | --- |
+| `# tests 700 / # suites 168 / # pass 700 / # fail 0`、exit 0 | `node --test test/*.test.js`（跑两次） | `/tmp/hd-repro/inc13b/t2.tap`、`t3.tap` |
+| `OK: … v1.12.13 …`、exit 0 | `node verify.mjs` | `/tmp/hd-repro/inc13b/v5.txt` |
+| `593 / 583 pass / 10 fail`、exit 1 | 1.12.7 存量树 `node --test test/*.test.js`（lib 覆盖为本版） | `/tmp/hd-repro/inc13b/legacy7c.tap` |
+| 差分四数 | `node /tmp/hd-repro/inc13b/diff4.mjs` | `/tmp/hd-repro/inc13b/diff4.txt` |
+| 变异 11 条读数 | `python3 mutate.py control no-cr-legacy stat-typing no-bounded-read config-throws config-can-disable config-empty-only struct-as-fulltext count-cap-256 no-count-cap` + `no-fd-type-check` | `/tmp/hd-repro/inc13b/mut3.txt` |
+| B3 抛错阶段（构造 OK / 首次 exec THROW、阈值二分） | `node /tmp/hd-repro/inc13b/b3probe4.mjs` | `/tmp/hd-repro/inc13b/b3probe4.txt` |
+| 判定成本 / statSync 单次成本 / stat 计数 | `node /tmp/hd-repro/inc13b/md-perf.mjs` | `/tmp/hd-repro/inc13b/md-perf.txt` |
+
+**下版本待办（本轮明确不做，登记备查）**
+
+1. **配置缺失态的负缓存**（M-d）：加 `DANGER_CONFIG_ABSENT_RECHECK_MS`（建议 1000ms）+ 负缓存状态 ⇒
+   未配置时每次判定的失败 `statSync`（≈14.9µs / 终审 25.12µs）降到 ≈1 次/进程；语义边界：**只影响
+   「文件从未存在 → 后来被创建」**（最多延迟 1s 生效），已存在文件的改动仍按 `mtimeMs:size:mode` 立刻生效，
+   方向只会更晚收紧、绝不放松；`resetDangerPatternCache()` 要一并清掉负缓存。
+2. **`dangerPatternReCache` 在配置键变化时 `clear()`**（Nit 3）：长驻进程反复改写配置时才累积，影响面小。
+3. **1024 条追加模式在大文本下的成本**（见本文件「跨仓常量对齐」节给出的三个可选缓解）：
+   合成单条 alternation 正则 / 收敛变体扫描 / 模式总字符数二级上限。
+
+### 过程登记（如实）
+
+- **并发变异 harness 竞态（本轮）**：第一次跑变异表时我同时开了两个 harness 实例去改同一个
+  `lib/host-approval.js` ⇒ 其中 `control` 那次读数不可信（`verify.mjs` exit 1 是竞态造成的）。
+  已改为**串行**重跑全部变异体（上表读数即串行结果）；每次恢复都做了
+  `cmp` 逐字节 + md5 等于基线 + `MUT-grep` = 0 的自证，最终基线 md5 `9dfb374982bc973375502a3a41b29bdd`。
+- **失败尝试**：一次 `verify.mjs` 补丁因断言串不匹配（匹配 0 处）整体未落盘 ——
+  脚本设计为「全部 `rep` 先通过再写盘」，当时工作树没有产生半成品，已按真实源码串重做。
+- 冻结纪律：本版**先改完、确认无写操作、再打包**；`lib/host-approval.js` 的 mtime 与冻结时刻
+  对照见交付报告。
+
+### 未做 / 未验证
+
+- **未实机跑宿主链路**：全部结论来自判据层/监听器层用例与本地探针（`DSH_HOME` 隔离到 `/tmp`），
+  没有真的去改 `~/.dsh/data/dsh-danger-patterns.json`、也没有起宿主跑一次真实审批。
+- **未跑 CI**（本地 Node 22.22.2 全量 + `verify.mjs`）；`B 仓`未触碰（另一仓库的同一文件由它自己发布）。
+- **未做的收紧**：Minor 3 的容差（`rm"-rf"` 这类）按「只做加法」**保持不缩**；
+  多字节/Unicode 边界的模式匹配未单独验证；`MAX_DANGER_PATTERN_COUNT` 的取值（1024）是**跨仓裁定**
+  （与 B 仓统一），不是按 A 侧性能选的 —— A 侧 1024 条的实测成本见下节，**大文本下已越过 100ms 线**。
+- **残余已知边界**（与 1.12.12 相同，未变）：结构型判据仍是计数/位置型（全文层不替代它们）；
+  命中面变大（提及/引述也弹）是用户裁定的代价。
+
+
+## 1.12.12（2026-10-06）
+
+> 一句话：**新增一层「全文危险词扫描」**（可配置，预设 `rm -rf` / `git push` / `npm publish`）——
+> 这三个字样出现在命令文本**任意位置**即视为高危；同时把归一化层的两处口径按用户裁定收口
+> （**字面 `\n`/`\r` 也算行分隔** + **多读**）。**只做加法**：既有「按段 / 命令头」判定、形状判据、
+> 结构判据（计数/位置型）、多读一个都没动 —— 相对上一冻结树（1.12.11）差分 **relaxed = 0**
+> （25,950 条语料；含字面转义家族），tightened = 2,783（逐类见下）。
+
+### 模式变更与代价（用户裁定）
+
+用户原话：
+
+> 「**改成全文子串判定：文本里出现危险字样就弹**」
+> 「做成一个配置项，以后可以动态增加高危判断的字符串。目前预设 `rm -rf`、`git push`、`npm publish` 三个先」
+
+- **语义**：这三个字符串出现在**归一化后**的命令文本任意位置 ⇒ 判为高危（不再要求它站在段首/命令头）。
+  归因名：内置串 `text:<模式>`（如 `text:rm -rf`）；自定义串 `text:custom:<原串>`。
+- **代价（有意取舍，不是缺陷）**：提交信息、注释、文档、`grep`/`--grep` 参数里**提到**这些字样也会弹。
+  这与默认值同向（保守方向），用户明确接受。
+- **只做加法**：既有判定一条不删 —— 结构型判据（`shell-nesting` / `wrapper-nesting` / `shell-stdin` /
+  `su-shell` / `wrapper-option-ambiguity`）**一律没有**改成全文匹配（它们是计数/位置判据，
+  全文子串表达不了「嵌套了几层」；B 仓终审实测：若用全文子串替换这两条计数判据会直接丢掉 612 条命中）。
+  全文扫描只在既有各遍都未命中时兜底 ⇒ **判定方向**不变（拦/不拦不变）。
+
+> **v1.12.13 订正（M1）**：上面「既有命中的**规则名与优先级一字不变**」这句**不成立** ——
+> 终审在 45,734 条语料里实测 **353 条「命中但规则名变了」**（全部仍 HIT、0 条变 null），
+> 例如 `shell-nesting → shell-stdin`（×30）、`wrapper-option-ambiguity → rm -rf / git push / npm publish`
+> （×52）。准确口径是「**判定不变、归因可能变化**」，详见 1.12.13 段的同名小节。
+
+### 配置项（路径 / schema / 语义 / 动态生效）
+
+- **路径**：`~/.dsh/data/dsh-danger-patterns.json`（即 `$DSH_HOME/data/dsh-danger-patterns.json`，
+  `$DSH_HOME` 缺省 `~/.dsh`；与 B 仓共用同一文件、同一 schema）。
+- **预设（恒生效、不可通过配置关闭）**：`rm -rf`、`git push`、`npm publish`。
+- **schema**：
+
+  ```json
+  { "_readme": "可选注释字段", "patterns": ["rm -rf", "git push", "npm publish"] }
+  ```
+
+- **语义**：
+  - **配置只增不减**：内置三串**恒生效、不可通过配置关闭**，`patterns` 里的条目只是**追加**到内置三串之后；
+  - 文件缺失 / 无法解析（坏 JSON）/ `patterns` 不是数组 / `patterns: []` ⇒ **一律等价于「没有追加项」**
+    （内置三串照常生效），最多告警一次，绝不因此变成「不判」。
+    理由：该文件在 `$DSH_HOME/data/` 下、**任何能写它的命令都能改它** ⇒ 若允许「关闭」，等于给危险命令
+    留了一条「先把自己的门关掉」的自解除武装路径；反过来，通过配置**增加**模式只会让门**更严**
+    （最坏是更爱弹），不可能放松；
+  - 每条 `trim` + 空白折叠 + 丢弃空串 + 去重；**按字面匹配，不是正则**（`a.*b` 只匹配字面 `a.*b` ⇒ 无注入面）。
+- **动态生效（不需要重装 / 重启宿主）**：每次判定位一次 `statSync`，按 `mtimeMs + size` 变化重读；
+  文件一变，**下一次判定立刻**用上新串。实测（`test/invariants-1-12-12.test.js` + `verify.mjs` 同一断言）：
+  不调用任何 reset、直接改文件 ⇒ `echo "kubectl delete ns prod"` 立刻从「不弹」变
+  `text:custom:kubectl delete ns`；把该串删掉 ⇒ 下一次判定立刻回到「不弹」，而**内置三串始终在**
+  （删追加项不会带掉它）。`stat` 的开销实测 0.043ms/次（配置未变时只有一次 stat，没有读盘）。
+
+### 匹配语义：容差清单（命中） / 反例边界（刻意不命中）
+
+| 形态 | 结果 | 说明 |
+| --- | --- | --- |
+| `rm  -rf` / `rm \t -rf` / `rm    -rf` | HIT | 归一化折叠连续空白 |
+| `git   push` / `npm  publish` | HIT | 同上 |
+| `rm "-rf"` / `rm '-rf'` | HIT | 容忍引号（既有词法规则也覆盖） |
+| `git \`⏎`push` | HIT | 续行合并后可见 |
+| `echo "git \`⏎`push"` | HIT `text:git push` | 归一化后再全文匹配（只有全文层能看见） |
+| `echo "npm\npublish"`（**字面** `\n`） | HIT `text:npm publish` | 字面 `\n` 按行分隔 |
+| `rm -r -f` / `rm -f -R` / `rm --recursive --force` | HIT `rm -rf` | 既有词法规则（与全文层无关，**不许**丢） |
+| `/bin/rm -rf` / `sudo rm -rf` / `git -C /tmp push` / `npm --prefix /tmp publish` | HIT | 既有词法规则 |
+| `perform -rf x`（含 `rm -rf` 子串） | **MISS** | 词边界：左邻是 `[A-Za-z0-9_-]` ⇒ 不算 |
+| `legit push` / `digit push`（含 `git push` 子串） | **MISS** | 同上 |
+| `npm publisher` / `git pushd` / `git pushpin` | **MISS** | 右边界（后缀）不许是词字符 |
+| `rmdir -rf` / `format -rf` / `echorm -rf` / `xrm -rf /tmp/x` | **MISS** | 子串本身不成立 / 左边界挡住 |
+| `rm -r /tmp/x` / `rm -f /tmp/x` | **MISS** | 只递归或只强制 ≠ `rm -rf` |
+| `git log --grep push` / `npm run publish` / `pnpm run publish` | **MISS** | 词法层要求动词位置；全文层要求字面 `git push` / `npm publish` 相邻 |
+| `pnpm publish` / `yarn publish`（引号内） | 引号外 HIT（既有规则）/ 引号内 **MISS** | 这两条**不在**预设三串里（配置的边界，如实登记；要覆盖就加进 `patterns`） |
+
+### 代价清单（逐条判定；**用户裁定的有意取舍**）
+
+| 类别 | 输入 | 判定 |
+| --- | --- | --- |
+| 提交正文 | `git commit -m "fix: avoid rm -rf"` | **弹** `text:rm -rf` |
+| 注释 | `# 注释：不要用 rm -rf` | **弹** `text:rm -rf` |
+| 文档写入 | `cat <<EOF > notes`⏎`正文提到 npm publish`⏎`EOF` | **弹** `text:npm publish` |
+| grep 模式 | `git log --grep "git push"` | **弹** `text:git push` |
+| echo 引述 | `echo "note: never run rm -rf /tmp/x by hand"` | **弹** `text:rm -rf` |
+| echo 引述（提交信息） | `git commit -m "fix: never git push --force"` | **弹** `text:git push` |
+| 无字样 | `echo "use sudo to install"` | **不弹** —— `sudo` 是**结构型包装器**，不在预设三串里（按裁定「结构判据保持原样」）；要它弹就把它加进 `patterns` |
+| 无字样 | `cat <<'EOF'`⏎`body`⏎`EOF` | **不弹**（文本里没有任何预设字样） |
+
+### 归一化穷举小表（哪种形态 ⇒ 分隔 / 折空格 / 直接拼接）
+
+| 输入形态 | 处理 | 例 |
+| --- | --- | --- |
+| 行尾**未转义** `\` + 换行 | 删 `\` 与行尾空白/CR，**直接拼接**下一行 | `git \`⏎`push` → `git push` |
+| 行尾 `\` + 行尾空白 + 换行 | 同上（比 shell 略宽，保守） | `git \   ` ⏎ `push` → `git push` |
+| `\\`（转义反斜杠） | **不动**（不是续行） | `echo a\\b` 原样 |
+| 真实 `\n` | **段分隔符** | `a`⏎`b` → `a\nb` |
+| CRLF（`\r\n`） | **一个**段分隔符 | `a\r\nb` → `a\nb` |
+| 裸 `\r` | **段分隔符** | `a\rb` → `a\nb` |
+| **字面** `\n` / `\r`（两字符序列） | **段分隔符**（Python/Node/PowerShell 眼里的真换行；折空格会把换行藏进同一段＝漏判方向） | `a\\nb` → `a\nb` |
+| **字面** `\t` | **折成一个空格**（只是空白） | `a\\tb` → `a b` |
+| 连续空格 / TAB | 折叠成**一个空格**；段分隔符前不留尾随空格 | `rm  -rf` → `rm -rf` |
+
+### 口径说明（偏离与理由）
+
+**这是对用户裁定字面口径的一处有意偏离，偏的是更保守的一侧。**
+
+1. **真实换行保留为「段分隔符」，没有折成空格。** 折成空格会**抹平行首/段首语义**，让 1.12.10 起
+   已经拦住的一批形态立刻变成 MISS（差分 `relaxed` 会远大于 0，与「只加不减」直接冲突）：
+   - `echo hi`⏎`- rm -rf /tmp/x` —— 折成空格后是一整行，段首是 `echo` ⇒ 形状判据①不再命中；
+   - `git add -A`⏎`git commit -q -F - <<'EOF'`⏎`- planGrantWrites …` —— 折成空格后「正文行以 `- ` 开头」
+     这条代价命中消失。
+   保留换行后，这些仍然按「段」判（该弹的照旧弹）。折成空格**只会更松、没有任何收益**。
+2. **多读（新口径 / 旧口径 / 原文，去重后逐份判）。** 归一化只许**更容易命中**：
+   - 「旧口径读」（字面转义折空格）保证**上一版会命中的形态一条都不许变 MISS** ——
+     典型 `rm\n-rf\n/tmp/x`（**字面** `\n`）在新口径下拆成三段都不命中，而旧口径拼成 `rm -rf /tmp/x` 是命中的
+     ⇒ 旧口径那一遍把它留下来（多弹一次，符合用户「宁愿多弹窗一次高危的处理」）；
+   - 「原文读」保 `test \`⏎`-f x` 这类：合并成 `test -f x` 后**段首不再是选项**（形状判据①不再命中），
+     而原文第二行 `-f x` 是命中的 ⇒ 原文那一遍保留它。
+   三份文本相同（普通输入）时只判一遍，零额外开销。
+
+### 只加不减：常驻反退化回归表（`test/no-relaxation-1-12-12.test.js`）
+
+四组各自独立成 `it()`，便于分别变异计数；G3 的 38 条逐条与 **1.12.11 冻结树**比对过
+（`之前规则名 → 现在规则名` **全部一致，无处为 null**）。
+
+| 组 | 内容 | 条数 | 1.12.11 → 1.12.12 |
+| --- | --- | --- | --- |
+| G1 | 结构判据（`sh -c 'sh -c "sh -c ls"'` ⇒ `shell-nesting`、9 跳包装 ⇒ `wrapper-nesting`、`bash <<< …` ⇒ `shell-stdin`、`su root` ⇒ `su-shell`、`-rf /x` / `env -S '…'` ⇒ `wrapper-option-ambiguity`） | 6 | 全部不变，无 null |
+| G2 | 词法等价写法（`rm -r -f` / `rm -f -R` / `rm --recursive --force` / `rm /x -rf` / `/bin/rm -rf` / `sudo rm -rf`） | 6 | 全部 `rm -rf`，不变 |
+| G3 | 既有位置敏感命中（命令头 / 段中 `;`·`&&`·`\|` / 剥壳 `command`·`env`·`nohup`·`nice`·`time`·`su -c` / `git -C`·`git -c k=v`·`npm --prefix` / `find -exec` / heredoc 前后 / argsText 通道 / 大写同形 / 续行 / 多行 `-c` / 空白与 TAB 规避 / 引号包裹选项 …） | 38 | 全部不变，无 null |
+| G4 | 新增面（三个预设串 × 段中 / 引号内 / 归一化拼接后 / 提及 + 自定义配置串） | 14 | 全部 HIT（其中 G4a/G4b 是**只有全文层**能命中的形态） |
+
+**两组转红实验**（每条都从 pristine 逐字节恢复并复核 md5）：
+
+| 变异 | 回归表读数 | 转红组 | 全量套件 | 退出码（回归表 / 全量 / verify） |
+| --- | --- | --- | --- | --- |
+| `control`（不变异） | 5/5 绿 | — | 667/667 绿 | 0 / 0 / 0 |
+| `no-fulltext`（删掉全文扫描） | 5 例 → 3 绿 2 红 | **只有 G4a + G4b**（G1–G3 全绿） | 667 → 645 pass / 22 fail | 1 / 1 / 1 |
+| `struct-as-fulltext`（把结构判据换成「只剩全文匹配」） | 5 例 → 4 绿 1 红 | **只有 G1**（G2–G4 全绿） | 667 → 628 pass / 39 fail | 1 / 1 / 1 |
+
+> 上表 4 行是 1.12.12 那一轮的表（保留为历史）。**1.12.13 重跑的表**（同一定义、当前套件 692/698 条）见下：
+>
+> | 变异体 | 定义（逐字可复现） | 全量读数 | 转红面 |
+> | --- | --- | --- | --- |
+> | `control` | 不改（基线） | `# tests 692 / # pass 692 / # fail 0`，test exit 0、verify exit 0 | —（全绿） |
+> | `no-cr-legacy` | 删掉旧口径读里的裸 CR 折空格分支 | `692 / 687 / 5`，exit 1、verify 1 | gate B1、`不变量①`、`不变量⑧`、**G5 两条**（生成式 840 条位图，540 条冻结命中） |
+> | `unbounded-read` | 配置读取退回 `readFileSync`（无 `isFile` / 无 `O_NONBLOCK` / 无有界读） | `node --test test/invariants-1-12-13.test.js` **120s 超时 = 124（挂死）** | `不变量②（B2）` |
+> | `config-throws` | 去掉 `new RegExp` 的 try/catch、单串上限、条数上限、外层兜底（3 处替换） | `692 / 688 / 4`，exit 1、verify 1 | `不变量③（B3）`、`不变量⑥（Minor 7）`、`不变量⑧` |
+> | `config-can-disable` | `const patterns = [...DEFAULT_DANGER_PATTERNS]` → `[]`（缺文件也空表） | `692 / 660 / 32`，exit 1、verify 1 | 12 条（`no-relaxation` G4a/G4b、监听器层代价两条等） |
+> | `config-empty-only` | `const patterns = exists ? [] : [...默认]`（只要路径存在就空表） | `692 / 681 / 11`，exit 1、verify 1 | 12 条（`不变量②/③/④`、1.12.12 配置项、动态生效） |
+> | `struct-as-fulltext` | 把 5 类结构/形状规则的返回点整块置 `null` | `692 / 665 / 27`，exit 1、verify 1 | 12 条（`no-relaxation` G1、嵌套/`su`/`source` 等） |
+> | `cap-strict`（**语义等价**） | `<= MAX` → `< MAX` | `# tests 81 / # pass 81 / # fail 0`，exit 0 | **不转红（如实登记：本版形状下不可观测）** |
+> | `cap-plus-one` | `<= MAX` → `<= MAX + 1` | `81 / 79 / 2`，exit 1 | 「恰好等值」边界用例 + 第六轮 Minor 2 截断用例 |
+> | `cap-slice-minus-one` | 截断少切一个字符 | `81 / 79 / 2`，exit 1 | 同上两条 |
+> | `stat-typing`（TOCTOU） | 按**路径** `statSync` 判类型 + `readFileSync` | `24 / 21 / 3`，exit 1、verify 1 | 「类型判定只靠 fd」、**TOCTOU 子进程探针（子进程被 SIGTERM 杀掉）**、B2 源码守卫 |
+> | `no-count-cap` | 去掉追加条数上限（`p.length > MAX_DANGER_PATTERN_CHARS` 单独成条件） | `25 / 23 / 2`，exit 1 | `不变量⑥`（1025 条全生效）与新增的「上限值 = 1024」用例 |
+> | `count-cap-256` | 上限值改回旧值 256 | `25 / 23 / 2`，exit 1 | 同上两条（1025 条只生效 256 条 / 源码值不是 1024） |
+| `config-can-disable`（把配置改回「`[]` 可关闭内置三串」） | 5 例 → 3 绿 2 红 | **只有 G4a + G4b** | 667 → 646 pass / 21 fail | 1 / 1 / 1 |
+
+### 差分（相对上一冻结树 1.12.11；25,950 条语料 = 前缀 × 命令 × 形状 + 字面转义家族）
+
+- `1.12.11` HIT 15,771 ⇒ `1.12.12` HIT **18,554**；**relaxed = 0**；tightened = **2,783**。
+- tightened 归类：**提及/引述（用户裁定代价）1,370**、注释与边角（`(rm -rf /x)` 这类括号包裹 / heredoc 普通行）749、
+  **引号包裹/引号内 322**、字面转义作行分隔/折叠 204、代码片段（标点紧邻，如 `os.system('rm -rf /x')`）132、续行合并 6。
+  六类**全是变严（多弹）**，没有一类是「把原本命中的真命令变成放行」。
+
+### 性能
+
+| 用例 | 1.12.11（旧） | 1.12.12（新） | 增量 |
+| --- | --- | --- | --- |
+| 1KB `echo` | 1.5ms | 2.4ms | +0.9ms |
+| 20KB `echo` | 23.8ms | 23.2ms | −0.5ms |
+| 典型 `git commit … <<'EOF'` | 0.1ms | 0.1ms | ±0 |
+| 256KB 多段（31k 段） | 227.7ms | 174.2ms | −53.5ms |
+| 500KB 多段（62k 段） | 316.0ms | 328.4ms | +12.4ms |
+| 500KB `sudo `×100000 + `ls` | 25.4ms | 42.6ms | +17.1ms（仍 **<100ms**） |
+| 500KB `rm `×100000 + `ls` | 85.0ms | 79.0ms | −6.0ms |
+| 1MB（模式在头部） | 25.8ms | 26.2ms | +0.3ms |
+
+- 配置文件的 `statSync` 开销 **0.043ms/次**（未变更时不读盘）。
+- 诚实说明：**多段大文本本身**（31k–62k 段，每段都要判）是**既有**成本（旧版同量级），
+  不是本层引入；真实宿主链路里 `commandText` 受 `MAX_DANGER_TEXT_CHARS = 256KB` 约束。
+
+### 测试与读数
+
+- `node --test test/*.test.js` ⇒ `# tests 667 / # suites 157 / # pass 667 / # fail 0`（exit 0）；
+  `node verify.mjs` ⇒ `OK: @kiligzzz/dsh-agent-dispatch v1.12.12 …`（exit 0）；`node --check` 全部 OK。
+- 新增：`test/invariants-1-12-12.test.js`（14 条：预设三串 × 三类位置 / 非预设规则边界 / 配置项
+  （路径·**只增不减**（缺失/坏 JSON/非数组/`[]` ⇒ 没有追加项，内置三串恒在）·trim·去重·动态生效·归因名）/
+  容差与词边界与字面匹配 / 结构判据不动 /
+  只做加法回归表 / 代价 / 性能 / 源码级守卫）、`test/no-relaxation-1-12-12.test.js`（5 条 = G1–G4）。
+- 既有用例按新裁定**翻面**（旧语义是「提及 ⇒ MISS」，现在必须 HIT 并注明是代价）：
+  `test/dangerous-command-gate.test.js`（误伤守卫拆成「真负例」+「代价」两条；分段测试、`find -exec echo rm -rf`、
+  `yarn info npm publish`、两处 argv 拆词残留边界、监听器层误伤守卫）、
+  `test/invariants-1-12-10.test.js`（「不是什么都弹」拆成真负例 + 代价）、
+  `test/invariants-1-12-11.test.js`（代码边界 MISS 列表、行首语义里的提及、问②口径）。
+  **没有加任何豁免**，也没有把代价写成缺陷。
+- `.github/workflows/ci.yml`：`MIN_TESTS: 645 → 667`（`SKIPPED_ALLOWED: 1` 不变）+ 注释块补 v1.12.12 说明。
+- **1.12.7 存量套件复跑**（`git archive HEAD` 的 593 条 + 本版 lib）：**583 pass / 10 fail**；
+  其中 3 条是 1.12.10 起就有的归因变化（`终审 M1-④`、`Minor：透明包装跳数用尽`、`shell 包装递归上限 2 层`），
+  另外 7 条是本轮用户裁定**翻面的旧语义断言**（那些文件里把「提及 ⇒ MISS」写成了不变量：
+  `终审 M1-⑥`、`终审 M1-⑤`、`误伤守卫…`、`自定义执行工具…{shell:…}`、`分段…引号内不切分`、
+  `第七轮兜底…`、`误伤守卫（监听器层）…`）—— 本仓现行用例已按裁定翻成 HIT。
+
+### 未做 / 未验证（本轮）
+
+- 未 commit、未部署、未碰 `dsh-plugin-danger…`/`dsh-plugin-product-subagents`；`stash@{0}`（1.12.8 草案）保留。
+- 未做实机手势验证（不写 `~/.dsh`）：结论来自本仓判据层 + `index.js` 审批 handler 的监听器级 e2e。
+- 预设三串之外的规则（`pnpm publish` / `yarn publish`）**不**做全文匹配 —— 要覆盖就把它们加进
+  `patterns`（此时归因为 `text:custom:…`）。
+- 归一化后日志里的 `segment` 显示的是**规范化/匹配片段**（与用户原文可能不同段），未做原文回填。
+- 多段超大文本（≥31k 段）判定耗时数百毫秒是**既有**成本，本轮未优化（真实链路受 256KB 上限约束）。
+
+## 1.12.11（2026-10-06）
+
+> **注（1.12.12 起）**：本段里「字面 `\n`/`\r`/`\t` 与裸 CR ⇒ 一个空格」与「**双读**」两处口径已在
+> 1.12.12 收口 —— 字面 `\n`/`\r`（含裸 CR）改按**行分隔**，判定改为**多读**（新口径 / 旧口径 / 原文）。
+> 见 1.12.12 段的「归一化穷举小表」与「口径说明（偏离与理由）」。本段其余结论（窗口、形状判据、只做加法）不变。
+
+> 一句话：**判定前先做「文本归一化」**（续行合并 / 换行转义折空格 / 连续空白折叠），并把
+> `contentRuleOf` 的二次路径用 **256 token 的归因窗口**封顶。修掉 1.12.10 终审的
+> **1 阻断 + 2 Major + 4 Minor**；**没有放宽任何既有拦截**（相对 1.12.10 的差分：
+> 24,755 条语料 **relaxed = 0**、tightened = 894，逐类见下）。
+
+### 用户裁定（原话，本轮唯一设计依据）
+
+> 「以保守的策略，遇到 尾未 `\` ，就一概 前置处理，去掉行末 `\` 再拼接下一行；凡是换行转义的形状，
+> 比如 `\n` `\r` 等，都直接换成空格处理。最后再对 处理后的 内容，进行 高危形状判断。这样就是简单的，
+> 保守方法，**不需要对 `-c` 等做复杂判断**」
+
+> 「归一化内容处理，需要将连续的空格，转换成单个空格吧？」
+
+### 改动表（`file:line` 按本版最终文件）
+
+| 位置 | 改动 |
+| --- | --- |
+| `lib/host-approval.js:582` | **新增** `export const MAX_ATTRIBUTION_TOKENS = 256`：归因窗口（只裁归因、**不放行**） |
+| `lib/host-approval.js:1323` | `contentRuleOf` 只扫**最后** 256 个 token 的每个后缀（原先是全 token 的后缀 ⇒ O(n²)）；窗口里没内容就返回 `null`，调用方仍落回 `wrapper-nesting` / `shell-nesting`（**仍然拦**） |
+| `lib/host-approval.js:1220` | **新增** `isUnescapedBackslashAt`：反斜杠奇偶（`\\` 是转义反斜杠，不是续行） |
+| `lib/host-approval.js:1248` | **新增** `export function normalizeDangerText(text)`：**归一化层**（顺序固定，见下） |
+| `lib/host-approval.js:1180` / `:1188` | `splitSubCommands`：**换行一律当段分隔符**（引号里也切，并重置引号状态）—— 这样多行 `-c` / `-Command` 正文逐行独立判定，**不需要**按 flag 做任何专门解析 |
+| `lib/host-approval.js:860` | `stripOuterQuotes`：容忍切段后**落单**的引号（`"x` / `npm publish"` ⇒ 去掉引号；只多命中，不放过） |
+| `lib/host-approval.js:1477` | `matchText`：`const normalized = normalizeDangerText(text)` ⇒ 切段/判定都用规范化文本；**再判一遍原文**（「双读」，见下） |
+
+### 归一化口径（顺序固定，判定全部在③之后的文本上做）
+
+1. **行尾未转义的 `\`**（可带行尾空白、可带 CR）= shell 续行 ⇒ 删掉 `\` 与行尾空白/CR/换行，
+   与下一行**直接拼接**（`git \`⏎`push origin main` → `git push origin main`；`rm \`⏎`-rf /tmp/x` → `rm -rf /tmp/x`）。
+   CRLF、行尾 `\` 后带空格都算续行（比真 shell 略宽 —— 保守方向）。
+2. **其它换行转义形态 ⇒ 一个空格**：文本里的**字面** `\n` / `\r` / `\t`（两字符序列）与**裸 CR**。
+3. **连续空白折叠成一个空格**（空格 / TAB / 残留 CR）。
+4. **真实换行保留为「段分隔符」，不折成空格 —— 这是刻意偏离字面口径的一处（安全方向）**：
+   把真实换行折成空格会**抹平行首/段首语义**，`echo hi`⏎`- rm -rf /tmp/x`（形状判据①）、
+   `git add -A`⏎`git commit …`⏎`- planGrantWrites …`（现场那条 commit 的代价命中）等一批
+   1.12.10 已拦截的形态会立刻变成 MISS（差分 relaxed 远大于 0），与「relaxed 必须 0」的硬约束
+   直接冲突；折成空格在安全上**只会更松**、没有收益。字面 `\n` 序列按裁定②折成空格（它本来就不是真实换行）。
+5. **双读（不许变松）**：先判规范化文本，没命中**再判一遍原文**。归一化只允许「更容易命中」——
+   例：`test \`⏎`-f x` 合并成 `test -f x` 后段首不再是选项（形状判据①不再命中），而原文第二行
+   `-f x` 在 1.12.10 里是命中的 ⇒ 原文那一遍把它保留下来（代价 = 多弹一次，符合用户「宁愿多弹」）。
+   只有文本里含 `\` / CR / 多空格 / TAB 时才跑第二遍。
+
+### Blocker：`contentRuleOf` 的 O(n²) 回归（与 B 仓同款修法）
+
+- 修前：`dangerousCommandMatch('sudo '.repeat(32768) + 'ls')`（164KB）**2,939ms**；
+  `'sudo '.repeat(52427) + 'ls'`（262,137 字符，**仍在 `MAX_DANGER_TEXT_CHARS = 256KB` 上限内**）**8,174ms**。
+  `MAX_DANGER_TEXT_CHARS` 只界**字符**不界 **token**（256KB 的 `sudo ` ＝ 52,427 个 token）。
+- 修后（`MAX_ATTRIBUTION_TOKENS = 256` 窗口）：同两条 **9.8ms / 16.7ms**。
+
+| 包装词数 | 字符数 | 1.12.10 `…ls` | 1.12.11 `…ls` | 1.12.10 `…rm -rf` | 1.12.11 `…rm -rf` | 归因（1.12.11） |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2,048 | 10,242 | 12.5ms | 2.9ms | 8.7ms | 2.4ms | `rm -rf` |
+| 8,192 | 40,962 | 51.1ms | 4.4ms | 57.9ms | 4.6ms | `rm -rf` |
+| 32,768 | 163,842 | 2,939.2ms | 9.8ms | 2,956.6ms | 10.0ms | `rm -rf` |
+| 100,000 | 500,002 | 31,174.8ms | 44.4ms | 35,306.4ms | 69.2ms | `rm -rf` |
+| 52,427（256KB 上限内） | 262,137 | 8,173.7ms | **16.7ms** | — | — | `wrapper-nesting`（`ls` 无内容可归因） |
+
+- 普通输入零退化：1KB `echo hi` 1.15ms → 1.29ms；20KB 24.09ms → 21.50ms；典型 `git commit … <<'EOF'` 0.03ms → 0.04ms。
+- 语义边界：窗口变小只让**归因变粗**（`sudo`×32768 + `ls` ⇒ `wrapper-nesting` 而不是 `null`），
+  **永不产生放行**；`sudo`×9 + `rm -rf` 仍精确归因 `rm -rf`，`sudo`×9 + `ls` 仍 `wrapper-nesting`。
+
+### Major 1 / Major 2（真实执行路径漏判）
+
+| 形态 | 1.12.10 | 1.12.11 |
+| --- | --- | --- |
+| `git \`⏎`push origin main`（裸续行） | 判据层 `null`；真实 handler `allowed-once` + **0 行留痕** | `git push`（内容规则） |
+| `npm \`⏎`publish`、`rm \`⏎`-rf /tmp/x`、`sudo \`⏎`rm -rf /tmp/x` | 同上（只有形状判据偶尔兜住） | `npm publish` / `rm -rf` / `rm -rf` |
+| `bash -c "true`⏎`rm -rf /tmp/x"` | `null`（一次即可绕过全部 5 条内容规则） | `rm -rf` |
+| `sh -c "true`⏎`npm publish"`、`pwsh -Command "x`⏎`npm publish"` | `null` | `npm publish` |
+| `cat <<'SH'`⏎`rm \`⏎`-rf /tmp/x`⏎`SH`（载荷 + 续行） | 形状判据 `wrapper-option-ambiguity` | `rm -rf`（归因升级） |
+
+### 差分（相对 1.12.10；自造语料 24,755 条，前缀/命令/分隔/引号/heredoc 组合）
+
+- **relaxed = 0**（1.12.10 HIT 14,142 ⇒ 1.12.11 HIT 15,036，无一条由命中变 MISS）
+- **tightened = 894**，逐类：**字面转义/CR 折空格 490**（如 `rm\n-rf /tmp/x`、`rm\t-rf …`）、
+  **续行合并 165**（`git \`⏎`push` 等）、**多行引号内切段 137**（`bash -c "true`⏎`rm -rf …"` 等）、
+  **引号包裹的整条命令（落单引号容错）102**（`"npm publish"` 这类）。
+  四类都是**按用户裁定的变严（只会多弹）**，没有一类是「把原本静默放行的真命令继续放行」。
+
+### 代价与边界（如实登记）
+
+- **大写 tag 逐条钉住（Minor 1）**：`SH`/`Sh`/`BASH`/`SU`/`Su`/`RUNUSER` 与对应小写**同样命中**
+  （`basenameOf` 小写化）；`EOF`/`Eof`/`eof`/`JSON`/`PY`/`END`/`YAML`/`TXT` 不弹。
+- **「句中只是提到危险命令」没有翻面（实测）**：`echo "note: never run rm -rf /tmp/x by hand"`、
+  `git commit -m "fix: never git push --force"`、`curl 'a=1&rm -rf'`、`cat <<EOF > f` 正文普通说明
+  ⇒ 全部仍然 **MISS**（危险门只看段首 / 包装剥壳后的段首，不做全文子串搜索）。
+- **连续空白折叠（细则⑤）的实测口径**：`rm  -rf` / `git\tpush` / `rm \t -rf` 在 1.12.10 里
+  **本来就命中**（tokenizer 一直按 `\s+` 切词）⇒ 折叠是**判定文本口径统一**，不是新的拦截来源；
+  差分 tightened 里没有一条来自⑤（它由 `normalizeDangerText` 的单元断言钉住）。
+- **开放问题（已在报告里点出，等裁定）**：若 `pwsh -Command "x\nnpm publish"` 里的 `\n` 指**字面两字符**，
+  按裁定②折成空格 ⇒ 不弹；**真实换行**形态 ⇒ 弹 `npm publish`（验收用例按真实换行实测通过）。
+  要「字面形态也弹」，把②里 `\n`/`\r` 改成**行分隔**即可（更保守，一行改动）。
+- 既有的「正文里真的写了危险命令 ⇒ 多弹一次」仍然是代价（`- ` 开头行 ⇒ `wrapper-option-ambiguity`）。
+
+### Minor 3 / Minor 4
+
+- **Minor 3（行号订正）**：1.12.10 段改动表的三个锚点已改准 —— `contentRuleOf` :1231（原写 :1234）、
+  `matchSegment` :1305 / :1338（原写 :1308 / :1341）、`matchText` :1378（原写 :1379）；
+  该段并已注明「行号按 1.12.10 那份文件，本版起整体下移」。
+- **Minor 4（ban-list 误伤注释）**：`test/dangerous-command-gate.test.js`、`test/invariants-1-12-10.test.js`、
+  `test/invariants-1-12-11.test.js`、`verify.mjs` 里的「旧符号不得复活」守卫改为**只查非注释行**
+  （共享 `stripComments`：整行 `//` / `*` / `/*` 开头的行剔除）。**已知代价**：行尾注释
+  （`code // 旧符号名`）仍会被扫到；行为断言才是主守卫，这条只防「符号复活」。
+
+### 测试与读数
+
+- `node --test test/*.test.js` ⇒ `# tests 645 / # suites 146 / # pass 645 / # fail 0`（exit 0）；
+  `node verify.mjs` ⇒ `OK: @kiligzzz/dsh-agent-dispatch v1.12.11 …`（exit 0）；
+  `node --check` 于 `lib/host-approval.js` / `verify.mjs` / 三个测试文件全 OK。
+- 新增/改写逐条：
+  - `test/dangerous-command-gate.test.js` 66 → **74**：B2 从「形状判据」翻成「续行合并 ⇒ 内容规则」；
+    matchText 标记改链式（`normalized` + 双读）；**新增** `v1.12.11 判据层` 8 条
+    （Major 1 续行+边缘 3 条 / Major 2 多行 `-c`+`-Command` / 细则⑤ 空白折叠 / 行首语义不许抹平 + 现场代价
+    / 「双读」不许变松 / Blocker 窗口语义 / Blocker 性能封顶 / Minor 1 大写 tag 两档）。
+  - `test/invariants-1-12-10.test.js` 15 条：B2 期望翻成 `rm -rf` 与 `git push`；`splitSubCommands`
+    结构守则更新为「HEAD 骨架 + 换行一律切段」；ban-list 改注释感知；matchText 标记改链式（不变条数）。
+  - **新增** `test/invariants-1-12-11.test.js` **15 条**：①归一化函数形状（续行 / 字面转义 / 折叠 / 换行保留 / 幂等）
+    ②判定在归一化之后（七条验收 + 空白折叠 + 行首语义 + 反放宽回归表 + 问②未翻面）
+    ③归因窗口只粗不放（含 32768 包装词 < 500ms 的性能封顶）④大写 tag 两档
+    ⑤源码级守卫（接线链、换行分支、**没有**按 flag 的专门解析、旧符号不复活）⑥监听器层 e2e
+    （续行 / 多行 `-c` / `-Command` ⇒ `next()` + 各 1 行门名；无害多行 ⇒ 自动放行且 0 留痕）。
+  - `verify.mjs`：v1.12.10 块的两处标记改为链式（规范化 + 双读）；新增 **v1.12.11 块**（窗口语义与「超限仍拦」、
+    续行 / 多行 / 折叠 / 行首语义 / 归因窗口 / 大写 tag / 归一化接线 + 双读 + 无按 flag 解析的反向守卫）。
+  - `.github/workflows/ci.yml`：`MIN_TESTS: 622 → 645`（`SKIPPED_ALLOWED: 1` 不变）+ 注释块补 v1.12.11 五行。
+- **1.12.7 存量套件复跑**（`git archive HEAD` 的 593 条 + 本版 lib）：**590 pass / 3 fail**，
+  与 1.12.10 完全相同的三条归因期望（`先内容、后形状`：`终审 M1-④`、`Minor：透明包装跳数用尽`、
+  `shell 包装递归上限 2 层` —— `*‑nesting` → 真命令名），**本轮没有新增红**。
+
+### 变亲自证（每条：改了哪一行 → 期望 / 实际；跑完逐字节恢复并自证）
+
+| 变异 | 改法 | 读数 | 退出码 | 转红用例（前几条） |
+| --- | --- | --- | --- | --- |
+| `control` | 不变异 | 645 / 645 / **0** | 0 / 0 | —（全绿） |
+| `no-window` | `contentRuleOf` 窗口去掉（`const window = tokens`） | 645 / 643 / **2** | 1 / 0 | Blocker 性能封顶 ×2（gate + invariants） |
+| `window-open` | 窗口超限即 `return null`（＝放行） | 645 / 637 / **8** | 1 / 1 | 归因窗口语义、`wrapper-nesting` 家族、监听器层 |
+| `no-continuation` | 续行合并关掉（`if (false && text[j] === '\n')`） | 645 / 639 / **6** | 1 / 1 | B2 ×2、Major 1、①续行、七条验收、监听器层 |
+| `quotes-block-newline` | 「换行一律切段」关掉（回到引号内不切） | 645 / 640 / **5** | 1 / 1 | Major 2、切分结构守卫、七条验收、⑤接线、监听器层 |
+| `no-double-read` | 去掉「原文那一遍」 | 645 / 642 / **3** | 1 / 1 | 不许变松（双读）、matchText 接线、不放宽③ |
+| `no-collapse` | 关掉连续空白折叠 | 645 / 643 / **2** | 1 / 1 | 归一化单元断言 ×2 |
+
+每次恢复后：`cmp` 与 pristine 逐字节相同、`md5` 等于基线 `551e23a98cbfcb62a150598a04d4fd6a`、
+`shasum -a 256 -c` OK、`grep -c 'MUT-'` = 0。
+
+### 未做 / 未验证
+
+- 未 commit、未部署、未碰 `dsh-plugin-product-subagents`；`stash@{0}`（1.12.8 草案）保留。
+- 未做**实机**手势验证（不写 `~/.dsh`）：全部结论来自本仓判据层 + `index.js` 审批 handler 的
+  监听器级 e2e（`test/agent-api-harness.js`）。
+- 「字面 `\n` 也算行分隔」是**待裁定**的开放项（见上「代价与边界」）。
+- 归一化会把日志里的 `segment` 显示为**规范化后**的文本（排障时看到的是合并/折叠后的形状，
+  与用户原文可能不同段）—— 有意取舍，未做原文回填。
+
+## 1.12.10（2026-10-06）
+**用户裁定：把 heredoc 的载荷豁免整个删掉 —— 危险的**内容**规则与**形状判据**对整段命令文本的每一个段/行全量生效，没有任何载荷特例、没有任何终止行跳过。**
+**未部署、未 commit、未动 `~/.dsh`，也未修改另一个仓库 `dsh-plugin-product-subagents`。**
+（1.12.8「剥载荷 / 数据消费者白名单 / 管道下游推断」与 1.12.9「行掩码 + 载荷豁免 + 终止行跳过」两份草案**都在发布前废弃、不在本版内**：本版是在 `5767953`（1.12.7）干净基线上重做的，两份草案的改动都在 `git stash@{0}` 里；新树里搜不到它们的任何符号。用户原话：「载荷豁免 尽量保守，避免可能错过的高危命令，宁愿多弹窗一次高危的处理」。）
+
+### 缺陷（1.12.9 被独立终审判「不可交付」；两条阻断都由豁免层本身造成）
+- **B1（阻断）假 heredoc 起始吞掉整段**：`x=$((n<<sh))` 的 `<<` 左操作数是**标识符**（不是数字）⇒ 算术左移守卫不成立 ⇒ 被登记成 heredoc 起始 ⇒ 下一行 `sh` 命中终止行 ⇒ **连同内容规则一起被跳过**。实测 `dangerousCommandMatch("x=$((n<<sh))\nsh")`：**1.12.7 = `shell-stdin` / 1.12.9 = `null`**；`/bin/sh` 与 `bash` 实测那一行**会执行**。同族 11 条（`x=$((n << sh))`、`x=$((n<< sh))`、`((n<<sh))`、`(( n << sh ))`、`x=$[n<<sh]`、`echo $[n<<sh]`、`n=1; x=$((n<<sh))`、`x=$((n<<sh)) # c`、`true && x=$((n<<sh))`、外加 `\nsh -c "rm -rf /tmp/x"` 尾）全部同样变 `null`；真实 handler 下 `allowed-once` + **0 行**留痕。
+- **B2（阻断）载荷行上的反斜杠续行**：`rm \` 换行 `-rf /tmp/x` 被换行切成两段 ⇒ 内容规则看不到 `rm -rf`，唯一抓得到它的形状判据①又因载荷豁免而不生效。实测 `"ssh host <<'SH'\nrm \\\n-rf /tmp/x\nSH"`：**1.12.7 = `wrapper-option-ambiguity` / 1.12.9 = `null`**；喂给 `/bin/sh` 的 stdin 后**真的删掉了目录**。真实 handler 下同样 `allowed-once` + 0 行留痕。
+
+### 改动（`lib/host-approval.js`，行号按本版）
+| 位置 | 改动 |
+| --- | --- |
+| `lib/host-approval.js` | **删除**（逐符号全仓 grep 0 引用）：`heredocPayloadLines`、`scanHeredocBlocks`、`parseHeredocTag`、`scanHeredocOps`、`isHeredocTerminator`、`MAX_HEREDOC_OPS`、`HEREDOC_TAG_RE`、`isCommentStart`、`splitSubCommandsDetailed`；`matchText` 里的终止行跳过与掩码映射一并删除 |
+| `splitSubCommands` :1157 | **还原为 v1.12.7 版**（与 `git show HEAD:lib/host-approval.js` 逐字节一致）：纯缓冲式切分、不产出行号 |
+| `matchText` :1378 | 还原为 HEAD 的逐段循环 `for (const segment of splitSubCommands(text))`：**每一个段/行都过判据，没有任何跳过分支** |
+| `matchSegment` :1296 / `matchSuShell` :1053 / `wrapperOptionAmbiguity` :1265 | 删掉 `shapeOk` 形参（16 处透传）与 `if (shapeOk && …)` ⇒ 形状判据对**所有**行生效 |
+| `contentRuleOf` :1231（**新增**） | 「**先内容、后形状**」：在该段 token 序列的**每个后缀**上求值 5 条内容规则，命中即返回该规则 id（纯词法、无递归；正常路径不走它） |
+| `matchSegment` :1305 / :1338 | 两个预算分支（透明包装跳数用尽 / shell 嵌套超限）返回形状规则**之前**先 `contentRuleOf(...)` ⇒ 归因是真命令名（`sudo×9 rm -rf` → `rm -rf`、三层 `bash -c` 里的 `rm -rf` → `rm -rf`、`sudo×9 git push` → `git push`），没有内容可归因时才落回 `wrapper-nesting` / `shell-nesting` |
+
+### 代价边界（**只有命中判据才会弹**；实测读数，用户口径）
+判定顺序不变：**先跑判据**（内容规则 + 形状判据）——**命中就转人工，危险门压过工具名档/路径档**（即使 bash
+已按工具名档授权、目录已在档内，命中也会弹；这正是用户实机确认过的 `rm -rf` 两次都弹的行为）；
+**一条都没命中 ⇒ 就当单个普通 bash 命令走既有流程**（工具名档/路径档命中即 `allowed-once` 自动放行、不弹）。
+
+- **① 会多弹：终止行本身命中规则**（`cat <<TAG` + 载荷 + 终止行 `TAG`，判据层实测）：
+
+  | TAG | 判定 | 依据 |
+  | --- | --- | --- |
+  | `EOF` / `eof` / `JSON` / `PY` / `END` / `YAML` / `TXT` | **MISS（不弹）** | 终止行是普通词，5 条内容规则与形状判据都不命中 |
+  | `sh` / `SH` / `Sh` / `bash` / `BASH` / `zsh` / `dash` / `ksh` | **HIT `shell-stdin`** | **`basenameOf` 会小写化** ⇒ `SH` 与大写写法同样命中（代价范围比「只有小写 tag」大，如实登记） |
+  | `su` / `Su` / `SU` / `runuser` / `RUNUSER` | **HIT `su-shell`** | 同上（`su` 无 `-c` 的裸调用门） |
+
+  引号形态（`<<'SH'`）与裸形态（`<<SH`）判定相同。
+- **② 会多弹：载荷里有命中规则的行**。判据只看每个段/行的**开头**（既有口径）：正文行以 `- ` 开头 ⇒
+  `wrapper-option-ambiguity`（**与 tag 叫什么无关**，`EOF`/`PY` 一样弹）；危险命令出现在**行首** ⇒ 报该规则
+  （`rm -rf` / `git push` / …）；**夹在句子中间只是提到**（`note: never run rm -rf /tmp/x by hand`）⇒ **不弹**。
+- **③ 不会多弹（最小对照，实测）**：
+  - `git add -A` + `git commit -q -F - <<'EOF'` + 正文是普通文本（无 `- ` 行首、无危险词行首）⇒ 判据层 MISS ⇒
+    真实 handler 下 `allowed-once` 自动放行、**0 行** `danger-command-block` 留痕；
+  - 会弹的对照：同样这条命令但正文有一行以 `- ` 开头 ⇒ 弹 1 次；`<<'SH'`（大写 tag 也一样）⇒ 终止行 `SH`
+    命中 `shell-stdin` ⇒ 弹 1 次；`cat <<'SH' > f` + 载荷里 `rm -rf /tmp/x` + `sh f` ⇒ 载荷命中 `rm -rf` ⇒ 弹 1 次。
+
+### 断言变更表（改前 → 改后；**只收紧、无放宽**）
+| 文件 | 改前 | 改后 | 理由 |
+| --- | --- | --- | --- |
+| `test/dangerous-command-gate.test.js` | `v1.12.9 判据层：…形状启发式只对非载荷行`（断言现场 commit 不弹、掩码行号集合、`- ` 行载荷一律 `null`） | `v1.12.10 判据层：无载荷豁免（全量判定）+ 先内容后形状归因`（现场 commit **必须弹**并标为代价；掩码断言整块删除） | 豁免层已删 |
+| 同上 | `监听器层：正常的 git commit…走工具名档直接放行（现场误报已修）`（`nextCalled=false`、`allowed-once`、0 行留痕） | `监听器层【代价，用户裁定】：现场那条 commit 又会弹一次授权框`（`nextCalled=true`、`!= allowed-once`、**恰好 1 行**留痕） | 同上 |
+| 同上 | `终审 M1-④` 第 3 层断言 `shell-nesting` | 第 3 层里有真命令 ⇒ 断言 `rm -rf`；另补「没有内容可归因 ⇒ `shell-nesting`」 | 「先内容、后形状」 |
+| 同上 | `Minor：透明包装跳数用尽…按 wrapper-nesting` | 有内容 ⇒ `rm -rf` / `git push`；无内容 ⇒ `wrapper-nesting` | 同上 |
+| 新增 `test/invariants-1-12-10.test.js`（15 条） | — | 5 条不变式：全量判定（数字/标识符两档 + 续行 + 7 tag + 截断）／不放宽（21 条回归表 + 9 条对照 MISS）／先内容后形状／**两套豁免机器不得复活**（20 个符号的源码级反向守卫 + `matchText` 无 `continue`）／接线 + 监听器层 | 交付要求 |
+| 删除 `test/invariants-1-12-9.test.js`（18 条） | 掩码语义、掩码上限、形状开关透传、终止行豁免 | — | 被整层删除的机器服务 |
+| `verify.mjs` v1.12.9 块（142 行） | 钉 `heredocPayloadLines` 导出、掩码接线 5 处、掩码行号、终止行不判 | v1.12.10 块（172 行）：20 个废弃符号反向守卫、`matchText` 无跳过、A 组 16 条必须 HIT、B1 11 条（两档）、B2 3 条、代价 3 类 + 7 tag、对照 5 条 MISS、D 组反放宽 16 条 + argsText、归因顺序 5 条、`index.js` 门调用点 | 新模型 |
+| `.github/workflows/ci.yml` | `MIN_TESTS: 625` + v1.12.9 注释块 | `MIN_TESTS: 622` + v1.12.10 注释块 | 用例数变化（gate 66 不变、invariants 18→15、删掉 1.12.9 文件） |
+
+**没有任何一条断言被放宽**：所有改动都是「把原先钉住放行/豁免的期望翻成必须拦截」或「删除为已删机器服务的断言」；
+新增的 15 + 172 行断言全部是收紧方向（含 20 个符号的反向守卫）。
+
+### 变异自证（每条：快照 → 变异 → 全量 + verify → 逐字节恢复 → 自证）
+| 变异 | 改了哪一行 | 期望 | 实测（`# tests / # pass / # fail`） |
+| --- | --- | --- | --- |
+| `control` | 无 | 全绿 | 622 / 622 / **0**，test exit 0、verify exit 0 |
+| `mask-only`（①终止行跳过加回来） | 用 1.12.9 那份 lib（`b656f5d9…`）+ 把 `!payload.has(line)` 改回 `true`（= 只保留终止行跳过、去掉形状豁免） | B1/B2/tag 用例 + 代价用例 + 监听器层转红 | 622 / 604 / **18**：**14 条行为红**（`验收组 B1`（11 条算术假起始）、`验收组 B2`（续行）、`验收组 B3`（7 个 tag）、`v1.12.10：终止行一律判定`、`代价（正文行以 \`- \` 开头）`、`先内容后形状`（2 条）、`监听器层：B1/B2 各留 1 行`）+ **4 条守卫红**（`不放宽③`、`源码级：符号不得复活`、`判定循环无跳过`、`splitSubCommands 是 HEAD 版`）；test exit 1、verify exit 1 |
+| `exempt-only`（②载荷豁免加回来） | 同上那份 lib − `if (terminators.has(line)) continue`（= 只保留载荷豁免、终止行照旧判） | B2 续行 + `-` 开头载荷用例 + 现场代价用例转红 | 622 / 606 / **16**：**12 条行为红**（`验收组 B2`、`B2 不变量`、`代价`（2 条：正文行以 `- ` 开头 / 正文危险词）、`监听器层【代价】`（2 条：现场 commit 又被放行）、`先内容后形状`（3 条））+ **4 条守卫红**（同上四条）；test exit 1、verify exit 1 |
+| `content-off`（③绕过内容规则） | 本版 lib：`if (rule.match(tokens))` → `if (false && rule.match(tokens))`（5 条内容规则一条都不再命中，形状判据照旧） | A 组大面积转红 | 622 / 574 / **48**：A 组 16 条形态、B1 11 条、代价组、D 组反放宽表、`argsText` 通道、判据层与监听器层的既有全部命中用例齐红；test exit 1、verify exit 1（`v1.12.10: pwsh -Command - 的载荷被隐藏（真命令静默放行）`） |
+
+### 测试与读数（恢复后）
+- `node --test test/*.test.js` → `# tests 622 / # suites 139 / # pass 622 / # fail 0 / # cancelled 0 / # skipped 0 / # todo 0`，exit 0；
+- **1.12.7 存量套件**（`git archive HEAD` 解到 `/tmp` + 覆盖本版 `lib/host-approval.js`）复跑 → `593 tests / 590 pass / **3 fail**`，exit 1。三条全部是裁定明文的**期望变化**（归因从「包装太深」改成**真命令名**，拦截结论不变，测试文件里已同步改写）：
+  `终审 M1-④`（第 3 层 `bash -c` 里的 `rm -rf`：`shell-nesting` → `rm -rf`）、
+  `Minor：透明包装跳数用尽`（`sudo×9 rm -rf`：`wrapper-nesting` → `rm -rf`）、
+  `shell 包装递归上限 2 层`（同上）。**无一条因「代价翻面」变红**（1.12.7 套件里那条「heredoc 正文多弹一次」的登记用例本来就是「会弹」，新模型下照旧成立）；
+- `node verify.mjs` → `OK: @kiligzzz/dsh-agent-dispatch v1.12.10 一致性链（无内置 Agent）+ 11 工具 + / 命令`，exit 0；
+- `node --check` 对 `lib/host-approval.js` / `index.js` / 两个测试文件 / `verify.mjs` 全部 OK。
+
+### 性能（终审 Minor：删掉解析后的热路径）
+同一台机器、同一探针（`dangerousCommandMatch` 扫一段 4MB 文本，三次取整）：
+- 改前（1.12.9 带掩码）：无 `<<` ≈ **2190–2282ms**、含 `<<` ≈ **2529–2869ms**（`<<` 额外开销 ≈ +300ms / +14%）；
+- 改后（1.12.10）：无 `<<` ≈ **2671–2923ms**、含 `<<` ≈ **2764–2929ms**（差值落在噪声内 ≈ +30ms / +1%，机器整体较前一轮慢，绝对数不可跨轮比较）；
+- 有界窗口内（`boundDangerText` 的 256KB）改后 ≈ **164–234ms**，与无 `<<` 时同档。
+
+> 行号口径：上表按 **1.12.10 那份文件**（终审 Minor 3 的订正后的值）。v1.12.11 因新增归一化层而整体下移，
+> 同一批锚点的**当前**行号见 1.12.11 段的改动表。
+
+### 已知边界（如实登记，本轮未改）
+- **反斜杠续行把命令劈成两半**时，只有形状判据①（段首以 `-` 开头）抓得到（`rm \` + `-rf /tmp/x` ⇒
+  `wrapper-option-ambiguity`）；`git \` + `push` 这种**第二行不是选项**的写法，若 tag 又不叫
+  `sh`/`bash`/`su`（终止行不命中），则**仍然判不出来**——这是 `splitSubCommands` 按换行切段的**既有**边界
+  （v1.12.7 起就如此），方向是少弹，本版没有引入新口子，也没有修它；
+- `bash -c "<换行分隔的多行>"` 第二行起判不出来（`-c` 正文按空白切词后用空格拼回，换行退化成空格）：同属既有边界；
+- 形状判据的保守多弹（`bash --version` / `bash --help` / `sh -n script.sh` ⇒ `shell-stdin`）也是既有行为，未改。
+
 ## 1.12.7（2026-10-06）
 **三条用户裁定叠加的一版：① 工具名档不再被「沙箱越权」逐请求排除（越权仍不写项目级落盘白名单）；② 弹框「空路径集」必须先二选一（仅本次放行 / 该工具对任意路径放行），不得再静默按工具名档提交；③ `~` 按服务端下发的 home 展开；并接住 product-subagents 0.7.10 的三个增量键（`grantTier` / `grantReason` / `grantDropped`）与 `granted-once-fallback`。**
 **未部署、未 commit、未动 `~/.dsh`，也未修改另一个仓库 `dsh-plugin-product-subagents`。**
@@ -715,7 +1546,9 @@ Minor，本轮逐条收口后**重打冻结包**（凭据见本节末）。版�
   这些要么需要真正的 shell 解析器 + 变量求值 + 读脚本文件，要么超出用户名单范围；
   判不出的方向不在这里兜底，而是由既有的保守策略（执行类解析不出正文 ⇒ 不自动放行）接手。
 - **已知多弹一次（安全方向，用户裁定不修，只登记）**：heredoc 正文里出现 `rm -rf`
-  （`cat <<'EOF' … rm -rf /tmp/x … EOF`）会被判危险；`write`/`edit` 的正文参数里出现这三条
+  （`cat <<'EOF' … rm -rf /tmp/x … EOF`）会被判危险（**1.12.10 起口径统一为「内容规则与形状判据
+  对整段文本全量生效、没有任何载荷豁免」，这条仍是刻意代价** —— 见 1.12.10 段的代价边界表）；
+  `write`/`edit` 的正文参数里出现这三条
   命令同理（`argsTextOf` 扫所有字符串值）。
   **触发条件第四轮按实测口径写精确**（登记成立、行为不变）：`argsTextOf` 把「每条字符串值」
   用换行拼接，判定只看**每段/每行的开头** ⇒ 只有危险命令位于行首/段首才会多弹一次：
@@ -791,7 +1624,12 @@ Minor，本轮逐条收口后**重打冻结包**（凭据见本节末）。版�
   （如 `{shell:…}`）时，过去既不判危险也不保守拦截 ⇒ 工具名档直放。按阻断项 ⑥ 收口
   （对 args 所有字符串值跑一次匹配），并补了监听器层用例：先把 `custom_shell` 授权到根会话键，
   普通正文 `{shell:'echo hi'}` 仍走工具名档放行，`{shell:'rm -rf /tmp/x'}` 必须 `next()`。
-- **heredoc 正文误报**：如实登记（见上），补一条**说明性用例**，判定不改。
+- **heredoc 正文误报**：如实登记（见上），补一条**说明性用例**，判定不改。（**变更说明（1.12.10 定稿）**：
+  「正文以 `- ` 开头 ⇒ `wrapper-option-ambiguity` 白弹」这一条**没有**被修掉 —— v1.12.8「剥载荷」/
+  v1.12.9「载荷豁免」两份草案都试过免掉它，结果各留一个静默放行的口子（载荷里的真命令被藏 /
+  假 heredoc 起始连内容规则一起跳过），两份草案都在发布前废弃；**用户裁定接受它作为代价**：
+  正文行以 `- ` 开头、正文里真出现危险命令、tag 恰好叫 `sh`/`bash`/`su` ⇒ 各多弹一次，
+  其余情况照旧自动放行。口径与实测见 1.12.10 段的「代价边界」。**）
 - **`门序` 哨兵**：源码字符串断言（`index.js` 的调用点 + `verify.mjs` 的位置比较）**保留**，
   但**行为哨兵为主** —— 监听器层用例（已授权 bash ⇒ 15 条等价写法全部 `next()`、零 `auto-grant`）
   才是真防线；源码哨兵只是补充，不再当唯一防线。

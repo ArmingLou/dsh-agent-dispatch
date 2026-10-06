@@ -35,7 +35,9 @@ import {
   // v1.12.6 第七轮（终审阻断 A/B）：剥壳后结构性可疑（把选项当程序名 / 命令被当成取值吃掉）的门名
   WRAPPER_OPTION_AMBIGUITY_RULE,
   MAX_DANGER_TEXT_CHARS,
+  MAX_ATTRIBUTION_TOKENS,
   boundDangerText,
+  normalizeDangerText,
   splitSubCommands,
   commandTextOf,
   argsTextOf,
@@ -222,8 +224,10 @@ describe('判据层：DANGEROUS_COMMAND_RULES 与产品侧同一份名单', () =
     // 也剥不掉 ⇒ 第二层不再当 shell 包装 ⇒ 整段静默放行（不是深度上限问题）。
     assert.equal(dangerousCommandMatch('bash -c "bash -c \\"rm -rf /x\\""')?.rule, 'rm -rf')
     assert.equal(dangerousCommandMatch("bash -c 'bash -c \\'rm -rf /x\\''")?.rule, 'rm -rf')
-    // 深度仍由层数决定：转义写法到第 3 层同样按 shell-nesting 保守转交互
-    assert.equal(dangerousCommandMatch('bash -c "bash -c \\"bash -c rm -rf /\\""')?.rule, SHELL_DEPTH_RULE)
+    // 深度仍由层数决定；但 v1.12.10 起「先内容、后形状」⇒ 第 3 层的归因是真命令名 `rm -rf`
+    assert.equal(dangerousCommandMatch('bash -c "bash -c \\"bash -c rm -rf /\\""')?.rule, 'rm -rf')
+    // 第 3 层里没有内容可归因时，才落回「嵌套太深」（形状规则）保守转交互
+    assert.equal(dangerousCommandMatch('bash -c "bash -c \\"bash -c echo hi\\""')?.rule, SHELL_DEPTH_RULE)
   })
 
   it('终审 M1-⑥：`find … -exec <危险程序>` 走同一份规则（不新增名单条目）', () => {
@@ -235,7 +239,8 @@ describe('判据层：DANGEROUS_COMMAND_RULES 与产品侧同一份名单', () =
     assert.equal(dangerousCommandMatch('find /tmp -exec git push {} +')?.rule, 'git push')
     // 误伤守卫：-exec 后面不是危险命令
     assert.equal(dangerousCommandMatch('find /tmp -exec ls {} +'), null)
-    assert.equal(dangerousCommandMatch('find /tmp -exec echo rm -rf'), null, 'echo 段首不是 rm')
+    // v1.12.12：`echo rm -rf` 里的字样由全文子串层兜住 ⇒ 弹（代价，见「模式变更与代价」）
+    assert.equal(dangerousCommandMatch('find /tmp -exec echo rm -rf')?.rule, 'text:rm -rf')
     assert.equal(dangerousCommandMatch('find /tmp -name x'), null)
   })
 
@@ -426,23 +431,28 @@ describe('判据层：DANGEROUS_COMMAND_RULES 与产品侧同一份名单', () =
     assert.equal(dangerousCommandMatch('yarn npm --cwd /tmp publish')?.rule, 'yarn publish')
     assert.equal(dangerousCommandMatch('yarn npm run publish'), null)
     assert.equal(dangerousCommandMatch('yarn npm install'), null)
-    assert.equal(dangerousCommandMatch('yarn info npm publish'), null, '动词仍是第一个非选项 token（info）')
+    // v1.12.12：`npm publish` 字样由全文子串层兜住 ⇒ 弹（代价）；词法层仍只认第一个非选项 token
+    assert.equal(dangerousCommandMatch('yarn info npm publish')?.rule, 'text:npm publish')
   })
 
   it('Minor：透明包装**跳数用尽**且段首仍是包装器 ⇒ 按 wrapper-nesting 保守转交互', () => {
     assert.equal(MAX_WRAPPER_UNWRAP_HOPS, 8)
     // 8 跳内照旧剥到真命令
     assert.equal(dangerousCommandMatch(`${'sudo '.repeat(8)}rm -rf /tmp/x`)?.rule, 'rm -rf')
-    // 9 跳起：剥不动 ⇒ **可疑**转交互（改前是静默放行）
+    // 9 跳起：剥不动 ⇒ **可疑**转交互（改前是静默放行）。
+    // v1.12.10：返回形状规则**之前先求值内容规则** ⇒ 归因是真命令名（`rm -rf`），
+    // 而不是「包装太深」。形状门名只在**没有内容可归因**时出现（见下一条）。
     for (const cmd of [
       `${'sudo '.repeat(9)}rm -rf /tmp/x`,
       `${'env '.repeat(9)}rm -rf /tmp/x`,
       `${'nice '.repeat(12)}rm -rf /tmp/x`,
     ]) {
       const hit = dangerousCommandMatch(cmd)
-      assert.equal(hit?.rule, WRAPPER_DEPTH_RULE, `${cmd} 跳数用尽后应保守转交互`)
+      assert.equal(hit?.rule, 'rm -rf', `${cmd} 的归因应是真命令名（先内容、后形状）`)
       assert.ok(hit.segment, '留痕必须带那段命令')
     }
+    assert.equal(dangerousCommandMatch(`${'sudo '.repeat(9)}ls -la`)?.rule, WRAPPER_DEPTH_RULE,
+      '没有内容可归因时才落回 wrapper-nesting（可疑，仍保守转交互）')
     // 纯包装、后面什么都没有：没有可执行的命令 ⇒ 不命中（不发假警报）
     assert.equal(dangerousCommandMatch(`${'sudo '.repeat(9)}`), null)
   })
@@ -451,32 +461,64 @@ describe('判据层：DANGEROUS_COMMAND_RULES 与产品侧同一份名单', () =
     assert.equal(MAX_SHELL_UNWRAP_DEPTH, 2)
     // 2 层包装仍逐层解开、按内层规则命名
     assert.equal(dangerousCommandMatch(`bash -c 'bash -c "rm -rf /"'`)?.rule, 'rm -rf')
-    // 第 3 层不再展开：可疑 ⇒ 保守转交互
+    // 第 3 层不再展开：可疑 ⇒ 保守转交互；v1.12.10 起同样**先求值内容规则**再归因
     const deep = dangerousCommandMatch(`bash -c 'bash -c "bash -c rm -rf /"'`)
-    assert.equal(deep?.rule, SHELL_DEPTH_RULE, '超过展开深度必须按「可疑」拦，而不是放行')
+    assert.equal(deep?.rule, 'rm -rf', '超过展开深度时归因应是真命令名（先内容、后形状）')
+    assert.equal(dangerousCommandMatch(`bash -c 'bash -c "bash -c echo hi"'`)?.rule, SHELL_DEPTH_RULE,
+      '没有内容可归因时才落回 shell-nesting')
     assert.ok(deep.segment.includes('bash -c'), '留痕要带外层那段命令（排障要看得到包装）')
     // 深度只由嵌套层数决定：不嵌套的 `bash -c` 不受影响
     assert.equal(dangerousCommandMatch('bash -c "echo hi"'), null)
   })
 
-  it('误伤守卫：命令文本里"提到"或"碰巧像"危险命令都不算危险', () => {
+  it('词法误伤守卫：**碰巧像/组成不同**危险命令的写法仍然 MISS（v1.12.12 起「提及」另算，见下条）', () => {
     for (const cmd of [
-      'echo "git push"', 'grep "git push" f', '# rm -rf /tmp', "curl 'a=1&rm -rf'",
-      'git commit -m "git push"', 'git log --grep push', 'npm run publish', 'pnpm run publish',
+      'git log --grep push', 'npm run publish', 'pnpm run publish',
       'rm -r /tmp/x', 'rm -f /tmp/x', 'rm /tmp/x', 'ls -la', 'echo hi',
       'sudo ls -la', 'xargs echo hi', 'bash -c "echo hi"', 'timeout 5 npm run build',
-      'env grep "git push" f', 'command -v rm', 'nice -n 10 ls', 'echorm -rf', 'rmdir -rf /tmp/x',
+      'command -v rm', 'nice -n 10 ls', 'echorm -rf', 'rmdir -rf /tmp/x',
     ]) {
       assert.equal(dangerousCommandMatch(cmd), null, `${cmd} 被误判成危险命令`)
     }
   })
 
-  it('已知保守误报（安全方向，刻意不修）：heredoc 正文里出现 rm -rf 会多弹一次', () => {
-    // 现状：heredoc 正文按普通文本参与词法判定（要修就得引入 heredoc 解析，用户裁定不做），
-    // `cat <<EOF … EOF` 里那行 `rm -rf /tmp/x` 会被判危险 —— 方向是**多弹一次**。
+  it('v1.12.12 代价（用户裁定）：文本里**提到**预设危险字样 ⇒ 也弹（不是缺陷，是有意取舍）', () => {
+    // 用户原话：「改成全文子串判定：文本里出现危险字样就弹」，并接受代价。
+    // 预设三个字符串：`rm -rf` / `git push` / `npm publish`（可用
+    // `$DSH_HOME/data/dsh-danger-patterns.json` 增删，见 test/invariants-1-12-12.test.js）。
+    for (const [cmd, rule] of [
+      ['echo "git push"', 'text:git push'],
+      ['grep "git push" f', 'text:git push'],
+      ['# rm -rf /tmp', 'text:rm -rf'],
+      ["curl 'a=1&rm -rf'", 'text:rm -rf'],
+      ['git commit -m "git push"', 'text:git push'],
+      ['env grep "git push" f', 'text:git push'],
+      ['echo "see rm -rf docs"', 'text:rm -rf'],
+      ['git commit -m "docs: mention npm publish"', 'text:npm publish'],
+    ]) {
+      assert.equal(dangerousCommandMatch(cmd)?.rule, rule,
+        `${cmd}：按 1.12.12 裁定这里**应当**弹（代价），若变 MISS 说明全文层丢了`)
+    }
+  })
+
+  it('v1.12.10：heredoc 正文与终止行都是**普通文本行**，一律判定（无载荷概念）', () => {
+    // 用户裁定：「载荷豁免 尽量保守，避免可能错过的高危命令，宁愿多弹窗一次高危的处理」
+    // ⇒ v1.12.8「剥载荷」与 v1.12.9「行掩码 + 载荷豁免 + 终止行跳过」两套机器**整层删除**。
+    assert.equal(dangerousCommandMatch("cat <<'EOF'\nrm -rf /tmp/x\nEOF")?.rule, 'rm -rf',
+      '载荷里的真命令必须命中（否则就是静默放行）')
+    // tag 恰好是 shell 名时，终止行也照普通行判（v1.12.9 的终止行跳过已删）
+    assert.equal(dangerousCommandMatch("cat <<'sh'\nbody\nsh")?.rule, SHELL_STDIN_RULE)
+    // 对照：正文既不以 `-` 开头、也不含危险命令 ⇒ 照旧不命中
+    assert.equal(dangerousCommandMatch("python3 - <<'PY'\nprint('hello')\nPY"), null)
+  })
+
+  it('v1.12.10 代价（用户裁定）：正文里出现危险命令、或正文行以 `- ` 开头 ⇒ 多弹一次', () => {
     const hit = dangerousCommandMatch("cat <<'EOF'\nrm -rf /tmp/x\nEOF")
-    assert.equal(hit?.rule, 'rm -rf', 'heredoc 正文里的 rm -rf 会命中（已知保守误报，登记在案）')
-    // 对照：正文里不含危险命令的 heredoc 照旧不命中（监听器层那条既有用例也钉着）
+    assert.equal(hit?.rule, 'rm -rf', '正文里的 rm -rf 必须命中（刻意的代价，不是漏修）')
+    // 「正文行以 `- ` 开头」= 当年那条卡 38 秒的误报：**用户明确接受它回来** —— 任何载荷豁免
+    // 都在 v1.12.8/v1.12.9 两轮里变成了静默放行的口子（见 CHANGELOG 1.12.10）。
+    assert.equal(dangerousCommandMatch("git commit -q -F - <<'EOF'\n- planGrantWrites 新增 none 出口 ⇒\nEOF")?.rule,
+      WRAPPER_OPTION_AMBIGUITY_RULE, '代价口径被偷偷放宽了')
     assert.equal(dangerousCommandMatch("python3 - <<'PY'\nprint('hello')\nPY"), null)
   })
 
@@ -491,20 +533,22 @@ describe('判据层：DANGEROUS_COMMAND_RULES 与产品侧同一份名单', () =
     assert.equal(argsTextOf(null), '')
     assert.equal(argsTextOf({ n: 1, b: true }), '', '非字符串值不进文本')
     assert.equal(dangerousCommandMatch(argsTextOf({ shell: 'rm -rf /tmp/x' }))?.rule, 'rm -rf')
-    assert.equal(dangerousCommandMatch(argsTextOf({ argv: ['rm', '-rf', '/'] })), null,
-      'argv 拆词形态是**登记在案的残留边界**（不做 shell 解析器）：这里钉住现状，别误以为已覆盖')
+    // v1.12.12：argv 拆词文本（`rm\n-rf\n/`）被全文子串层（容忍空白）覆盖 ⇒ 现在会弹
+    assert.equal(dangerousCommandMatch(argsTextOf({ argv: ['rm', '-rf', '/'] }))?.rule, 'text:rm -rf')
   })
 
-  it('分段：只判每个子命令的**开头**，引号内不切分', () => {
+  it('分段：切分规则不变（v1.12.12 起另有一层全文子串兜底，故「引号内」也会弹）', () => {
     assert.equal(splitSubCommands('a;b&&c||d|e&f\ng').filter((s) => s !== '').length, 7)
     // 命中「第二段」也必须拦（`cd /tmp && rm -rf x`）
     assert.equal(dangerousCommandMatch('cd /tmp && rm -rf x')?.rule, 'rm -rf')
     assert.equal(dangerousCommandMatch('true;git push')?.rule, 'git push')
-    // 误伤守卫：这三条**不得**判为危险
-    assert.equal(dangerousCommandMatch('echo "git push"'), null)
-    assert.equal(dangerousCommandMatch('grep "git push" f'), null)
-    assert.equal(dangerousCommandMatch('# rm -rf /tmp'), null)
-    assert.equal(dangerousCommandMatch("curl 'a=1&rm -rf'"), null)
+    // v1.12.12（用户裁定）：这几条现在由**全文子串层**兜住 ⇒ 弹（代价）
+    assert.equal(dangerousCommandMatch('echo "git push"')?.rule, 'text:git push')
+    assert.equal(dangerousCommandMatch('grep "git push" f')?.rule, 'text:git push')
+    assert.equal(dangerousCommandMatch('# rm -rf /tmp')?.rule, 'text:rm -rf')
+    assert.equal(dangerousCommandMatch("curl 'a=1&rm -rf'")?.rule, 'text:rm -rf')
+    // 分段语义本身没变：`;` 切出的第二段照旧按段首判
+    assert.deepEqual(splitSubCommands('true;git push'), ['true', 'git push'])
   })
 
   it('前导环境变量赋值被跳过；大小写按小写比对', () => {
@@ -692,8 +736,9 @@ describe('判据层：DANGEROUS_COMMAND_RULES 与产品侧同一份名单', () =
       assert.equal(dangerousCommandMatch(cmd), null, `${cmd} 被结构性兜底误伤`)
     }
     // 守卫 ②：光秃秃一个选项 token（`argsText` 把 argv 拆词后的 `-rf`）仍是**登记在案的残留边界**
-    assert.equal(dangerousCommandMatch(argsTextOf({ argv: ['rm', '-rf', '/'] })), null,
-      'argv 拆词边界被结构性兜底翻掉了（那会连带把 {argv:[ls,-la]} 也弹出来）')
+    // v1.12.12：argv 文本按换行分隔（`rm\n-rf\n/`），全文子串层容忍空白 ⇒ 现在**会弹**
+    // （预设 `rm -rf` 命中）；这是**收紧**（原先登记的残留边界被这层覆盖）
+    assert.equal(dangerousCommandMatch(argsTextOf({ argv: ['rm', '-rf', '/'] }))?.rule, 'text:rm -rf')
     assert.equal(dangerousCommandMatch('-rf'), null, '单个选项 token 不该判可疑')
     // 守卫 ③：既有误伤守卫里「选项取值吃掉后什么都不剩」的形态不许被翻成命中
     for (const cmd of [
@@ -927,6 +972,363 @@ describe('判据层：DANGEROUS_COMMAND_RULES 与产品侧同一份名单', () =
 })
 
 // ════════════════════════════════════════════════════════════════════
+// v1.12.10：**没有任何载荷豁免**（用户裁定：「载荷豁免 尽量保守，避免可能错过的高危命令，
+// 宁愿多弹窗一次高危的处理」）。内容规则与形状判据对整段命令文本的**每一个段/行**全量生效。
+//
+// 为什么把前两版的豁免整层删掉（终审在真实链路上证成）：
+//   · v1.12.8「剥载荷」：载荷里的真命令被藏 ⇒ `allowed-once` + 零留痕（静默放行）；
+//   · v1.12.9「行掩码 + 载荷豁免 + 终止行跳过」：两条阻断 ——
+//     B1 **假 heredoc 起始**：`x=$((n<<sh))` 的 `<<` 左操作数是标识符（不是数字），算术左移守卫
+//        不成立 ⇒ 登记成 heredoc 起始 ⇒ 下一行 `sh` 命中终止行 ⇒ **连同内容规则一起被跳过**
+//        ⇒ `null`（真 shell 实测那一行会被执行）；
+//     B2 **载荷行上的反斜杠续行**：`rm \` 换行 `-rf /tmp/x` 被换行切成两段，内容规则看不到
+//        `rm -rf`，唯一抓得到它的形状判据①又因载荷豁免而不生效 ⇒ `null`（喂给 `/bin/sh` 真删目录）。
+//   两处现在都一律判定；新增的**代价**：正文行以 `- ` 开头、正文里真的出现危险命令、tag 恰好叫
+//   `sh`/`bash`/`su` 时终止行按裸解释器判 —— 都会多弹一次，已如实登记进 CHANGELOG。
+describe('v1.12.10 判据层：无载荷豁免（全量判定）+ 先内容后形状归因', () => {
+  it('验收组 A：载荷里的真命令必须命中（第三轮终审证成的三族 + 兄弟仓那几族）', () => {
+    for (const [why, cmd, rule] of [
+      ['ssh host 载荷执行', "ssh host <<'SH'\nrm -rf /tmp/x\nSH", 'rm -rf'],
+      ['载荷里带算术左移的对抗配方', "ssh host <<'SH'\nx=$((size << shift))\nrm -rf /tmp/x\nSH", 'rm -rf'],
+      ['写脚本再执行（A 形态）', "cat > /tmp/g <<'SH'\nrm -rf /tmp/x\nSH\nsh /tmp/g", 'rm -rf'],
+      ['重定向 + 分号执行（B 形态）', "cat <<'SH' > /tmp/g; sh /tmp/g\nrm -rf /tmp/x\nSH", SHELL_STDIN_RULE],
+      ['重定向在前 + 分号执行（C 形态）', "cat > /tmp/g <<'SH'; sh /tmp/g\nrm -rf /tmp/x\nSH", SHELL_STDIN_RULE],
+      ['重定向 + && 执行（D 形态）', "cat <<'SH' > /tmp/g && sh /tmp/g\nrm -rf /tmp/x\nSH", SHELL_STDIN_RULE],
+      ['进程替换 `> >(ssh host)`', "cat <<'SH' > >(ssh host)\nrm -rf /tmp/x\nSH", 'rm -rf'],
+      ['反斜杠奇偶 `tee /dev/null <<SH | sh`', "tee /dev/null <<'SH' | sh\nrm -rf /tmp/x\nSH", SHELL_STDIN_RULE],
+      ['`\\` 续行把管道藏到下一行', "cat <<'SH' \\\n| ssh host\nsh -c 'rm -rf /tmp/zz'\nSH", 'rm -rf'],
+      ['同名函数遮蔽 cat', 'cat() { ssh "$1"; }; cat <<\'SH\'\nrm -rf /tmp/x\nSH', 'rm -rf'],
+      ['别名遮蔽 cat', "alias cat=ssh; cat <<'SH'\nrm -rf /tmp/x\nSH", 'rm -rf'],
+      ['假 cat（`/tmp/plant/cat`）', "/tmp/plant/cat <<'SH'\nrm -rf /tmp/x\nSH", 'rm -rf'],
+      ['`tar --use-compress-program=sh`', "tar --use-compress-program=sh -xf - <<'SH'\nrm -rf /tmp/x\nSH", 'rm -rf'],
+      ['`git -c alias.s=!sh`', "git -c alias.s='!sh' s <<'SH'\nrm -rf /tmp/x\nSH", 'rm -rf'],
+      ['管道下游 ssh', "cat <<'SH' | ssh host\nrm -rf /tmp/x\nSH", 'rm -rf'],
+      ['`pwsh -Command -`', "pwsh -Command - <<'P'\ngit push\nP", 'git push'],
+      ['docker exec -i', "docker exec -i c sh <<'SH'\nrm -rf /tmp/x\nSH", 'rm -rf'],
+      ['kubectl exec -i', "kubectl exec -i pod -- sh <<'SH'\nrm -rf /tmp/x\nSH", 'rm -rf'],
+    ]) {
+      assert.equal(dangerousCommandMatch(cmd)?.rule, rule, `${why}：载荷里的真命令被放过（静默放行）`)
+    }
+  })
+
+  it('验收组 B1（原阻断）：假 heredoc 起始不再吞掉后面的真命令（11 条算术形态）', () => {
+    // `<<` 前是**标识符**时算术左移守卫不成立 ⇒ v1.12.9 会把它当 heredoc 起始、把下一行 `sh`
+    // 当终止行并跳过 ⇒ `null`。真 shell 实测（`/bin/sh` 与 bash 都打印第二行）该行**会执行**。
+    for (const cmd of [
+      'x=$((n<<sh))\nsh',
+      'x=$((n << sh))\nsh',
+      'x=$((n<< sh))\nsh',
+      '((n<<sh))\nsh',
+      '(( n << sh ))\nsh',
+      'x=$[n<<sh]\nsh',
+      'echo $[n<<sh]\nsh',
+      'n=1; x=$((n<<sh))\nsh',
+      'x=$((n<<sh)) # c\nsh',
+      'true && x=$((n<<sh))\nsh',
+      'x=$((n<<sh))\nsh -c "rm -rf /tmp/x"',
+    ]) {
+      const hit = dangerousCommandMatch(cmd)
+      assert.notEqual(hit, null, `${JSON.stringify(cmd)} 被静默放行（假 heredoc 起始吞掉了下一行）`)
+      // 前 10 条的第二行是**裸解释器** ⇒ 形状/内容规则按 `shell-stdin` 拦；
+      // 第 11 条的第二行是 `sh -c "rm -rf …"` ⇒ 展开后归因是真命令名
+      assert.equal(hit.rule, cmd.includes('rm -rf') ? 'rm -rf' : SHELL_STDIN_RULE,
+        `${JSON.stringify(cmd)} 的归因不对`)
+    }
+    // 数字字面量那一档（原本就只有它被测到）照旧要命中
+    assert.equal(dangerousCommandMatch('x=$((1<<n))\nrm -rf /tmp/x\nn')?.rule, 'rm -rf')
+  })
+
+  it('验收组 B2（v1.12.11 起：续行合并 ⇒ **内容规则**直接命中，比形状判据更准）', () => {
+    // v1.12.10 那种「命令被换行劈成两半」的写法只有形状判据①抓得到；v1.12.11 的
+    // `normalizeDangerText` 把**行尾未转义的 `\`** 与换行一起删掉、与下一行直接拼接
+    // ⇒ 内容规则看得见真命令 ⇒ 归因是真命令名，而且 `git \`+`push` 这种「第二行不是选项」
+    // 的写法也不再漏（v1.12.10 里它只在 tag 恰好是 shell 名时才被顺带拦下）。
+    for (const [cmd, rule] of [
+      ["ssh host <<'SH'\nrm \\\n-rf /tmp/x\nSH", 'rm -rf'],
+      ["ssh host <<'EOF'\nrm \\\n-rf /tmp/x\nEOF", 'rm -rf'],
+      ["ssh host <<'SH'\ngit \\\npush\nSH", 'git push'],
+      ["ssh host <<'SH'\nnpm \\\npublish\nSH", 'npm publish'],
+      ["ssh host <<'EOF'\ngit \\\npush origin main\nEOF", 'git push'],
+    ]) {
+      assert.equal(dangerousCommandMatch(cmd)?.rule, rule, `${JSON.stringify(cmd)} 判定不对`)
+    }
+  })
+
+  it('验收组 B3：tag 恰好是 shell / 包装器名 ⇒ 终止行按普通行判（必须命中 = 代价多弹一次）', () => {
+    for (const [tag, rule] of [
+      ['sh', SHELL_STDIN_RULE], ['bash', SHELL_STDIN_RULE], ['zsh', SHELL_STDIN_RULE],
+      ['dash', SHELL_STDIN_RULE], ['ksh', SHELL_STDIN_RULE],
+      ['su', SU_SHELL_RULE], ['runuser', SU_SHELL_RULE],
+    ]) {
+      const cmd = `cat <<'${tag}'\nbody\n${tag}`
+      assert.equal(dangerousCommandMatch(cmd)?.rule, rule,
+        `tag=${tag} 的终止行被跳过（v1.12.9 的终止行豁免已删）`)
+    }
+  })
+
+  it('代价（用户裁定，刻意不再免掉）：正文行以 `- ` 开头 / 正文里出现危险命令 ⇒ 照旧多弹一次', () => {
+    // 现场那条 38 秒白弹的 commit —— **用户明确接受它回来**：宁可多弹，也不冒漏掉载荷里真命令的险。
+    const REPRO = [
+      'git add -A',
+      "git commit -q -F - <<'EOF'",
+      'feat(grant): 0.7.10 全非法路径不再退化为工具档；补「规则语义（读侧）」文档',
+      '',
+      '- planGrantWrites 新增 none 出口：用户给了非空路径但全部被丢弃 ⇒',
+      '  路径档与工具档都不写，只放行本次（仅显式回传 paths:[] 才落工具档）',
+      'EOF',
+    ].join('\n')
+    for (const [why, cmd, rule] of [
+      ['现场：正文行以 `- ` 开头', REPRO, WRAPPER_OPTION_AMBIGUITY_RULE],
+      ['正文 `- 修复 xxx ####`', "git commit -q -F - <<EOF\n- 修复 xxx ####\nEOF", WRAPPER_OPTION_AMBIGUITY_RULE],
+      ['`cat <<EOF > f` 正文以 `- ` 开头', 'cat <<EOF > f\n- planGrantWrites 新增 none 出口 ⇒\nEOF',
+        WRAPPER_OPTION_AMBIGUITY_RULE],
+      ['正文行以 `rm -rf` 开头', 'cat <<EOF > f\nrm -rf /tmp/x is documented here\nEOF', 'rm -rf'],
+      ['正文行以 `git push` 开头', "git commit -q -F - <<'EOF'\ngit push 这类命令写在正文里时也只是在描述\nEOF", 'git push'],
+    ]) {
+      assert.equal(dangerousCommandMatch(cmd)?.rule, rule, `${why}：代价被偷偷免掉了`)
+    }
+    // 对照（不是「什么都弹」）：正文不含 `- ` 行、也不含危险命令字样 ⇒ 照旧 MISS
+    for (const cmd of [
+      'cat <<EOF > f\n普通说明文本\nEOF',
+      "patch -p1 <<'EOF'\n正文说明文本\nEOF",
+      "python3 - <<'PY'\nprint('hello')\nPY",
+      "ssh host <<'E'\necho hello\nE",
+    ]) {
+      assert.equal(dangerousCommandMatch(cmd), null, `${JSON.stringify(cmd)} 被误判`)
+    }
+  })
+
+  it('先内容、后形状：预算/形状分支返回前先求真命令名（终审指令 2/8）', () => {
+    // 透明包装跳数用尽：归因必须是真命令名（改前一律 `wrapper-nesting`）
+    assert.equal(dangerousCommandMatch(`${'sudo '.repeat(9)}rm -rf /tmp/x`)?.rule, 'rm -rf')
+    assert.equal(dangerousCommandMatch(`${'env '.repeat(9)}rm -rf /tmp/x`)?.rule, 'rm -rf')
+    assert.equal(dangerousCommandMatch(`${'sudo '.repeat(9)}git push`)?.rule, 'git push')
+    // 没有内容可归因时，仍按形状规则（可疑）保守转交互
+    assert.equal(dangerousCommandMatch(`${'sudo '.repeat(9)}ls -la`)?.rule, WRAPPER_DEPTH_RULE)
+    // shell 嵌套超限：同理先求内容
+    assert.equal(dangerousCommandMatch(`bash -c 'bash -c "bash -c rm -rf /"'`)?.rule, 'rm -rf')
+    assert.equal(dangerousCommandMatch(`bash -c 'bash -c "bash -c echo hi"'`)?.rule, SHELL_DEPTH_RULE)
+  })
+
+  it('不放宽①：`<<` **之前**那条命令本身照旧判（`rm -rf x <<\'EOF\'`）', () => {
+    assert.equal(dangerousCommandMatch("rm -rf /tmp/x <<'EOF'\nbody\nEOF")?.rule, 'rm -rf')
+    assert.equal(dangerousCommandMatch("git push <<'EOF'\nbody\nEOF")?.rule, 'git push')
+    assert.equal(dangerousCommandMatch("cat <<'EOF' > f && npm publish\nbody\nEOF")?.rule, 'npm publish',
+      '同一行里 `<<` 之后的命令也必须照旧判')
+  })
+
+  it('不放宽②：终止行**之后**的命令照旧判（`EOF` 换行后的 `rm -rf /tmp/x`）', () => {
+    assert.equal(dangerousCommandMatch('cat <<EOF > f\nbody\nEOF\nrm -rf /tmp/x')?.rule, 'rm -rf')
+    assert.equal(dangerousCommandMatch("cat <<'EOF'\nbody\nEOF\ngit push")?.rule, 'git push')
+    assert.equal(dangerousCommandMatch("cat <<'EOF'\nEOF\nrm -rf /tmp/x")?.rule, 'rm -rf')
+    assert.equal(dangerousCommandMatch('cat <<-EOF\n\tbody\n\tEOF\nrm -rf /tmp/x')?.rule, 'rm -rf')
+  })
+
+  it('不放宽③：v1.12.8/v1.12.9 那两套豁免机器一个符号都不许复活', () => {
+    for (const banned of [
+      'heredocPayloadLines', 'scanHeredocBlocks', 'parseHeredocTag', 'scanHeredocOps',
+      'isHeredocTerminator', 'MAX_HEREDOC_OPS', 'HEREDOC_TAG_RE', 'isCommentStart',
+      'splitSubCommandsDetailed', 'shapeOk', 'terminators',
+    ]) {
+      assert.ok(!hostSrc.includes(banned), `lib/host-approval.js 里仍有过期符号：${banned}`)
+    }
+    // 判定必须仍然逐段走**同一个** matchSegment（没有任何「跳过」的分支）。
+    // v1.12.11：判定文本先过 `normalizeDangerText`（续行合并 / 换行转义折空格 / 折叠空白），
+    // 再交给 `splitSubCommands` 切段 —— 仍然是「每段都判、没有跳过」。
+    assert.match(hostSrc, /for \(const variant of \[\n/, 'matchText 没有多读（口径链断了）')
+    // v1.12.13：② 词内引号拼接（M3）与 ③ 旧口径读（B1：字面转义 + **裸 CR** 都折空格 = 1.12.11 读法）
+    assert.match(hostSrc, /stripWordInternalQuotes\(normalizeDangerText\(text\)\)/, '词内引号拼接那一遍不见了（M3 会变松）')
+    assert.match(hostSrc, /normalizeDangerText\(text, \{ literalEscapeAsSpace: true \}\)/, '旧口径读（literalEscapeAsSpace）不见了 —— 会变松')
+    assert.match(hostSrc, /for \(const segment of splitSubCommands\(variant\)\) \{/, 'matchText 的逐段循环变了')
+    assert.ok(!/continue\s*\/\*.*(skip|豁免)/.test(hostSrc), '出现可疑的跳过分支')
+  })
+
+  it('不放宽④：既有全部等价写法逐条不变（回归表）', () => {
+    for (const [cmd, rule] of [
+      ['bash -c "rm -rf /tmp/x"', 'rm -rf'],
+      ["sh -c 'rm -rf /tmp/x'", 'rm -rf'],
+      ['bash -c "bash -c \\"rm -rf /x\\""', 'rm -rf'],
+      ['echo x | xargs rm -rf /tmp/x', 'rm -rf'],
+      ['sudo rm -rf /tmp/x', 'rm -rf'],
+      ['command rm -rf /tmp/x', 'rm -rf'],
+      ['env rm -rf /tmp/x', 'rm -rf'],
+      ['nohup rm -rf /tmp/x', 'rm -rf'],
+      ['nice rm -rf /tmp/x', 'rm -rf'],
+      ['time rm -rf /tmp/x', 'rm -rf'],
+      ['/bin/rm -rf /tmp/x', 'rm -rf'],
+      ['find /tmp -exec rm -rf {} +', 'rm -rf'],
+      ['git -C /tmp push', 'git push'],
+      ['git -c k=v push', 'git push'],
+      ['npm --prefix /tmp publish', 'npm publish'],
+      ['pnpm publish', 'pnpm publish'],
+      ['yarn publish', 'yarn publish'],
+      ['cat <<EOF > f && rm -rf /tmp/x\nbody\nEOF', 'rm -rf'],
+    ]) {
+      assert.equal(dangerousCommandMatch(cmd)?.rule, rule, `${cmd} 被放过（不得放宽任何既有拦截）`)
+    }
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════
+// v1.12.11（用户裁定）：判定前的**文本规范化** + `contentRuleOf` 的**归因窗口**。
+//
+//   · Major 1：行尾**未转义的** `\`（可带行尾空白/CR）= 续行 ⇒ 删掉 `\` 与换行、直接拼接
+//     ⇒ `git \`⏎`push origin main` 由**内容规则**命中（v1.12.10 是 MISS + 0 行留痕）；
+//   · Major 2：**换行一律当段分隔符**（引号里也切）⇒ `bash -c "true`⏎`rm -rf /tmp/x"` 的第二行
+//     独立判定 ⇒ 命中，**不需要**按 `-c` / `-Command` 做任何 flag 专门解析（用户明确不要）；
+//   · 细则⑤：**连续空白折叠成一个空格** ⇒ `rm  -rf` / `git\tpush` / `rm \t -rf` 这类靠空白
+//     规避的写法失效；真实换行**保留**为段分隔符（否则会抹平行首语义、把 1.12.10 已拦的一批
+//     形态变成 MISS —— 见 CHANGELOG「归一化口径」）；
+//   · Blocker：`MAX_ATTRIBUTION_TOKENS = 256` 窗口 —— 只让归因变粗，**绝不放行**。
+describe('v1.12.11 判据层：续行合并 / 多行切段 / 空白折叠 / 归因窗口', () => {
+  it('Major 1：行尾未转义的 `\` = 续行 ⇒ 合并后由内容规则命中', () => {
+    for (const [cmd, rule] of [
+      ['git \\\npush origin main', 'git push'],
+      ['npm \\\npublish', 'npm publish'],
+      ['rm \\\n-rf /tmp/x', 'rm -rf'],
+      ['sudo \\\nrm -rf /tmp/x', 'rm -rf'],
+      ['git \\\r\npush origin main', 'git push'], // CRLF
+      ['git \\   \npush origin main', 'git push'], // 行尾 `\` 后带空格
+      ['git \\\npush', 'git push'], // 只有两行
+    ]) {
+      assert.equal(dangerousCommandMatch(cmd)?.rule, rule, `${JSON.stringify(cmd)} 判定不对`)
+    }
+    // 非续行的边缘形态：`\` 被转义（`\\`）、行尾孤立 `\`、单引号里的 `\`
+    assert.equal(dangerousCommandMatch('git \\\\\npush origin main'), null, '`\\` 是转义反斜杠，不是续行')
+    assert.equal(dangerousCommandMatch('echo hi\\'), null, '行尾孤立反斜杠不该发假警报')
+    assert.equal(dangerousCommandMatch("echo 'a\\\nb'"), null, '单引号里的形状不是命令')
+    // 段切分直接可断言
+    assert.deepEqual(splitSubCommands(normalizeDangerText('git \\\npush origin main')), ['git push origin main'])
+  })
+
+  it('Major 2：换行一律切段（含引号内）⇒ 多行 `-c` / `-Command` 正文逐行判定', () => {
+    for (const [cmd, rule] of [
+      ['bash -c "true\nrm -rf /tmp/x"', 'rm -rf'],
+      ["sh -c 'true\nnpm publish'", 'npm publish'],
+      ['zsh -c "echo hi\ngit push"', 'git push'],
+      ['pwsh -Command "x\nnpm publish"', 'npm publish'],
+      ['su root -c "true\ngit push"', 'git push'],
+      ['bash -c "true\n- rm -rf /tmp/x"', 'wrapper-option-ambiguity'],
+      // 裁定 2（v1.12.11 二次走查）：**字面** `\n`（两字符）也是这些消费者眼里的真换行 ⇒ 行分隔
+      ['pwsh -Command "x\\nnpm publish"', 'npm publish'],
+      ['python3 -c "import os\\nos.system(\'rm -rf /tmp/x\')"', 'rm -rf'],
+    ]) {
+      assert.equal(dangerousCommandMatch(cmd)?.rule, rule, `${JSON.stringify(cmd)} 判定不对`)
+    }
+    // 误伤守卫：多行正文里没有危险内容 ⇒ 照旧 MISS
+    assert.equal(dangerousCommandMatch('bash -c "echo hi\nls -la"'), null)
+    assert.equal(dangerousCommandMatch('bash -c "echo hi"'), null)
+  })
+
+  it('代码边界内容规则：危险命令紧跟**代码标点**（Python/Node/JSON 片段）⇒ HIT', () => {
+    for (const [cmd, rule] of [
+      ["os.system('rm -rf /tmp/x')", 'rm -rf'],
+      ["{shell:'rm -rf /tmp/x'}", 'rm -rf'],
+      ["subprocess.run(['rm', '-rf', '/tmp/x'])", null],
+      ['$(git push origin main)', 'git push'],
+      ['x="npm publish"', 'npm publish'],
+    ]) {
+      if (rule === null) { assert.equal(dangerousCommandMatch(cmd), null, `${cmd} 不该弹`); continue }
+      assert.equal(dangerousCommandMatch(cmd)?.rule, rule, `${cmd} 应命中（代码片段）`)
+    }
+    // v1.12.12（用户裁定）：这些「标点左贴空白」的形态（数据参数 / 句中提及）现在由
+    // **全文子串层**兜住 ⇒ 会弹（代价）。与「左贴代码」是两条通道，规则名可能是任一条。
+    for (const cmd of ['echo "git push"', "echo 'rm -rf /tmp/x'", "curl 'a=1&rm -rf'",
+      'echo "npm publish"', 'git commit -m "fix: never git push --force"']) {
+      assert.notEqual(dangerousCommandMatch(cmd), null, `${cmd}：按 1.12.12 裁定应当弹（代价）`)
+    }
+  })
+
+  it('细则⑤：连续空白折叠成单个空格（多余的空白不再是规避手段）', () => {
+    for (const cmd of ['rm  -rf /tmp/x', 'rm    -rf /tmp/x', 'rm\t-rf /tmp/x', 'rm \t -rf /tmp/x',
+      'git\t\tpush origin main', 'npm   publish']) {
+      assert.notEqual(dangerousCommandMatch(cmd), null, `${JSON.stringify(cmd)} 应命中`)
+    }
+    // 折叠只作用在判定文本上：普通文本照旧 MISS
+    assert.equal(dangerousCommandMatch('echo  hi   there'), null)
+  })
+
+  it('折叠/换行处理**不许**抹平行首语义（用户点名的三条 + 现场代价用例）', () => {
+    assert.equal(dangerousCommandMatch('echo hi\n- rm -rf /tmp/x')?.rule, WRAPPER_OPTION_AMBIGUITY_RULE)
+    assert.equal(dangerousCommandMatch('true\n- rf /tmp/x')?.rule, WRAPPER_OPTION_AMBIGUITY_RULE)
+    assert.equal(dangerousCommandMatch('echo x\nsudo rm -rf /tmp/y')?.rule, 'rm -rf')
+    // 现场那条 commit 的**代价**命中（1.12.10 起就是代价，本轮不许因为归一化丢掉）
+    const REPRO = [
+      'git add -A',
+      "git commit -q -F - <<'EOF'",
+      'feat: x',
+      '',
+      '- planGrantWrites 新增 none 出口：用户给了非空路径但全部被丢弃 ⇒',
+      'EOF',
+    ].join('\n')
+    assert.equal(dangerousCommandMatch(REPRO)?.rule, WRAPPER_OPTION_AMBIGUITY_RULE)
+    // 句中只是提到危险命令 ⇒ v1.12.12 起按用户裁定**弹**（代价；见 CHANGELOG「模式变更与代价」）
+    assert.equal(dangerousCommandMatch('echo "note: never run rm -rf /tmp/x by hand"')?.rule, 'text:rm -rf')
+    assert.equal(dangerousCommandMatch('git commit -m "fix: never git push --force"')?.rule, 'text:git push')
+  })
+
+  it('不许变松（**双读**）：规范化只能更容易命中，1.12.10 会命中的形态一条都不许变 MISS', () => {
+    // `test \` ⏎ `-f x`：合并成 `test -f x` 后段首不再是选项（形状判据①不再命中），
+    // 但原文第二行 `-f x` 在 1.12.10 里是命中的 ⇒ 「双读」把原文那一遍保留下来（多弹一次）。
+    // 差分实测（24,755 条语料）：relaxed 必须为 0，这条就是其中一类的代表。
+    for (const cmd of ['test \\\n-f x', 'test \\\r\n-f x', 'test \\   \n-f x']) {
+      assert.equal(dangerousCommandMatch(cmd)?.rule, WRAPPER_OPTION_AMBIGUITY_RULE,
+        `${JSON.stringify(cmd)} 从「命中」变成了 MISS（= 变松）`)
+    }
+    // 对照组：原文本来就不命中的续行（无害）⇒ 仍然 MISS
+    assert.equal(dangerousCommandMatch('echo \\\nhi'), null)
+    // 「旧口径读」也必须保留（多读的第二遍：字面转义折空格）：`rm\n-rf\n/tmp/x`（**字面** \n）
+    // 在新口径下拆成三段都不命中，但旧口径拼成 `rm -rf /tmp/x` 是命中的 ⇒ 保留（relaxed = 0 的一类）
+    for (const [cmd, rule] of [
+      ['rm\\n-rf\\n/tmp/x', 'rm -rf'],
+      ['rm\\r-rf\\r/tmp/x', 'rm -rf'],
+      ['git\\npush origin main', 'git push'],
+      ['npm\\npublish', 'npm publish'],
+    ]) {
+      assert.equal(dangerousCommandMatch(cmd)?.rule, rule,
+        `${cmd} 旧口径会命中、新口径拆散了 ⇒ 多读必须把它留下来（否则就是变松）`)
+    }
+  })
+
+  it('Blocker：`MAX_ATTRIBUTION_TOKENS` 窗口 —— 归因变粗但**绝不放行**', () => {
+    assert.equal(MAX_ATTRIBUTION_TOKENS, 256)
+    // 归因精度：9 个包装词（落不进窗口裁剪区）照旧精确
+    assert.equal(dangerousCommandMatch(`${'sudo '.repeat(9)}rm -rf /tmp/x`)?.rule, 'rm -rf')
+    assert.equal(dangerousCommandMatch(`${'sudo '.repeat(9)}ls -la`)?.rule, WRAPPER_DEPTH_RULE)
+    // 超长包装前缀：**仍然拦**（不是 null），真命令在尾部照旧能归因
+    assert.equal(dangerousCommandMatch(`${'sudo '.repeat(32768)}rm -rf /tmp/x`)?.rule, 'rm -rf')
+    assert.equal(dangerousCommandMatch(`${'sudo '.repeat(32768)}ls`)?.rule, WRAPPER_DEPTH_RULE,
+      '窗口裁掉后只剩「包装太深」的可疑归因 —— 但绝不是放行')
+    assert.notEqual(dangerousCommandMatch(`${'sudo '.repeat(100000)}ls`), null)
+  })
+
+  it('Blocker：二次路径的性能回归被封顶（32768 个包装词 < 500ms；1.12.10 实测 ≈2.9s）', () => {
+    const big = 'sudo '.repeat(32768) + 'ls'
+    dangerousCommandMatch(big.slice(0, 400)) // 预热
+    const t0 = performance.now()
+    dangerousCommandMatch(big)
+    const ms = performance.now() - t0
+    assert.ok(ms < 500, `32768 个包装词耗时 ${ms.toFixed(1)}ms（>500ms ⇒ 归因窗口被破坏）`)
+  })
+
+  it('Minor 1：大写 tag 与 runuser 的终止行代价逐条钉住', () => {
+    for (const [tag, rule] of [
+      ['sh', SHELL_STDIN_RULE], ['SH', SHELL_STDIN_RULE], ['Sh', SHELL_STDIN_RULE],
+      ['bash', SHELL_STDIN_RULE], ['BASH', SHELL_STDIN_RULE],
+      ['zsh', SHELL_STDIN_RULE], ['dash', SHELL_STDIN_RULE], ['ksh', SHELL_STDIN_RULE],
+      ['su', SU_SHELL_RULE], ['SU', SU_SHELL_RULE], ['Su', SU_SHELL_RULE],
+      ['runuser', SU_SHELL_RULE], ['RUNUSER', SU_SHELL_RULE],
+    ]) {
+      assert.equal(dangerousCommandMatch(`cat <<'${tag}'\nbody\n${tag}`)?.rule, rule,
+        `tag=${tag} 的终止行应当命中（basenameOf 会小写化）`)
+    }
+    for (const tag of ['EOF', 'Eof', 'eof', 'JSON', 'Json', 'PY', 'END', 'YAML', 'TXT']) {
+      assert.equal(dangerousCommandMatch(`cat <<'${tag}'\nbody\n${tag}`), null, `tag=${tag} 不该弹`)
+    }
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════
 describe('监听器层：危险命令在任何档位下都不自动放行', () => {
   it('已授权 bash ⇒ 三条命令仍一律 next()，且都不吃路径/项目档', async () => {
     const b = await bootWithBashGranted()
@@ -972,15 +1374,21 @@ describe('监听器层：危险命令在任何档位下都不自动放行', () =
     } finally { await b.close() }
   })
 
-  it('误伤守卫（监听器层）：命令文本里"提到"危险命令不算危险', async () => {
+  it('v1.12.12 代价（监听器层）：文本里提到预设字样 ⇒ next() + 留 1 行门名', async () => {
+    // 用户裁定「文本里出现危险字样就弹」⇒ 监听器层同样不再自动放行（代价，不是缺陷）
     const b = await bootWithBashGranted()
     try {
-      for (const cmd of ['echo "git push"', 'grep "git push" f', '# rm -rf /tmp']) {
+      for (const [cmd, rule] of [['echo "git push"', 'text:git push'],
+        ['grep "git push" f', 'text:git push'], ['# rm -rf /tmp', 'text:rm -rf']]) {
+        const before = logRows(b.home).filter((r) => r.action === 'danger-command-block').length
         const s = mkSession({ id: 'child-2', parentSession: 'R', toolCalls: bashCall('f1', cmd) })
         const r = await approve(b, s, { callId: 'f1', toolName: 'bash' })
-        assert.equal(r.res, 'allowed-once', `${cmd} 被误判成危险命令`)
+        assert.equal(r.nextCalled, true, `${cmd} 应当交给交互层（代价）`)
+        assert.notEqual(r.res, 'allowed-once')
+        const rows = logRows(b.home).filter((r) => r.action === 'danger-command-block')
+        assert.equal(rows.length - before, 1, `${cmd} 必须留 1 行门名`)
+        assert.equal(rows[rows.length - 1].rule, rule)
       }
-      assert.equal(logRows(b.home).filter((r) => r.action === 'danger-command-block').length, 0)
     } finally { await b.close() }
   })
 
@@ -1313,6 +1721,80 @@ describe('监听器层：危险命令在任何档位下都不自动放行', () =
     assert.ok(indexSrc.indexOf('if (isAcpTwinApproval(ctxInfo.toolName, ctxInfo.reason)) return next()') < gate,
       'ACP 孪生应当仍是更早的那道早退门')
   })
+
+  // ── v1.12.10：**没有任何载荷豁免**（监听器层）────────────────────────────
+  it('监听器层【代价，用户裁定】：现场那条 commit 又会弹一次授权框（正文行以 `- ` 开头）', async () => {
+    // 这是用户明确接受的取舍：宁可多弹一次，也不冒「载荷豁免漏掉真命令」的险。
+    // v1.12.8（剥载荷）/v1.12.9（掩码豁免）都试图免掉它，结果各留一个静默放行的口子。
+    const b = await bootWithBashGranted()
+    try {
+      const cmd = [
+        'git add -A',
+        "git commit -q -F - <<'EOF'",
+        'feat(grant): 0.7.10 全非法路径不再退化为工具档；补「规则语义（读侧）」文档',
+        '',
+        '- planGrantWrites 新增 none 出口：用户给了非空路径但全部被丢弃 ⇒',
+        '  路径档与工具档都不写，只放行本次（仅显式回传 paths:[] 才落工具档）',
+        'EOF',
+      ].join('\n')
+      const s = mkSession({ id: 'child-2', parentSession: 'R', toolCalls: bashCall('v9n', cmd) })
+      const r = await approve(b, s, { callId: 'v9n', toolName: 'bash' })
+      assert.equal(r.nextCalled, true, '载荷行不再豁免 ⇒ 必须转人工（代价）')
+      assert.notEqual(r.res, 'allowed-once', '代价：这条 commit 不再自动放行')
+      assert.equal(logRows(b.home).filter((x) => x.action === 'danger-command-block').length, 1,
+        '必须留 1 行 danger-command-block（排障要能看到是形状判据拦的）')
+    } finally { await b.close() }
+  })
+
+  it('监听器层：载荷**之外**的命令照旧一律 next()（EOF 之后 / 同一行的后续命令 / `<<` 之前）', async () => {
+    const b = await bootWithBashGranted()
+    try {
+      for (const cmd of [
+        'cat <<EOF > f\nbody\nEOF\nrm -rf /tmp/x',
+        "cat <<'EOF' > f && npm publish\nbody\nEOF",
+        "rm -rf /tmp/x <<'EOF'\nbody\nEOF",
+        'cat <<EOF\nrm -rf /tmp/x',
+      ]) {
+        const s = mkSession({ id: 'child-2', parentSession: 'R', toolCalls: bashCall('v9o', cmd) })
+        const r = await approve(b, s, { callId: 'v9o', toolName: 'bash' })
+        assert.equal(r.nextCalled, true, `${JSON.stringify(cmd)} 被静默放行（载荷之外的命令没被扫）`)
+        assert.notEqual(r.res, 'allowed-once')
+      }
+      assert.equal(logRows(b.home).filter((x) => x.action === 'danger-command-block').length, 4,
+        '四条都要留痕')
+    } finally { await b.close() }
+  })
+
+  it('v1.12.10 监听器层：载荷里含真命令的形态 + 两条原阻断都必须 next() 且各留 1 行门名', async () => {
+    // 「会话级工具名授权 + 载荷危险命令」这个帧上，任何一条静默放行都是阻断级缺陷。
+    const b = await bootWithBashGranted()
+    try {
+      const cases = [
+        "ssh host <<'SH'\nrm -rf /tmp/x\nSH",
+        "cat > /tmp/g <<'SH'\nrm -rf /tmp/x\nSH\nsh /tmp/g",
+        "cat <<'SH' > /tmp/g; sh /tmp/g\nrm -rf /tmp/x\nSH",
+        "cat <<'SH' > >(ssh host)\nrm -rf /tmp/x\nSH",
+        'cat() { ssh "$1"; }; cat <<\'SH\'\nrm -rf /tmp/x\nSH',
+        "tar --use-compress-program=sh -xf - <<'SH'\nrm -rf /tmp/x\nSH",
+        "pwsh -Command - <<'P'\ngit push\nP",
+        // 终审 B1：假 heredoc 起始 ⇒ 下一行 `sh` 是真命令，必须拦
+        'x=$((n<<sh))\nsh',
+        // 终审 B2：载荷行上的反斜杠续行 ⇒ `rm \` + `-rf /tmp/x`，必须拦
+        "ssh host <<'SH'\nrm \\\n-rf /tmp/x\nSH",
+        // 代价：tag 恰好是 shell 名 ⇒ 终止行按裸解释器判
+        "cat <<'bash'\nbody\nbash",
+      ]
+      for (const cmd of cases) {
+        const before = logRows(b.home).filter((x) => x.action === 'danger-command-block').length
+        const s = mkSession({ id: 'child-2', parentSession: 'R', toolCalls: bashCall('v9a', cmd) })
+        const r = await approve(b, s, { callId: 'v9a', toolName: 'bash' })
+        assert.equal(r.nextCalled, true, `${JSON.stringify(cmd)} 被静默放行（载荷里的真命令没被扫）`)
+        assert.notEqual(r.res, 'allowed-once', `${JSON.stringify(cmd)} 不该走工具名档自动放行`)
+        const after = logRows(b.home).filter((x) => x.action === 'danger-command-block').length
+        assert.equal(after - before, 1, `${JSON.stringify(cmd)} 必须留 1 行 danger-command-block`)
+      }
+    } finally { await b.close() }
+  })
 })
 
 // ════════════════════════════════════════════════════════════════════
@@ -1388,5 +1870,99 @@ describe('既有两道门的行为不被这道门改动', () => {
         assert.equal(r.res, 'allowed-once', `${cmd} 应当仍走工具名档自动放行`)
       }
     } finally { await b.close() }
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════
+// v1.12.13（独立终审 3 阻断 / 3 主要 / 8 次要）：行为层三条。
+//   ① B1：1.12.11 的「裸 CR 折空格」读法必须保留（`rm␍-rf␍/tmp/x` 真的会执行 rm）；
+//   ② M3：**词内引号拼接**（`r"m" -rf /tmp/x`）在 `/bin/sh` 里就是 `rm -rf /tmp/x`（实测
+//      `RM_INVOKED argv=[-rf /tmp/x]`），1.12.7/1.12.11/1.12.12 三版全 MISS ⇒ 本版补上；
+//   ③ 反过来：去词内引号**不许**凭空造出危险字样（`it's`、`df -h`、`ls -l` 之类仍 MISS）。
+describe('v1.12.13 判据层：CR 家族（B1）与词内引号拼接（M3）', () => {
+  it('B1：裸 CR / CRLF / 字面 `\\r` 作词间分隔 ⇒ 仍由内容规则命中', () => {
+    for (const [cmd, rule] of [
+      ['\\trm\r-r\r-f\r/tmp/x', 'rm -rf'], // 字面 `\t` 两字符 + 裸 CR（终审 B1 的最小复现）
+      ['\trm\r-r\r-f\r/tmp/x', 'rm -rf'], // 真实 TAB + 裸 CR（走全文层）
+      ['rm\r-rf\r/tmp/x', 'rm -rf'],
+      ['rm\r\n-rf\r\n/tmp/x', 'text:rm -rf'], // CRLF：CR 折空格、LF 仍是段分隔符（1.12.11 同口径）⇒ 由全文层兜住
+      ['rm\\r-rf\\r/tmp/x', 'rm -rf'],
+      ['git\rpush origin main', 'git push'],
+      ['npm\rpublish', 'npm publish'],
+    ]) {
+      assert.equal(dangerousCommandMatch(cmd)?.rule, rule, `${JSON.stringify(cmd)} 判定不对（B1 回归）`)
+    }
+    // 反向：CR 文本里没有危险串就不该弹（新口径的段分隔语义没被改掉）
+    for (const cmd of ['echo hi\rworld', 'ls\r-l', 'printf "a\rb"']) {
+      assert.equal(dangerousCommandMatch(cmd), null, `${JSON.stringify(cmd)} 误报`)
+    }
+  })
+
+  it('M3：词内引号拼接的形态 ⇒ HIT（真会执行）', () => {
+    for (const cmd of ['r"m" -rf /tmp/x', "r'm' -rf /tmp/x", 'g"it" push origin main',
+      'n"pm" publish', 'p"npm" publish', 'sud"o" rm -rf /tmp/x']) {
+      assert.notEqual(dangerousCommandMatch(cmd), null, `${JSON.stringify(cmd)} 变 MISS（M3 回归）`)
+    }
+    // 反向：贴空白的引号原样保留 ⇒ 没有危险串的引号文本仍不弹
+    for (const cmd of ["it's a normal message", 'echo "df -h"', "echo 'ls -l'", 'echo "git status"']) {
+      assert.equal(dangerousCommandMatch(cmd), null, `${JSON.stringify(cmd)} 误报（M3 扩大了误伤面）`)
+    }
+  })
+
+  it('v1.12.13 追加·边界：`MAX_DANGER_TEXT_CHARS` 的「恰好等值」—— 262144 走正常扫描，262145 才 command-too-long', async () => {
+    // 动机（跨仓纪律）：B 仓同款边界被变异 `>` → `>=` 后 92/92 全绿（边界语义没人看着）。
+    // 判据层：截断是 `<=`（恰好等于上限 ⇒ 一个字都不截）；监听器层：只有 `omitted > 0` 才落
+    // `command-too-long`。两侧都要有**恰好等值**的用例，否则边界语义可以被人悄悄改掉。
+    const tail = '; rm -rf /tmp/x'
+    const atLimit = 'a'.repeat(MAX_DANGER_TEXT_CHARS - tail.length) + tail
+    const overLimit = 'a'.repeat(MAX_DANGER_TEXT_CHARS + 1 - tail.length) + tail
+    assert.equal(atLimit.length, MAX_DANGER_TEXT_CHARS, '前置：恰好等值')
+    assert.equal(overLimit.length, MAX_DANGER_TEXT_CHARS + 1, '前置：超一个字')
+    assert.deepEqual(boundDangerText(atLimit), { text: atLimit, omitted: 0 }, '恰好等于上限不许截断')
+    assert.equal(boundDangerText(overLimit).omitted, 1)
+    assert.equal(dangerousCommandMatch(atLimit)?.rule, 'rm -rf', '恰好等值 ⇒ 正常扫描（不是 command-too-long）')
+
+    const b = await bootWithBashGranted()
+    try {
+      const s1 = mkSession({ id: 'cap-1', parentSession: 'CR', toolCalls: bashCall('CAP1', atLimit) })
+      const r1 = await approve(b, s1, { callId: 'CAP1', toolName: 'bash' })
+      assert.equal(r1.nextCalled, true, '恰好等值的危险命令必须转交互')
+      let blocked = logRows(b.home).filter((r) => r.action === 'danger-command-block')
+      assert.equal(blocked.length, 1)
+      assert.equal(blocked[0].rule, 'rm -rf', `恰好等值必须走正常扫描，实得 ${blocked[0].rule}`)
+      assert.equal(logRows(b.home).filter((r) => r.action === 'danger-text-truncated').length, 0,
+        '恰好等值不许留「截断」痕（那就是把边界改成了 >）')
+
+      const s2 = mkSession({ id: 'cap-2', parentSession: 'CR', toolCalls: bashCall('CAP2', overLimit) })
+      const r2 = await approve(b, s2, { callId: 'CAP2', toolName: 'bash' })
+      assert.equal(r2.nextCalled, true, '超一个字同样必须转交互')
+      blocked = logRows(b.home).filter((r) => r.action === 'danger-command-block')
+      assert.equal(blocked.length, 2)
+      assert.equal(blocked[1].rule, COMMAND_TOO_LONG_RULE, '超一个字才落 command-too-long')
+      assert.equal(logRows(b.home).filter((r) => r.action === 'danger-text-truncated').length, 1)
+    } finally { await b.close() }
+  })
+
+  it('v1.12.13 追加·大小写折叠口径：折叠只用于**程序名比较**，绝不用来切 segment', () => {
+    // 跨仓对齐（B 仓被证伪的那条「ẞ 折叠后不折成 ß ⇒ 二者永不互命」）：A 仓**没有**这种断言。
+    // 这里按实测把事实钉住，避免以后有人照抄那句错话：
+    assert.equal('\u1E9E'.toLowerCase(), '\u00DF', 'ẞ(U+1E9E) 折叠**就是** ß(U+00DF) ⇒ 二者互命')
+    assert.equal('\u0130'.toLowerCase().length, 2, 'İ(U+0130) 折叠**会变长**（i + U+0307）⇒ 不能假设长度不变')
+    for (const s of ['İ'.repeat(5), 'aİb', 'ß', 'ẞ', 'e\u0301', 'ﬁ', 'ǅ']) {
+      assert.equal(typeof s.toLowerCase(), 'string', `${s} 折叠必须有结果`)
+    }
+    // 折叠不参与切分：命中后回报的 `segment` 必须是**原文**的子串（逐字切出）
+    for (const [cmd, rule] of [['RM -RF /tmp/x', 'rm -rf'], ['Sudo RM -rf /tmp/x', 'rm -rf'],
+      ['ẞ -rf /tmp/x', null], ['İ -rf /tmp/x', null], ['ß -rf /tmp/x', null], ['ﬁ -rf /tmp/x', null]]) {
+      const hit = dangerousCommandMatch(cmd)
+      assert.equal(hit?.rule ?? null, rule, `${JSON.stringify(cmd)} 判定不对`)
+      if (hit) assert.ok(cmd.includes(hit.segment), `segment 必须从原文切出（${JSON.stringify(hit.segment)}）`)
+    }
+  })
+
+  it('M3 的边界：只去「两侧都紧邻非空白」的引号（`curl \'a=1&rm -rf\'` 文本不变）', () => {
+    // `a=1&rm -rf` 这一段里引号贴空格 ⇒ 不去；判定仍与 1.12.12 一致（全文层兜住）
+    assert.equal(dangerousCommandMatch("curl 'a=1&rm -rf'")?.rule, 'text:rm -rf')
+    assert.equal(dangerousCommandMatch('echo "never run rm -rf /x by hand"')?.rule, 'text:rm -rf')
   })
 })

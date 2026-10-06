@@ -5,7 +5,7 @@
 // （本插件无 tsdown banner，ModuleLoader id 由 exports 隐含 = 包名）。
 // 同时冒烟：模块可加载、apply 桩测试全绿、无内置 Agent（v1.1 全清空）。
 
-import { readFileSync, existsSync } from 'node:fs'
+import { readFileSync, existsSync, mkdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -1312,6 +1312,633 @@ if (!c.includes('uiSubs')) throw new Error('v0.9.29: 持久化状态应有订阅
     throw new Error('v1.12.7-8: paths:null 的响应没有如实回 written:false')
   if (!/paths: null/.test(nullGateBody))
     throw new Error('v1.12.7-8: paths:null 的响应没有回带 paths:null（会让人以为走了 legacy 自动分析）')
+}
+
+// ── v1.12.10：**没有任何载荷豁免**（内容规则 + 形状判据对整段文本的每个段/行全量生效）──
+//
+// 行为断言在 test/dangerous-command-gate.test.js 的 v1.12.10 describe 与
+// test/invariants-1-12-10.test.js；这里钉「单点实现 + 接线 + A/B/C/D 四组方向 + 代价 +
+// 两套豁免机器（1.12.8 剥离 / 1.12.9 掩码）不得复活」，保证那两处被整块删掉时 CI 仍能看见。
+{
+  const ha = await import('./lib/host-approval.js')
+  const hostV10 = readFileSync(path.join(root, 'lib', 'host-approval.js'), 'utf8')
+  const idxV10 = readFileSync(path.join(root, 'index.js'), 'utf8')
+
+  // Minor 4：ban-list 只盯**代码行**（整行注释剔除；行尾注释仍会被扫到 = 已知代价）
+  const stripCommentsV10 = (text) => text.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')
+  const hostCodeV10 = stripCommentsV10(hostV10)
+
+  // ① 反向守卫：两套豁免机器的符号一个都不许留
+  for (const banned of [
+    'stripHeredocPayloads', 'DATA_CONSUMERS', 'STDIN_SCRIPT_CONSUMERS',
+    'heredocPayloadIsData', 'isDataConsumerCommand', 'pipelineIsDataOnly',
+    'heredocCommandStart', 'openerTailIsOpen', 'scanText',
+    'heredocPayloadLines', 'scanHeredocBlocks', 'parseHeredocTag', 'scanHeredocOps',
+    'isHeredocTerminator', 'MAX_HEREDOC_OPS', 'HEREDOC_TAG_RE', 'isCommentStart',
+    'splitSubCommandsDetailed', 'shapeOk', 'terminators',
+  ]) {
+    if (hostCodeV10.includes(banned))
+      throw new Error(`v1.12.10: 源码里出现已废弃的载荷豁免机器残留：${banned}`)
+  }
+
+  // ② 接线：逐段**一律**判定（没有任何跳过分支），切分函数是 HEAD 版（不带行号）
+  const mtStart = hostV10.indexOf('function matchText(text, depth)')
+  if (mtStart < 0) throw new Error('v1.12.10: 找不到 matchText')
+  const mtBody = stripCommentsV10(hostV10.slice(mtStart, hostV10.indexOf('\n}\n', mtStart)))
+  // v1.12.11：判定文本先过 `normalizeDangerText`（续行合并 / 换行转义折空格 / 折叠空白）再切段；
+  // 并且多一遍「原文再判」（双读）—— 规范化只许更容易命中，不许把 1.12.10 会命中的形态变 MISS
+  // v1.12.13：变体链扩到四份（新口径 / 词内引号拼接 / 旧口径读 / 原文）—— 断言改为「多读 + 逐段」结构
+  if (!/for \(const variant of \[\n/.test(mtBody)
+    || !/normalizeDangerText\(text, \{ literalEscapeAsSpace: true \}\)/.test(mtBody)
+    || !/for \(const segment of splitSubCommands\(variant\)\) \{/.test(mtBody))
+    throw new Error('v1.12.10: matchText 不再逐段调用判据（多读口径链断了）')
+  if (/\bcontinue\b/.test(mtBody) || /payload|exempt|skip/i.test(mtBody))
+    throw new Error('v1.12.10: matchText 里出现跳过/载荷/豁免语义（豁免机器复活了）')
+  if (!hostV10.includes('export function splitSubCommands(text) {'))
+    throw new Error('v1.12.10: splitSubCommands 不见了')
+  if (/Detailed/.test(hostCodeV10))
+    throw new Error('v1.12.10: 又出现了带行号的切分变体（为掩码服务的那一版）')
+  try {
+    const st = ha.splitSubCommands("cat <<'EOF'\nbody\nEOF\nrm -rf /tmp/x")
+    if (!Array.isArray(st) || typeof st[0] !== 'string')
+      throw new Error('v1.12.10: splitSubCommands 不再返回字符串数组（行号语义漏进了签名）')
+  } catch (err) {
+    if (/行号语义/.test(String(err && err.message))) throw err
+  }
+
+  // ③ A 组：载荷里的真命令必须 HIT（含终审证成会**静默放行**的那几族）
+  for (const [why, cmd] of [
+    ['ssh 载荷执行', "ssh host <<'SH'\nrm -rf /tmp/x\nSH"],
+    ['写脚本再执行', "cat > /tmp/g <<'SH'\nrm -rf /tmp/x\nSH\nsh /tmp/g"],
+    ['重定向 + 分号执行', "cat <<'SH' > /tmp/g; sh /tmp/g\nrm -rf /tmp/x\nSH"],
+    ['进程替换', "cat <<'SH' > >(ssh host)\nrm -rf /tmp/x\nSH"],
+    ['同名函数遮蔽', 'cat() { ssh "$1"; }; cat <<\'SH\'\nrm -rf /tmp/x\nSH'],
+    ['别名遮蔽', "alias cat=ssh; cat <<'SH'\nrm -rf /tmp/x\nSH"],
+    ['假 cat', "/tmp/plant/cat <<'SH'\nrm -rf /tmp/x\nSH"],
+    ['tar --use-compress-program', "tar --use-compress-program=sh -xf - <<'SH'\nrm -rf /tmp/x\nSH"],
+    ['git -c alias', "git -c alias.s='!sh' s <<'SH'\nrm -rf /tmp/x\nSH"],
+    ['管道下游 ssh', "cat <<'SH' | ssh host\nrm -rf /tmp/x\nSH"],
+    ['pwsh -Command -', "pwsh -Command - <<'P'\ngit push\nP"],
+    ['docker exec -i', "docker exec -i c sh <<'SH'\nrm -rf /tmp/x\nSH"],
+    ['kubectl exec -i', "kubectl exec -i pod -- sh <<'SH'\nrm -rf /tmp/x\nSH"],
+    ['载荷里的 npm publish', "cat <<'EOF' > f\nnpm publish\nEOF"],
+    ['`\\` 续行把管道藏到下一行', "cat <<'SH' \\\n| ssh host\nsh -c 'rm -rf /tmp/zz'\nSH"],
+    ['反斜杠奇偶（tee | sh）', "tee /dev/null <<'SH' | sh\nrm -rf /tmp/x\nSH"],
+  ]) {
+    const hit = ha.dangerousCommandMatch(cmd)
+    if (!hit) throw new Error(`v1.12.10: ${why} 的载荷被隐藏（真命令静默放行）`)
+  }
+
+  // ④ B1（原阻断）：假 heredoc 起始（`<<` 前是标识符）不再吞掉下一行 —— 数字/标识符两档
+  for (const head of [
+    'x=$((1<<n))', 'x=$((n<<sh))', 'x=$((n << sh))', 'x=$((n<< sh))', '((n<<sh))',
+    '(( n << sh ))', 'x=$[n<<sh]', 'echo $[n<<sh]', 'n=1; x=$((n<<sh))', 'x=$((n<<sh)) # c',
+    'true && x=$((n<<sh))',
+  ]) {
+    const hit = ha.dangerousCommandMatch(`${head}\nsh`)
+    if (!hit || hit.rule !== 'shell-stdin')
+      throw new Error(`v1.12.10: 假 heredoc 起始吞掉了下一行的真命令（${head}）：${hit ? hit.rule : 'null'}`)
+  }
+
+  // ⑤ B2（原阻断）：载荷行上的反斜杠续行照旧判 —— v1.12.11 起由**续行合并**命中，
+  // 归因从形状判据（`wrapper-option-ambiguity`）升级为真命令名（`rm -rf`），仍然必须命中
+  for (const cmd of [
+    "ssh host <<'SH'\nrm \\\n-rf /tmp/x\nSH",
+    "cat <<'E'\nrm \\\n-rf /tmp/x\nE",
+    "cat <<X\nrm \\\n-rf /tmp/x",
+  ]) {
+    const hit = ha.dangerousCommandMatch(cmd)
+    if (!hit || hit.rule !== 'rm -rf')
+      throw new Error(`v1.12.10: 续行劈开的 rm -rf 被放过（${hit ? hit.rule : 'null'}）`)
+  }
+
+  // ⑥ 代价（用户裁定，刻意不免）：现场 commit、正文危险词、7 个 shell 名 tag
+  const REPRO = [
+    'git add -A',
+    "git commit -q -F - <<'EOF'",
+    'feat(grant): 0.7.10 全非法路径不再退化为工具档；补「规则语义（读侧）」文档',
+    '',
+    '- planGrantWrites 新增 none 出口：用户给了非空路径但全部被丢弃 ⇒',
+    '  路径档与工具档都不写，只放行本次（仅显式回传 paths:[] 才落工具档）',
+    'EOF',
+  ].join('\n')
+  const replay = ha.dangerousCommandMatch(REPRO)
+  if (!replay || replay.rule !== ha.WRAPPER_OPTION_AMBIGUITY_RULE)
+    throw new Error(`v1.12.10: 现场原文的代价口径变了（got ${replay ? replay.rule : 'null'}）`)
+  for (const [tag, rule] of [
+    ['sh', 'shell-stdin'], ['bash', 'shell-stdin'], ['zsh', 'shell-stdin'],
+    ['dash', 'shell-stdin'], ['ksh', 'shell-stdin'], ['su', 'su-shell'], ['runuser', 'su-shell'],
+  ]) {
+    const hit = ha.dangerousCommandMatch(`cat <<'${tag}'\nbody\n${tag}`)
+    if (!hit || hit.rule !== rule)
+      throw new Error(`v1.12.10: tag=${tag} 的终止行被跳过（got ${hit ? hit.rule : 'null'}）`)
+  }
+  for (const cmd of [
+    "git commit -q -F - <<'EOF'\ngit push 这类命令写在正文里时也只是在描述\nEOF",
+    "tee /tmp/f <<'EOF'\nrm -rf /tmp/x\nEOF",
+  ]) {
+    if (!ha.dangerousCommandMatch(cmd))
+      throw new Error('v1.12.10: 载荷里的危险命令被免掉了（代价口径被偷偷放宽）')
+  }
+
+  // ⑦ 对照组：正文里没有 `- ` 行、也没有危险命令字样 ⇒ 照旧放行（不是「什么都弹」）
+  for (const [why, cmd] of [
+    ['普通说明文本', 'cat <<EOF > f\n普通说明文本\nEOF'],
+    ['patch 正文', "patch -p1 <<'EOF'\n正文说明文本\nEOF"],
+    ['python3 载荷', "python3 - <<'PY'\nprint('hello')\nPY"],
+    ['只有一个普通 tag 行', "cat <<'EOF'\nbody\nEOF"],
+    ['续行里没有危险程序', "cat <<'E'\nfoo \\\n-bar\nE"],
+  ]) {
+    const hit = ha.dangerousCommandMatch(cmd)
+    if (hit) throw new Error(`v1.12.10: ${why} 被拦成危险命令（rule=${hit.rule}）—— 误伤面变大了`)
+  }
+
+  // ⑧ D 组：反放宽总表（既有拦截一条都不许失效）+ argsText 通道
+  for (const [cmd, rule] of [
+    ['bash -c "rm -rf /tmp/x"', 'rm -rf'],
+    ["sh -c 'rm -rf /tmp/x'", 'rm -rf'],
+    ['bash -c "bash -c \\"rm -rf /x\\""', 'rm -rf'],
+    ['echo x | xargs rm -rf /tmp/x', 'rm -rf'],
+    ['sudo rm -rf /tmp/x', 'rm -rf'],
+    ['command/env/nohup/nice/time rm -rf /tmp/x', 'rm -rf'],
+    ['/bin/rm -rf /tmp/x', 'rm -rf'],
+    ['find /tmp -exec rm -rf {} +', 'rm -rf'],
+    ['git -C /tmp push', 'git push'],
+    ['git -c k=v push', 'git push'],
+    ['npm --prefix /tmp publish', 'npm publish'],
+    ['pnpm publish', 'pnpm publish'],
+    ['yarn publish', 'yarn publish'],
+    ['cat <<EOF > f && rm -rf /tmp/x\nbody\nEOF', 'rm -rf'],
+    ['rm -rf /tmp/x <<\'EOF\'\nbody\nEOF', 'rm -rf'],
+    ['cat <<EOF > f\nbody\nEOF\nrm -rf /tmp/x', 'rm -rf'],
+  ]) {
+    const hit = ha.dangerousCommandMatch(cmd)
+    if (!hit || hit.rule !== rule)
+      throw new Error(`v1.12.10: 反放宽回归失败（want ${rule}，got ${hit ? hit.rule : null}）：${cmd.slice(0, 40)}`)
+  }
+  if (ha.dangerousCommandMatch(ha.argsTextOf({ shell: 'rm -rf /tmp/x' }))?.rule !== 'rm -rf')
+    throw new Error('v1.12.10: argsText 通道（自定义执行工具）被改坏了')
+
+  // ⑨ 归因顺序「先内容、后形状」：预算/形状分支返回前先求真命令名
+  for (const [cmd, rule] of [
+    [`${'sudo '.repeat(9)}rm -rf /tmp/x`, 'rm -rf'],
+    [`${'sudo '.repeat(9)}git push`, 'git push'],
+    [`${'sudo '.repeat(9)}ls -la`, 'wrapper-nesting'],
+    [`bash -c 'bash -c "bash -c rm -rf /"'`, 'rm -rf'],
+    [`bash -c 'bash -c "bash -c echo hi"'`, 'shell-nesting'],
+  ]) {
+    const hit = ha.dangerousCommandMatch(cmd)
+    if (!hit || hit.rule !== rule)
+      throw new Error(`v1.12.10: 归因顺序不对（want ${rule}，got ${hit ? hit.rule : null}）：${cmd.slice(0, 40)}`)
+  }
+
+  // ⑩ index.js 的危险命令门调用点仍在（门前置不变）
+  if (!idxV10.includes('dangerousCommandMatch(dangerCmd.text)') || !idxV10.includes('dangerousCommandMatch(dangerArgs.text)'))
+    throw new Error('v1.12.10: index.js 的危险命令门调用点丢失')
+}
+
+// ── v1.12.11：判定前的文本规范化（续行合并 / 换行转义折空格 / 折叠空白）+ 归因窗口 ──
+//
+// 行为断言在 test/dangerous-command-gate.test.js 的 v1.12.11 describe、
+// test/invariants-1-12-11.test.js（6 条不变式）与 test/invariants-1-12-10.test.js；这里钉
+// 「单点实现 + 接线 + 七条验收 + 行首语义不许被抹平 + 归因窗口只粗不放 + 不做按 flag 的解析」。
+{
+  const ha = await import('./lib/host-approval.js')
+  const hostV11 = readFileSync(path.join(root, 'lib', 'host-approval.js'), 'utf8')
+  const codeV11 = hostV11.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')
+
+  // ① 单点实现：常量 + 导出函数 + 接线（判定跑在规范化之后的文本上）
+  if (ha.MAX_ATTRIBUTION_TOKENS !== 256)
+    throw new Error(`v1.12.11: MAX_ATTRIBUTION_TOKENS 不是 256（实得 ${ha.MAX_ATTRIBUTION_TOKENS}）`)
+  if (typeof ha.normalizeDangerText !== 'function')
+    throw new Error('v1.12.11: 未导出 normalizeDangerText（归一化缺失）')
+  // v1.12.13：变体链扩到四份（+ 词内引号拼接）⇒ 断言改为「多读 + 旧口径读 + 逐段」
+  if (!codeV11.includes('for (const variant of [\n')
+    || !codeV11.includes('normalizeDangerText(text, { literalEscapeAsSpace: true })')
+    || !codeV11.includes('for (const segment of splitSubCommands(variant)) {'))
+    throw new Error('v1.12.11: matchText 没有做「多读」（新口径 / 旧口径 / 原文）—— 会变松')
+  if (!codeV11.includes('if (!variants.includes(variant)) variants.push(variant)'))
+    throw new Error('v1.12.11: matchText 的多读没有去重（普通输入会重复判定）')
+  if (!/if \(ch === '\\n'\) \{/.test(codeV11))
+    throw new Error('v1.12.11: splitSubCommands 里没有「换行一律切段」的分支')
+
+  // ② 归一化函数的形状（顺序：续行 ⇒ 转义折空格 ⇒ 折叠空白；真实换行保留）
+  for (const [input, want] of [
+    ['git \\\npush origin main', 'git push origin main'],
+    ['git \\\r\npush', 'git push'],
+    ['git \\   \npush', 'git push'],
+    ['rm  -rf /tmp/x', 'rm -rf /tmp/x'],
+    ['rm \t -rf', 'rm -rf'],
+    // v1.12.11 二次走查（裁定 2）：**字面** `\n`/`\r` 与裸 CR 都是**行分隔**（不是空格）
+    ['a\\nb', 'a\nb'],
+    ['a\\rb', 'a\nb'],
+    ['a\rb', 'a\nb'],
+    ['a\\tb', 'a b'],
+    ['echo hi\n- rm -rf /tmp/x', 'echo hi\n- rm -rf /tmp/x'],
+  ]) {
+    const got = ha.normalizeDangerText(input)
+    if (got !== want)
+      throw new Error(`v1.12.11: normalizeDangerText(${JSON.stringify(input)}) = ${JSON.stringify(got)}，期望 ${JSON.stringify(want)}`)
+  }
+
+  // ③ 七条验收（用户点名）必须 HIT，且归因是真命令名
+  for (const [why, cmd, rule] of [
+    ['续行 git push', 'git \\\npush origin main', 'git push'],
+    ['续行 npm publish', 'npm \\\npublish', 'npm publish'],
+    ['续行 rm -rf', 'rm \\\n-rf /tmp/x', 'rm -rf'],
+    ['续行 sudo rm -rf', 'sudo \\\nrm -rf /tmp/x', 'rm -rf'],
+    ['多行 bash -c', 'bash -c "true\nrm -rf /tmp/x"', 'rm -rf'],
+    ['多行 sh -c', 'sh -c "true\nrm -rf /tmp/x"', 'rm -rf'],
+    ['多行 pwsh -Command', 'pwsh -Command "x\nnpm publish"', 'npm publish'],
+    // 二次走查：**字面** `\n` 的两条验收
+    ['字面 \\n pwsh -Command', 'pwsh -Command "x\\nnpm publish"', 'npm publish'],
+    ['字面 \\n python os.system', 'python3 -c "import os\\nos.system(\'rm -rf /tmp/x\')"', 'rm -rf'],
+  ]) {
+    const hit = ha.dangerousCommandMatch(cmd)
+    if (!hit || hit.rule !== rule)
+      throw new Error(`v1.12.11: ${why} 未按预期命中（want ${rule}，got ${hit ? hit.rule : null}）`)
+  }
+
+  // ③″ 代码边界内容规则：危险命令紧跟**代码标点**（左贴代码）⇒ HIT；左贴空白 ⇒ 仍 MISS
+  for (const [why, cmd, rule] of [
+    ['os.system 片段', "os.system('rm -rf /tmp/x')", 'rm -rf'],
+    ['JSON 参数片段', "{shell:'rm -rf /tmp/x'}", 'rm -rf'],
+    ['子 shell 片段', '$(git push origin main)', 'git push'],
+    ['赋值片段', 'x="npm publish"', 'npm publish'],
+  ]) {
+    const hit = ha.dangerousCommandMatch(cmd)
+    if (!hit || hit.rule !== rule)
+      throw new Error(`v1.12.11(代码边界): ${why} 未按预期命中（want ${rule}，got ${hit ? hit.rule : null}）`)
+  }
+  // v1.12.12（用户裁定「文本里出现危险字样就弹」）⇒ 这些「左贴空白」的提及/参数形态现在
+  // **必须弹**（代价，由全文子串层兜住）；变 MISS 才是缺陷
+  for (const cmd of ['echo "git push"', "echo 'rm -rf /tmp/x'", "curl 'a=1&rm -rf'",
+    'echo "npm publish"', 'git commit -m "fix: never git push --force"']) {
+    if (!ha.dangerousCommandMatch(cmd))
+      throw new Error(`v1.12.11/1.12.12(代码边界⇒全文层): ${JSON.stringify(cmd)} 应当弹（代价）`)
+  }
+  if (!/function codeBoundaryContentRule\(segment\) \{/.test(codeV11))
+    throw new Error('v1.12.11: 代码边界内容规则不见了（字面 \\n 的 python 验收用例会漏）')
+  if (!/function boundaryGluedLeft\(segment, i\) \{/.test(codeV11))
+    throw new Error('v1.12.11: 代码边界少了「左贴代码」门（会把 echo "git push" 这类提及判成危险）')
+
+  // ④ 折叠空白让「靠多余空白规避」失效
+  for (const cmd of ['rm  -rf /tmp/x', 'rm    -rf /tmp/x', 'rm\t-rf /tmp/x', 'rm \t -rf /tmp/x',
+    'git\t\tpush origin main', 'sudo   rm   -rf   /tmp/x']) {
+    if (!ha.dangerousCommandMatch(cmd))
+      throw new Error(`v1.12.11: ${JSON.stringify(cmd)} 被放过（空白规避成功了）`)
+  }
+
+  // ⑤ 行首语义**不许**被抹平（用户点名的三条 + 现场代价用例）
+  for (const [why, cmd, rule] of [
+    ['行首形状 1', 'echo hi\n- rm -rf /tmp/x', 'wrapper-option-ambiguity'],
+    ['行首形状 2', 'true\n- rf /tmp/x', 'wrapper-option-ambiguity'],
+    ['行首危险 3', 'echo x\nsudo rm -rf /tmp/y', 'rm -rf'],
+    ['现场 commit 的代价命中', "git add -A\ngit commit -q -F - <<'EOF'\nfeat: x\n\n- planGrantWrites 新增 none 出口\nEOF", 'wrapper-option-ambiguity'],
+  ]) {
+    const hit = ha.dangerousCommandMatch(cmd)
+    if (!hit || hit.rule !== rule)
+      throw new Error(`v1.12.11: ${why} 被归一化抹平（want ${rule}，got ${hit ? hit.rule : null}）`)
+  }
+
+  // ⑥ 「句中只是提到危险命令」不许翻面（问②的实测口径）
+  // v1.12.12（用户裁定）：句中提及的预设字样现在**必须弹**（代价）；只有不含预设字样的文本仍 MISS
+  for (const [cmd, rule] of [
+    ['echo "note: never run rm -rf /tmp/x by hand"', 'text:rm -rf'],
+    ['git commit -m "fix: never git push --force"', 'text:git push'],
+    ["curl 'a=1&rm -rf'", 'text:rm -rf'],
+  ]) {
+    const hit = ha.dangerousCommandMatch(cmd)
+    if (!hit || hit.rule !== rule)
+      throw new Error(`v1.12.11/1.12.12: ${JSON.stringify(cmd)} 应当弹（代价，want ${rule}，got ${hit ? hit.rule : 'null'}）`)
+  }
+  if (ha.dangerousCommandMatch("cat <<'EOF'\nbody\nEOF"))
+    throw new Error('v1.12.11/1.12.12: 不含预设字样的文本被弹了（误伤面不该这么大）')
+
+  // ⑦ 归因窗口只粗不放：超长包装前缀仍**必须拦**
+  const longRm = `${'sudo '.repeat(32768)}rm -rf /tmp/x`
+  const longLs = `${'sudo '.repeat(32768)}ls`
+  if (ha.dangerousCommandMatch(longRm)?.rule !== 'rm -rf')
+    throw new Error('v1.12.11: 超长包装前缀后真命令的归因丢了（窗口裁错了位置）')
+  const lsHit = ha.dangerousCommandMatch(longLs)
+  if (!lsHit || lsHit.rule !== 'wrapper-nesting')
+    throw new Error(`v1.12.11: 超长包装前缀 + 无危险内容应当仍是「可疑」而不是放行（实得 ${lsHit ? lsHit.rule : 'null'}）`)
+  if (!ha.dangerousCommandMatch(`${'sudo '.repeat(100000)}ls`))
+    throw new Error('v1.12.11: 500KB 包装前缀被放行（窗口语义写错成「超限即放行」了）')
+
+  // ⑧ 反向守卫：不做按 flag 的专门解析；两套旧豁免机器不得复活（只看代码行）
+  for (const banned of ['rawBodyText', 'shellBodyText', 'bodyTextFrom', 'perFlag', 'flagBody',
+    'heredocPayloadLines', 'scanHeredocBlocks', 'shapeOk', 'splitSubCommandsDetailed',
+    'stripHeredocPayloads', 'DATA_CONSUMERS', 'STDIN_SCRIPT_CONSUMERS', 'terminators']) {
+    if (codeV11.includes(banned))
+      throw new Error(`v1.12.11: 代码里出现已废弃/被否定的实现：${banned}`)
+  }
+}
+
+// ── v1.12.12：全文危险词扫描（可配置，预设三串）───────────────────────────────
+// 用户裁定：「改成全文子串判定：文本里出现危险字样就弹」+「做成一个配置项…目前预设
+// rm -rf、git push、npm publish 三个先」。结构型判据一律**不许**改成全文匹配（只做加法）。
+{
+  const ha = await import('./lib/host-approval.js')
+  const codeV12 = (() => {
+    const src = readFileSync(path.join(root, 'lib', 'host-approval.js'), 'utf8')
+    return src.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')
+  })()
+  // ① 常量与路径口径
+  if (JSON.stringify(ha.DEFAULT_DANGER_PATTERNS) !== JSON.stringify(['rm -rf', 'git push', 'npm publish']))
+    throw new Error('v1.12.12: 预设危险串不是 rm -rf / git push / npm publish')
+  const cfgPath = ha.dangerPatternsPath()
+  if (path.basename(cfgPath) !== 'dsh-danger-patterns.json' || !cfgPath.endsWith(path.join('data', 'dsh-danger-patterns.json')))
+    throw new Error(`v1.12.12: 配置文件路径不符合规格（实得 ${cfgPath}）`)
+  for (const need of ['export function fullTextDangerMatch(text) {', 'statSync(file)', 'new RegExp(',
+    "\\\\$&",
+    'if (depth === 0) {', 'for (const variant of variants) {'])
+    if (!codeV12.includes(need)) throw new Error(`v1.12.12: 源码缺少关键实现：${need}`)
+  for (const banned of ['shell-nesting', 'wrapper-nesting', 'shell-stdin', 'su-shell', 'sudo', 'bash -c'])
+    if (ha.DEFAULT_DANGER_PATTERNS.includes(banned))
+      throw new Error(`v1.12.12: 预设串里混进了结构型词（结构判据不许改成全文匹配）：${banned}`)
+
+  // ② 预设三串 × 三种位置（隔离到临时 DSH_HOME，别碰开发机真实配置）
+  const origHome = process.env.DSH_HOME
+  const tmpHome = mkdtempSync(path.join(os.tmpdir(), 'dsh-verify-11212-'))
+  const cfg = path.join(tmpHome, 'data', 'dsh-danger-patterns.json')
+  const writeCfg = (v) => { mkdirSync(path.dirname(cfg), { recursive: true }); writeFileSync(cfg, JSON.stringify(v)); ha.resetDangerPatternCache() }
+  try {
+    process.env.DSH_HOME = tmpHome
+    ha.resetDangerPatternCache()
+    for (const [why, cmd, rule] of [
+      ['rm -rf 段中', "echo hi\n- rm -rf /tmp/x", ha.WRAPPER_OPTION_AMBIGUITY_RULE],
+      ['rm -rf 引号内', 'echo "note: rm -rf /tmp/x"', 'text:rm -rf'],
+      ['git push 段中', 'cd /tmp && git push origin main', 'git push'],
+      ['git push 引号内', 'git log --grep "git push"', 'text:git push'],
+      ['npm publish 段中', 'cd /tmp && npm publish', 'npm publish'],
+      ['npm publish 引号内', 'echo "npm publish"', 'text:npm publish'],
+    ]) {
+      const hit = ha.dangerousCommandMatch(cmd)
+      if (!hit || hit.rule !== rule)
+        throw new Error(`v1.12.12: ${why} 未按预期命中（want ${rule}，got ${hit ? hit.rule : null}）`)
+    }
+    // ③ 词边界反例（正常英文单词/更长程序名里的字样不许弹）
+    for (const cmd of ['perform -rf x', 'legit push origin main', 'digit push', 'npm publisher',
+      'git pushd', 'git pushpin', 'rmdir -rf', 'format -rf', 'echorm -rf', 'xrm -rf /tmp/x',
+      'git log --grep push', 'npm run publish', 'rm -r /tmp/x'])
+      if (ha.dangerousCommandMatch(cmd))
+        throw new Error(`v1.12.12: ${JSON.stringify(cmd)} 不该命中（词边界/语义反例）`)
+    // ④ 配置项：缺失/坏 JSON/非数组 ⇒ 默认；[] ⇒ 关闭；自定义 ⇒ 立刻生效（不重启）
+    try { rmSync(cfg) } catch {}
+    ha.resetDangerPatternCache()
+    if (JSON.stringify(ha.dangerTextPatterns()) !== JSON.stringify(ha.DEFAULT_DANGER_PATTERNS))
+      throw new Error('v1.12.12: 配置缺失时没有回退默认')
+    writeCfg({ patterns: 'not-an-array' })
+    if (JSON.stringify(ha.dangerTextPatterns()) !== JSON.stringify(ha.DEFAULT_DANGER_PATTERNS))
+      throw new Error('v1.12.12: patterns 非数组时没有回退默认')
+    writeFileSync(cfg, '{ 坏 JSON')
+    ha.resetDangerPatternCache()
+    if (JSON.stringify(ha.dangerTextPatterns()) !== JSON.stringify(ha.DEFAULT_DANGER_PATTERNS))
+      throw new Error('v1.12.12: 坏 JSON 时没有回退默认')
+    // **只增不减**：`[]` 等价于「没有追加项」——内置三串照常生效（配置不可关闭这层）
+    writeCfg({ patterns: [] })
+    if (JSON.stringify(ha.dangerTextPatterns()) !== JSON.stringify(ha.DEFAULT_DANGER_PATTERNS))
+      throw new Error('v1.12.12: patterns: [] 不该清空内置三串（配置只增不减）')
+    for (const [cmd, rule] of [['echo "rm -rf /x"', 'text:rm -rf'], ['echo "git push"', 'text:git push'],
+      ['echo "npm publish"', 'text:npm publish']]) {
+      if (ha.dangerousCommandMatch(cmd)?.rule !== rule)
+        throw new Error(`v1.12.12: patterns: [] 把内置串关了（${cmd} 应仍然命中 ${rule}）`)
+    }
+    if (ha.dangerousCommandMatch('rm -rf /tmp/x')?.rule !== 'rm -rf')
+      throw new Error('v1.12.12: patterns: [] 把既有按段判定也关了')
+    // 不调用 reset：直接改文件 ⇒ 下一次判定就用新串（mtime+size 变化重读）
+    writeFileSync(cfg, JSON.stringify({ patterns: ['  kubectl   delete ns ', '', 'kubectl delete ns'] }))
+    const dyn = ha.dangerousCommandMatch('echo "kubectl delete ns prod"')
+    if (dyn?.rule !== 'text:custom:kubectl delete ns')
+      throw new Error(`v1.12.12: 自定义串没有立刻生效/归因名不对（实得 ${dyn ? dyn.rule : 'null'}）`)
+    // 追加项删掉后立刻失效，但内置三串始终在
+    writeFileSync(cfg, JSON.stringify({ patterns: ['helm uninstall'] }))
+    if (ha.dangerousCommandMatch('echo "kubectl delete ns prod"'))
+      throw new Error('v1.12.12: 删掉的追加项没有立刻失效')
+    if (ha.dangerousCommandMatch('echo "rm -rf /x"')?.rule !== 'text:rm -rf')
+      throw new Error('v1.12.12: 追加项变动把内置串带没了（只增不减被破坏）')
+    // ⑤ 按字面（不是正则）
+    writeCfg({ patterns: ['a.*b'] })
+    if (ha.dangerousCommandMatch('echo axxb')) throw new Error('v1.12.12: 模式被当正则执行了（注入面）')
+    if (ha.dangerousCommandMatch('echo "a.*b"')?.rule !== 'text:custom:a.*b')
+      throw new Error('v1.12.12: 字面模式未命中')
+    // ⑥ 结构判据不受影响（计数判据仍按层数/跳数）
+    ha.resetDangerPatternCache()
+    if (ha.dangerousCommandMatch('sh -c \'sh -c "sh -c ls"\'')?.rule !== ha.SHELL_DEPTH_RULE)
+      throw new Error('v1.12.12: 全文层把 shell-nesting 的计数判据顶掉了')
+    if (ha.dangerousCommandMatch(`${'sudo '.repeat(9)}ls`)?.rule !== ha.WRAPPER_DEPTH_RULE)
+      throw new Error('v1.12.12: 全文层把 wrapper-nesting 的计数判据顶掉了')
+    // ⑦ 只做加法：既有等价写法一条不丢
+    for (const [cmd, rule] of [['rm -r -f /tmp/x', 'rm -rf'], ['/bin/rm -rf /tmp/x', 'rm -rf'],
+      ['sudo rm -rf /tmp/x', 'rm -rf'], ['git -C /tmp push', 'git push'],
+      ['npm --prefix /tmp publish', 'npm publish'], ['pnpm publish', 'pnpm publish'],
+      ['yarn publish', 'yarn publish']]) {
+      if (ha.dangerousCommandMatch(cmd)?.rule !== rule)
+        throw new Error(`v1.12.12: 既有覆盖丢了（那就是变松）：${cmd}`)
+    }
+  } finally {
+    if (origHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = origHome
+    ha.resetDangerPatternCache()
+    rmSync(tmpHome, { recursive: true, force: true })
+  }
+}
+
+// ── v1.12.13：独立终审（3 阻断 / 3 主要 / 8 次要）的修复守卫 ──────────────────
+{
+  const ha = await import('./lib/host-approval.js')
+  const codeV13 = (() => {
+    const src = readFileSync(path.join(root, 'lib', 'host-approval.js'), 'utf8')
+    return src.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')
+  })()
+  // ① B1：旧口径读（1.12.11 读法）必须把**裸 CR / CRLF** 折空格 —— 少一条就会变松
+  if (!/if \(literalEscapeAsSpace\) \{ \/\/ 旧口径（1\.12\.11 读法）/.test(codeV13))
+    throw new Error('v1.12.13: 旧口径读没有把裸 CR 折空格（B1 会变松）')
+  if (!/function pushSpace\(out\) \{/.test(codeV13)) throw new Error('v1.12.13: pushSpace 不见了')
+  // 口径必须**两份都在**：新口径裸 CR = 段分隔；旧口径读（1.12.11 读法）裸 CR = 空格
+  if (ha.normalizeDangerText('a\rb') !== 'a\nb')
+    throw new Error('v1.12.13: 新口径的裸 CR 不再是段分隔符（CR 家族修复走偏）')
+  if (ha.normalizeDangerText('a\rb', { literalEscapeAsSpace: true }) !== 'a b')
+    throw new Error('v1.12.13: 旧口径读没有把裸 CR 折成空格（B1 会变松）')
+  // ② B2：配置读取必须先 fstat 查 isFile + O_NONBLOCK + 有界 readSync（不得再 readFileSync）
+  if (!/fs\.openSync\(file, fs\.constants\.O_RDONLY \| fs\.constants\.O_NONBLOCK\)/.test(codeV13))
+    throw new Error('v1.12.13: 配置读取没有用 O_NONBLOCK（FIFO 会阻塞在 open）')
+  if (!/if \(!st\.isFile\(\)\) return null/.test(codeV13))
+    throw new Error('v1.12.13: 配置读取没有 isFile 检查（FIFO / /dev/zero 会无限阻塞）')
+  if (!/readSync\(fd, buf, off, size - off, off\)/.test(codeV13))
+    throw new Error('v1.12.13: 配置读取没有有界 readSync')
+  if (!/const MAX_DANGER_CONFIG_BYTES = 1 << 20/.test(codeV13)) throw new Error('v1.12.13: 读取上限常量不见了')
+  if (/JSON\.parse\(fs\.readFileSync\(file, 'utf8'\)\)/.test(codeV13))
+    throw new Error('v1.12.13: dangerTextPatterns 又直接用 readFileSync 读配置了（B2 回归）')
+  // ③ B3：new RegExp 有 try/catch（失败缓存 null）+ 单串/条数上限 + 外层兜底
+  if (!/const MAX_DANGER_PATTERN_CHARS = 4096/.test(codeV13)) throw new Error('v1.12.13: 单串长度上限不见了')
+  if (!/const MAX_DANGER_PATTERN_COUNT = 1024/.test(codeV13)) throw new Error('v1.12.13: 条数上限不见了/不是与 B 仓统一的 1024')
+  if (!/try \{\n        re = new RegExp\(/.test(codeV13)) throw new Error('v1.12.13: new RegExp 没有包 try（B3 回归）')
+  if (!/catch \{\n        re = null/.test(codeV13)) throw new Error('v1.12.13: RegExp 构造失败没有落回 null')
+  if (!/warnDangerConfigOnce\(`全文危险词扫描异常/.test(codeV13)) throw new Error('v1.12.13: 全文层外层兜底不见了')
+  // ④ M3 与 Minor 5 的接线
+  if (!/stripWordInternalQuotes\(normalizeDangerText\(text\)\)/.test(codeV13))
+    throw new Error('v1.12.13: 词内引号拼接变体不在变体链里（M3 回归）')
+  // Minor 4：缺失文件必须**静默**（行为断言在下面「缺失配置」一节；这里钉住结构：只对 exists 告警）
+  if (!/if \(exists\) \{/.test(codeV13))
+    throw new Error('v1.12.13: 配置读取的告警没有按「文件存在」分流（Minor 4 会回归）')
+
+  // 行为层（隔离到临时 DSH_HOME）
+  const origHome = process.env.DSH_HOME
+  const tmpHome = mkdtempSync(path.join(os.tmpdir(), 'dsh-verify-11213-'))
+  const cfg = path.join(tmpHome, 'data', 'dsh-danger-patterns.json')
+  const writeCfg = (v) => { mkdirSync(path.dirname(cfg), { recursive: true }); writeFileSync(cfg, JSON.stringify(v)); ha.resetDangerPatternCache() }
+  try {
+    process.env.DSH_HOME = tmpHome
+    ha.resetDangerPatternCache()
+    // B1
+    for (const [why, cmd, rule] of [
+      ['B1 最小复现（字面 \\t + 裸 CR）', '\trm\r-r\r-f\r/tmp/x', 'rm -rf'],
+      ['B1 裸 CR 分隔', 'rm\r-rf\r/tmp/x', 'rm -rf'],
+      ['B1 字面 \\r 两字符', 'rm\\r-rf\\r/tmp/x', 'rm -rf'],
+      ['B1 git push', 'git\rpush origin main', 'git push'],
+      ['B1 npm publish', 'npm\rpublish', 'npm publish'],
+    ]) {
+      const hit = ha.dangerousCommandMatch(cmd)
+      if (!hit || hit.rule !== rule)
+        throw new Error(`v1.12.13: ${why} 未按预期命中（want ${rule}，got ${hit ? hit.rule : null}）`)
+    }
+    for (const cmd of ['echo hi\rworld', 'ls\r-l'])
+      if (ha.dangerousCommandMatch(cmd)) throw new Error(`v1.12.13: ${JSON.stringify(cmd)} 误报（CR 不是危险信号）`)
+    // M3：词内引号拼接（真会执行）
+    for (const cmd of ['r"m" -rf /tmp/x', "r'm' -rf /tmp/x", 'g"it" push origin main', 'n"pm" publish'])
+      if (!ha.dangerousCommandMatch(cmd)) throw new Error(`v1.12.13: ${JSON.stringify(cmd)} 变 MISS（M3 回归）`)
+    for (const cmd of ["it's a normal message", 'echo "df -h"', "echo 'ls -l'", 'echo "git status"'])
+      if (ha.dangerousCommandMatch(cmd)) throw new Error(`v1.12.13: ${JSON.stringify(cmd)} 误报（M3 扩大了误伤面）`)
+    // B3：超长模式串不许抛、内置三串照常命中
+    for (const bad of ['x'.repeat(32768), 'a b'.repeat(20000)]) {
+      writeCfg({ patterns: [bad] })
+      if (ha.dangerousCommandMatch('echo hi')) throw new Error('v1.12.13: 超长模式串被当成有效模式了')
+      for (const [cmd, rule] of [['rm -rf /tmp/x', 'rm -rf'], ['git push origin main', 'git push'], ['npm publish', 'npm publish']])
+        if (ha.dangerousCommandMatch(cmd)?.rule !== rule)
+          throw new Error(`v1.12.13: 超长模式串把内置串带没了（${cmd}）`)
+    }
+    // B2：FIFO / 设备 / 目录 ⇒ <50ms 回退内置，不抛不挂
+    const { execFileSync } = await import('node:child_process')
+    const { symlinkSync } = await import('node:fs')
+    const fresh = () => { try { rmSync(cfg, { force: true, recursive: true }) } catch {} }
+    const cases = [
+      ['FIFO', () => { fresh(); execFileSync('mkfifo', [cfg]) }],
+      ['/dev/zero 软链', () => { fresh(); symlinkSync('/dev/zero', cfg) }],
+      ['目录', () => { fresh(); mkdirSync(cfg, { recursive: true }) }],
+    ]
+    for (const [name, mk] of cases) {
+      mk()
+      ha.resetDangerPatternCache()
+      const t0 = process.hrtime.bigint()
+      const hit = ha.dangerousCommandMatch('echo hi')
+      const ms = Number(process.hrtime.bigint() - t0) / 1e6
+      if (hit) throw new Error(`v1.12.13: ${name} 下普通文本误报`)
+      if (ms >= 50) throw new Error(`v1.12.13: ${name} 下判定耗时 ${ms.toFixed(1)}ms（≥50ms ⇒ 又阻塞了）`)
+      if (JSON.stringify(ha.dangerTextPatterns()) !== JSON.stringify(ha.DEFAULT_DANGER_PATTERNS))
+        throw new Error(`v1.12.13: ${name} 下没有回退内置三串`)
+      if (ha.dangerousCommandMatch('rm -rf /tmp/x')?.rule !== 'rm -rf')
+        throw new Error(`v1.12.13: ${name} 下内置三串不生效`)
+    }
+    // Minor 4：缺失文件静默；空文件静默；坏 JSON 告警一次（这里只断言不抛 + 回退）
+    try { rmSync(cfg, { force: true, recursive: true }) } catch {}
+    ha.resetDangerPatternCache()
+    if (ha.dangerousCommandMatch('echo hi')) throw new Error('v1.12.13: 缺失配置下普通文本误报')
+    if (JSON.stringify(ha.dangerTextPatterns()) !== JSON.stringify(ha.DEFAULT_DANGER_PATTERNS))
+      throw new Error('v1.12.13: 缺失配置下没有回退内置三串')
+    // Minor 5：含字面转义的追加模式要生效（全文层扫全部变体）
+    writeCfg({ patterns: ['foo\\nbar'] })
+    if (ha.dangerousCommandMatch('foo\\nbar')?.rule !== 'text:custom:foo\\nbar')
+      throw new Error('v1.12.13: 含字面转义的追加模式配了不生效（Minor 5 回归）')
+    // Minor 7 + 跨仓常量对齐：追加条数上限 **1024**（1025 条 ⇒ 只生效前 1024 条）
+    writeCfg({ patterns: Array.from({ length: 1025 }, (_, i) => 'zzpat' + i) })
+    if (ha.dangerTextPatterns().length !== ha.DEFAULT_DANGER_PATTERNS.length + 1024)
+      throw new Error(`v1.12.13: 追加条数上限不是 1024（实得 ${ha.dangerTextPatterns().length - ha.DEFAULT_DANGER_PATTERNS.length} 条追加项）`)
+    if (ha.dangerousCommandMatch('zzpat1023')?.rule !== 'text:custom:zzpat1023')
+      throw new Error('v1.12.13: 第 1024 条追加项没有生效')
+    if (ha.dangerousCommandMatch('zzpat1024')) throw new Error('v1.12.13: 超限条目被当成有效模式了')
+    // 三档上限（与 B 仓逐字一致）：文件 ≤1MiB、单串 ≤4096、追加条数 ≤1024
+    if (!/const MAX_DANGER_CONFIG_BYTES = 1 << 20/.test(codeV13)
+      || !/const MAX_DANGER_PATTERN_CHARS = 4096/.test(codeV13)
+      || !/const MAX_DANGER_PATTERN_COUNT = 1024/.test(codeV13))
+      throw new Error('v1.12.13: 三档上限（1MiB / 4096 / 1024）与 B 仓不一致')
+    if (ha.dangerousCommandMatch('rm -rf /tmp/x')?.rule !== 'rm -rf')
+      throw new Error('v1.12.13: 超限后内置串不生效（超限≠关闭）')
+  } finally {
+    if (origHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = origHome
+    ha.resetDangerPatternCache()
+    rmSync(tmpHome, { recursive: true, force: true })
+  }
+}
+
+// ── v1.12.13 收尾：终审（4 Major / 7 Nit）的守卫 ─────────────────────────────
+{
+  const ha2 = await import('./lib/host-approval.js')
+  const fsMod = (await import('node:fs')).default
+  const osM = await import('node:os')
+  const pathM = (await import('node:path')).default
+  const code2 = rf(new URL('./lib/host-approval.js', import.meta.url), 'utf8')
+
+  // M-d（**本轮只订正注释，不改热路径**）：注释必须与实现一致 ——「未配置时每次判定都付一次失败 statSync」
+  if (!/每次判定都要付一次失败的 `statSync`/.test(code2))
+    throw new Error('v1.12.13 收尾: 配置缺失态的 statSync 开销注释与实际不符了（M-d 回归）')
+  if (/DANGER_CONFIG_ABSENT_RECHECK_MS|dangerPatternsAbsentFile/.test(code2))
+    throw new Error('v1.12.13 收尾: 出现负缓存实现（本轮已裁定取消、登记为下版本待办）')
+
+  // M-c：B3 的威胁模型在**首次 exec 期**（V8 惰性编译）—— 构造不抛、exec 抛「too large」
+  const buildV = (p) => {
+    const parts = p.split(/\s+/).filter(Boolean).map((q) => q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    return `(?<![A-Za-z0-9_-])${parts.join('[\\s"`\']+')}(?![A-Za-z0-9_-])`
+  }
+  const bigRe = new RegExp(buildV('a'.repeat(32768)), 'i') // 构造成功（不抛）
+  let threwTooLarge = false
+  try { bigRe.exec('zzz') } catch (e) { threwTooLarge = /too large/.test(String(e && e.message)) }
+  if (!threwTooLarge) throw new Error('v1.12.13 收尾: B3「首次 exec 抛 too large」不再复现（威胁模型变了？）')
+  const worstSrc = buildV(('* '.repeat(1400)).slice(0, 4096))
+  if (worstSrc.length > 20600)
+    throw new Error(`v1.12.13 收尾: 4096 上限下的最坏正则源 ${worstSrc.length} 越过安全线（触发点 32,803）`)
+  if (new RegExp(worstSrc, 'i').exec('zzz') !== null)
+    throw new Error('v1.12.13 收尾: 上限内最坏形态构造/exec 不可用')
+
+  // M-b 计数行为牙（承重件是「NONBLOCK fd + 有界 readSync」，不是类型判定本身）：
+  // 非普通文件（目录）档 readSync = 0 / openSync = 1；正常文件档 readSync ≥ 1
+  {
+    const home2 = mkdtempSync(path.join(osM.tmpdir(), 'dsh-verify-mb-'))
+    const origHome2 = process.env.DSH_HOME
+    process.env.DSH_HOME = home2
+    const cfg2 = pathM.join(home2, 'data', 'dsh-danger-patterns.json')
+    mkdirSync(pathM.dirname(cfg2), { recursive: true })
+    mkdirSync(cfg2, { recursive: true }) // 目录 = 非普通文件
+    ha2.resetDangerPatternCache()
+    const realOpen = fsMod.openSync
+    const realRead = fsMod.readSync
+    const counts = { open: 0, read: 0 }
+    fsMod.openSync = (...a) => { counts.open += 1; return realOpen(...a) }
+    fsMod.readSync = (...a) => { counts.read += 1; return realRead(...a) }
+    try {
+      if (ha2.dangerousCommandMatch('echo hi')) throw new Error('v1.12.13 收尾: 目录配置下普通文本误报')
+      if (counts.read !== 0)
+        throw new Error(`v1.12.13 收尾: 非普通文件档 readSync = ${counts.read}（必须 0：判类型要在读之前）`)
+      if (counts.open !== 1) throw new Error(`v1.12.13 收尾: 非普通文件档 openSync = ${counts.open}（应为 1）`)
+      rmSync(cfg2, { recursive: true, force: true })
+      writeFileSync(cfg2, JSON.stringify({ patterns: ['kubectl delete ns'] }))
+      ha2.resetDangerPatternCache()
+      counts.open = 0; counts.read = 0
+      if (ha2.dangerousCommandMatch('kubectl delete ns prod')?.rule !== 'text:custom:kubectl delete ns')
+        throw new Error('v1.12.13 收尾: 正常文件档追加项不生效')
+      if (counts.read < 1)
+        throw new Error(`v1.12.13 收尾: 正常文件档 readSync = ${counts.read}（退回 readFileSync ⇒ 无界读回归）`)
+    } finally {
+      fsMod.openSync = realOpen
+      fsMod.readSync = realRead
+      if (origHome2 === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = origHome2
+      ha2.resetDangerPatternCache()
+      rmSync(home2, { recursive: true, force: true })
+    }
+  }
 }
 
 console.log(`OK: ${PKG_NAME} v${pkg.version} 一致性链（无内置 Agent）+ ${tools.length} 工具 + /${commands.join('/')} 命令`)
