@@ -146,15 +146,17 @@ jobs:
       #      M-d 的负缓存**本轮取消实现** ⇒ 不加用例，只订正注释与文档）；
       #      「类型判定只靠 fd」那条改成**源码守卫 + 计数行为牙**（FIFO 档 readSync=0 / statSync=1、
       #      正常档 readSync≥1）；`no-relaxation` 的 G5 与 gate 的 B1 组不动。
-      #   ⑧ 用例条数：593（1.12.7 基线）→ … → 667（1.12.12）→ 700（1.12.13）→ **713**（1.12.14：
-      #      新增 test/invariants-1-12-14.test.js 12 条；1.12.14 的语义翻转与文案订正净 +1）。
-      #   **MIN_TESTS 故意留 2 条余量（713 - 2 = 711）**：`test/host-0.2-compat.test.js` 里有一条硬编码
+      #   ⑧ 用例条数：593（1.12.7 基线）→ … → 667（1.12.12）→ 700（1.12.13）→ 713（1.12.14）→
+      #      **735**（1.12.15：新增 test/danger-permission-dialog.test.js 15 条 = dangerAskOf 判据 5 +
+      #      黄球 6 + 蓝球 4；test/permission-pending.test.js +7 条归因透传。渲染半用生产源码切片 +
+      #      假 DOM 执行，数据半用生产版 serializePermissionPending，所以两边各计一次不是重复覆盖）。
+      #   **MIN_TESTS 故意留 2 条余量（735 - 2 = 733）**：`test/host-0.2-compat.test.js` 里有一条硬编码
       #   macOS 路径的用例，在 ubuntu runner 上会 **skip**（`SKIPPED_ALLOWED: 1` 正是为它留的）⇒
-      #   CI 实际 pass 期望 712；若把 MIN_TESTS 钉到 713 会因这条 skip 直接红（余量 0 太脆）。
+      #   CI 实际 pass 期望 734；若把 MIN_TESTS 钉到 735 会因这条 skip 直接红（余量 0 太脆）。
       # 新增用例时请一起把这个数抬上去。
       - name: 单元 / 集成测试（含用例条数守卫）
         env:
-          MIN_TESTS: 711
+          MIN_TESTS: 733
           SKIPPED_ALLOWED: 1
         run: |
           set -uo pipefail

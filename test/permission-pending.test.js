@@ -330,3 +330,93 @@ describe('v1.12.7 裁定 B：grantTier/Reason/Dropped 的展示（含老对端�
     assert.match(t, /已结束\(rejected\)/, '未知/失败结局照旧如实显示')
   })
 })
+
+// ── v1.12.15（用户裁定）：高危归因的透传半 ────────────────────────────────────
+// 渲染半（只出「允许一次」「拒绝」两个按钮）见 test/danger-permission-dialog.test.js；
+// 这里钉的是**数据链**：产品侧 0.7.16 在危险 ASK 的 pending 事件里带
+// askReason/dangerRule/dangerSegment/dangerCommand/dangerCommandOmitted，
+// A 侧 markPermissionPending 记账 → serializePermissionPending 输出 → 前端拿到。
+// 两个方向都要钉：① 有归因时逐字透传（面板据此才写得出「高危操作权限申请」+ 命令正文）；
+// ② 没有归因时归 null/0，前端才会按原普通卡渲染——**不得**凭空造出一个高危形态，
+//    也不得反过来把高危询问降级成"可以记住"的普通询问。
+describe('v1.12.15 高危归因透传：danger 询问带四件套，其余一律 null/0（判定零变更）', () => {
+  const dangerPayload = (over = {}) => ({
+    childId: 'ext-1', permId: 'tc-1#1', product: 'qoder', toolName: 'Bash',
+    description: 'Allow bash?', paths: ['/tmp/a'],
+    askReason: 'danger', dangerRule: 'rm -rf', dangerSegment: 'rm -rf /tmp/a',
+    dangerCommand: 'cd /x && rm -rf /tmp/a', dangerCommandOmitted: 0, ...over,
+  })
+
+  it('危险 ASK：五个归因字段原样进 REST（前端只认这些才敢收成两个按钮）', () => {
+    const out = serializePermissionPending([dangerPayload()], null)
+    const r = out.permissionPending
+    assert.equal(r.askReason, 'danger')
+    assert.equal(r.dangerRule, 'rm -rf')
+    assert.equal(r.dangerSegment, 'rm -rf /tmp/a')
+    assert.equal(r.dangerCommand, 'cd /x && rm -rf /tmp/a')
+    assert.equal(r.dangerCommandOmitted, 0)
+    assert.equal(out.permissionPendingList[0].dangerRule, 'rm -rf', '列表半份也要有（新客户端读 List）')
+  })
+
+  it('逐字：连续空白、制表符、换行、首尾空格一律不得 trim/折叠（用户靠这些字符分辨是哪条命令）', () => {
+    const raw = '  cd /tmp   &&\trm  -rf\t/tmp/a\n尾'
+    const out = serializePermissionPending([dangerPayload({ dangerSegment: raw, dangerCommand: raw })], null)
+    assert.equal(out.permissionPending.dangerSegment, raw, 'suggestedDirs 那种清洗范式（strList）绝不许用在归因上')
+    assert.equal(out.permissionPending.dangerCommand, raw)
+  })
+
+  it('非危险询问 ⇒ askReason:null + 三个文本:null + 省略数:0（老 payload 没有这些字段同样降级可用）', () => {
+    const out = serializePermissionPending([{ childId: 'ext-1', permId: 'p#1', product: 'qoder', description: 'Allow reading?' }], null)
+    const r = out.permissionPending
+    assert.equal(r.askReason, null)
+    assert.deepEqual([r.dangerRule, r.dangerSegment, r.dangerCommand], [null, null, null])
+    assert.equal(r.dangerCommandOmitted, 0)
+    assert.deepEqual(JSON.parse(JSON.stringify(out)).permissionPending.askReason, null, 'null 而非 undefined：REST 响应不得出现字段缺失')
+  })
+
+  it('归因取值不可信时的收敛：askReason 只认 danger，非字符串/空串归 null，省略数非有限或负数归 0', () => {
+    const out = serializePermissionPending([dangerPayload({
+      askReason: 'sandbox-escalation', dangerRule: 123, dangerSegment: '', dangerCommand: { x: 1 }, dangerCommandOmitted: -5,
+    })], null)
+    assert.equal(out.permissionPending.askReason, null, '别的询问原因（如沙箱升级）不得冒用高危形态')
+    assert.equal(out.permissionPending.dangerRule, null)
+    assert.equal(out.permissionPending.dangerSegment, null)
+    assert.equal(out.permissionPending.dangerCommand, null)
+    assert.equal(out.permissionPending.dangerCommandOmitted, 0)
+    const nan = serializePermissionPending([dangerPayload({ dangerCommandOmitted: '很多' })], null)
+    assert.equal(nan.permissionPending.dangerCommandOmitted, 0, '省略数必须是数字，否则宁可不报也不能报个假的')
+  })
+
+  it('只有 dangerRule 没有 askReason（原生通道/老 B 载荷）⇒ 规则名照样透传，任一信号都够前端判高危', () => {
+    const out = serializePermissionPending([dangerPayload({ askReason: undefined })], null)
+    assert.equal(out.permissionPending.askReason, null)
+    assert.equal(out.permissionPending.dangerRule, 'rm -rf')
+  })
+
+  it('命令正文不在这一层二次截断（产品侧已按上限截并报了省略数，这里再截就是丢尾）', () => {
+    const long = 'rm -rf /tmp/a && ' + 'y'.repeat(20000)
+    const out = serializePermissionPending([dangerPayload({ dangerCommand: long, dangerCommandOmitted: 1234 })], null)
+    assert.equal(out.permissionPending.dangerCommand.length, long.length)
+    assert.equal(out.permissionPending.dangerCommandOmitted, 1234, '上游报的省略数原样带上，前端据此如实说明"另有 N 个字符未展示"')
+  })
+
+  it('markPermissionPending 记账这四个字段，同 permId 重发（带归因）时就地更新不丢', () => {
+    const d = boot()
+    const entry = activeEntry('child-A')
+    d.activeChildren.set('child-A', entry)
+    d.markPermissionPending({ ...dangerPayload(), childId: 'child-A', permId: 'tc#1' })
+    const rec = entry.permissionPending[0]
+    assert.equal(rec.askReason, 'danger')
+    assert.equal(rec.dangerSegment, 'rm -rf /tmp/a')
+    d.markPermissionPending({ ...dangerPayload({ dangerSegment: 'rm -rf /tmp/b' }), childId: 'child-A', permId: 'tc#1' })
+    assert.equal(entry.permissionPending.length, 1, '同 permId 不堆重复行')
+    assert.equal(entry.permissionPending[0].dangerSegment, 'rm -rf /tmp/b', '重发以最新归因为准')
+    const plain = boot()
+    const pe = activeEntry('child-B')
+    plain.activeChildren.set('child-B', pe)
+    plain.markPermissionPending({ childId: 'child-B', permId: 'tc#9', product: 'qoder', description: 'R' })
+    assert.equal(pe.permissionPending[0].askReason, null)
+    assert.equal(pe.permissionPending[0].dangerRule, null)
+    assert.equal(serializePermissionPending(pe.permissionPending, null).permissionPending.dangerCommandOmitted, 0)
+  })
+})

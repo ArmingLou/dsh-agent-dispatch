@@ -1,3 +1,70 @@
+## 1.12.15（2026-10-07）
+
+> 一句话：**高危操作触发的授权询问，两个球都改成专用形态** —— 标题只写「高危操作权限申请」，
+> 按钮只有「允许一次」「拒绝」，并把**触发它的命令内容原样摊出来**；非高危询问的渲染一字未动。
+> 危险命令门、授权档位、落盘规则与全部判据**一字未动**（本版是载荷字段 + 渲染分流）。
+
+> 用户原话：「碰到是高危情况下 的悬浮球弹出，只需要提示 **高危操作权限申请**，这种情况下，
+> 按钮操作 只需要提供 **允许一次** 和 **拒绝**。」追加硬要求：「需要保留**相关命令的操作内容**」；
+> 范围追问：「主代理蓝色悬浮球和子代理黄色悬浮球都改吗？」→ **两处都要改**。
+
+### 现场（为什么必须改）
+
+`dispatches.jsonl` 实拍：15:30:46 `action=danger-command-block rule="rm -rf"` 之后，
+15:31:31 `action=rule-tool-disk` 真写进了一条 `main:bash` 工具档 —— 用户在危险命令的弹框上
+看到了「本会话总是允许该工具 / 总是允许(项目)」和「（本会话将记住：qoder:bash）」。
+那句是**错误承诺**（危险门与档位无关，写了下次照样问），而旧渲染只给 `description` 的前 160
+字符，**命中片段落在命令尾部时用户根本看不见 `rm -rf`**，于是把高危请求当普通请求点了允许。
+
+### Added —— 专用形态与归因透传
+
+- **归因字段（数据链）**：`lib/dispatch.js` 的 `markPermissionPending` 记账、`serializePermissionPending`
+  透传 `askReason / dangerRule / dangerSegment / dangerCommand / dangerCommandOmitted`
+  （`lib/dispatch.js:488-492`、`lib/dispatch.js:1580-1584`；取值器 `dangerText:442` 只做形态检查，
+  **绝不 trim、绝不折叠空白**——连续空格与大小写都是用户分辨命令的依据）。
+- **宿主原生通道**：`index.js:434`、`index.js:459` 把 `askReason:'danger'` 与命中片段写进暂存上下文，
+  随 `/agent-api/host-approval-context` 整份回传；命令正文沿用上下文里已有的 `commandText / argsText`，
+  不复制第二份。
+- **共用渲染件**（两球同一入口，判据只写一遍）：`lib/client.js:945-1074` ——
+  `DANGER_ASK_TITLE:968`、`dangerAskCommandOf:978`（候选序 `dangerCommand → commandText → argsText`，
+  **优先真的包含命中片段那一份**）、`dangerAskOf:996`、`buildDangerAskRow:1011`（标题 + 规则名 +
+  触发片段原文 + 命令正文 `<pre>`（`white-space:pre-wrap`，`max-height:180px` 可滚动）+ 省略说明 +
+  **恰好两个按钮** `1070-1071`）。
+- **黄球（ACP 子代理）**：`lib/client.js:4389-4406` 整行短路；`allow-once` **不带 paths**，
+  不开目录编辑弹框、不 POST 任何规则。
+- **蓝球（宿主原生主代理）**：`lib/client.js:4704-4718` 同一短路 + `5094-5099` 上下文回填补齐归因；
+  `item.answer("allowed-once")` 不触发 `openGrantDialog`。ACP 孪生不是第三处渲染（原生条目最终仍由蓝球
+  `renderPop` 出），随蓝球一起覆盖。
+- **展示上限**：命令正文最多 20000 字符（与产品侧 `MAX_DANGER_COMMAND_CHARS` 跨仓同值），
+  超限**如实报「另有 N 个字符未展示」**而不是静默截断；命中片段本身永不截断。
+
+### 降级契约（本版显式定义，由用例钉住）
+
+- 归因信号**两个都认**：`askReason === 'danger'` **或** `dangerRule` 非空 ⇒ 专用形态。
+- 只有 `askReason` 没有规则名 ⇒ 仍走专用形态，规则位如实写「未标注规则名」。
+- 两个信号都没有 ⇒ 判不出原因 ⇒ **保持今天的行为**（渲染原普通卡，一字不变）。归因完全由
+  `dsh-plugin-product-subagents ≥ 0.7.16` 负责产出；**本仓不做任何本地重扫兜底**（用户裁定：
+  不在渲染层复制一份危险判定，避免两仓漂移）。因此**黄球那一半必须两仓一起上**才生效，
+  蓝球那一半只依赖本仓。
+- 非高危询问的四个按钮、`permGrantTip` 的「（本会话将记住：…）」、目录编辑弹框、落盘档位**全部原样**。
+
+### Tests
+
+- `node --test test/*.test.js`：**735 / 735**（713 → 735）；`node verify.mjs`：**exit 0**。
+- 新增 `test/danger-permission-dialog.test.js` 15 条（判据 5 + 黄球 6 + 蓝球 4：按钮集合恰好
+  = `{允许一次, 拒绝}`、无「将记住」文案、尾部命中可见、点允许一次不写档、非高危四按钮防回归）；
+  `test/permission-pending.test.js` +7 条归因透传（含不可信取值收敛、逐字不 trim、不在序列化层二次截断）。
+- 反退化读数：`no-relaxation-1-12-12` 7/7、`invariants-1-12-{6,7,10,11,12,13,14}` 18/21/15/16/14/26/12、
+  `perm-fab-jump` 23/23（高危行**不绑整行跳转**，故 `permTip(` 计数与 `openSelf` 绑定的结构不变量未动）。
+- 变异自证 4 条全部转红后逐字节还原：黄球短路关掉 → 6 红；蓝球短路关掉 → 3 红；
+  本仓序列化层去掉归因 → 10 红（全量 725/735）；产品侧 emit 去掉归因 → 对端 wiring 4 红。
+- `ci.yml` 的 `MIN_TESTS` 711 → **733**（= 735 − 那条已登记 macOS skip 的 2 条余量）。
+
+### 跨仓
+
+`dsh-plugin-product-subagents` 同批发 **0.7.16**（危险门 ASK 的 pending 载荷补归因五字段）。
+两仓一起部署；载荷是**加法字段**，旧客户端忽略未知键，滚动升级不炸。
+
 ## 1.12.14（2026-10-06）
 
 > 一句话：**修「二级选择『落盘工具放行任意路径』没落盘」的缺口**，并按用户裁定**放开

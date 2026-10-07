@@ -425,7 +425,14 @@ export function apply(ctx, config = {}) {
             segment: `commandText 超长（${ctxInfo.commandText.length} 字符 > ${MAX_DANGER_TEXT_CHARS}）`,
           }
           if (req.callId) {
-            hostApproval.pushPendingContext(req.callId, { ...ctxInfo, sessionId, rootSessionId, dangerRule: tooLong.rule })
+            // v1.12.15：除了门名，还要把归因（为什么问）与**命中片段**一起暂存——
+            // 客户端 GET /agent-api/host-approval-context 拿到的是这份上下文，
+            // 高危专用弹框靠它显示「高危操作权限申请」+ 片段 + 命令正文（正文本身
+            // 早已随 ctxInfo 在上下文里，这里不再复制一份）。
+            hostApproval.pushPendingContext(req.callId, {
+              ...ctxInfo, sessionId, rootSessionId,
+              askReason: 'danger', dangerRule: tooLong.rule, dangerSegment: tooLong.segment,
+            })
           }
           logApproval(
             `宿主审批不自动放行（${COMMAND_TOO_LONG_RULE}：执行类命令正文超过有界判定的上限）: ` +
@@ -446,7 +453,11 @@ export function apply(ctx, config = {}) {
           // 暂存上下文在上面（门前）已写入——写侧依赖它，位置不能挪；这里按同一 callId
           // **覆盖**一份带门名的（peekPendingContext 读到的是这一份）。
           if (req.callId) {
-            hostApproval.pushPendingContext(req.callId, { ...ctxInfo, sessionId, rootSessionId, dangerRule: danger.rule })
+            // v1.12.15：同超长门——归因 + **命中片段**入上下文（命令正文已在 ctxInfo 里）。
+            hostApproval.pushPendingContext(req.callId, {
+              ...ctxInfo, sessionId, rootSessionId,
+              askReason: 'danger', dangerRule: danger.rule, dangerSegment: danger.segment,
+            })
           }
           logApproval(
             `宿主审批不自动放行（危险命令排除门命中 ${danger.rule}）: ` +
