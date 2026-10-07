@@ -1347,9 +1347,21 @@ describe('U2 琥珀通道：sendDecision 按契约透传 paths（不传＝产品
   })
 
   it('面板不得把整条 paths 原文摊到不必要的地方（U1 最小化）', () => {
-    const tipBody = src.slice(src.indexOf('function permGrantTip(p) {'), src.indexOf('let grantDialogOpen'))
+    // v1.12.16 订正锚点范围：原来切片一路取到 `let grantDialogOpen`，而 1.12.15 把高危
+    // 共用件（DANGER_ASK_TITLE…buildDangerAskRow）插进了这段区间 ⇒ 这两条断言会把
+    // 「高危弹框」也当成"提示文案"在管。本意只管 permGrantTip 一个函数，就按它的函数体锚。
+    // 路径列表在**蓝球高危行**是该显示的上下文（与普通行同源，见
+    // test/danger-permission-dialog.test.js 的同源用例）；黄球那条通道本轮没加，
+    // 由下面第二条继续钉住。
+    const tipStart = src.indexOf('function permGrantTip(p) {')
+    assert.ok(tipStart >= 0, 'permGrantTip 锚点丢失')
+    const tipBody = src.slice(tipStart, src.indexOf('\n    }', tipStart) + 5)
+    assert.ok(tipBody.includes('本次仅放行一次'), 'permGrantTip 切片边界被改写（没覆盖整个函数）')
     assert.doesNotMatch(tipBody, /return[^;]*p\.paths/, '提示文案里不许拼原始路径')
     assert.doesNotMatch(tipBody, /join\("\\n"\)/, '提示不是路径列表')
+    const amber = src.slice(src.indexOf('function mountPermFab() {'), src.indexOf('function mountHostApprovalFab'))
+    assert.ok(amber.length > 0, '黄球面板锚点丢失')
+    assert.doesNotMatch(amber, /join\("\\n"\)/, '黄球那条通道仍不许把整条 paths 原文摊成列表')
   })
 })
 

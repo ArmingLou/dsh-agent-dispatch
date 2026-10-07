@@ -146,17 +146,18 @@ jobs:
       #      M-d 的负缓存**本轮取消实现** ⇒ 不加用例，只订正注释与文档）；
       #      「类型判定只靠 fd」那条改成**源码守卫 + 计数行为牙**（FIFO 档 readSync=0 / statSync=1、
       #      正常档 readSync≥1）；`no-relaxation` 的 G5 与 gate 的 B1 组不动。
-      #   ⑧ 用例条数：593（1.12.7 基线）→ … → 667（1.12.12）→ 700（1.12.13）→ 713（1.12.14）→
-      #      **735**（1.12.15：新增 test/danger-permission-dialog.test.js 15 条 = dangerAskOf 判据 5 +
-      #      黄球 6 + 蓝球 4；test/permission-pending.test.js +7 条归因透传。渲染半用生产源码切片 +
-      #      假 DOM 执行，数据半用生产版 serializePermissionPending，所以两边各计一次不是重复覆盖）。
-      #   **MIN_TESTS 故意留 2 条余量（735 - 2 = 733）**：`test/host-0.2-compat.test.js` 里有一条硬编码
+      #   ⑨ 用例条数：735（1.12.15）→ **748**（1.12.16：高危专用行的两处缺口修复——
+      #      黄球高危行补「↗ 打开该子代理会话」入口（复用普通行的 openSelf 闭包）+5 条；
+      #      蓝球高危行补 `ha-reason` / `ha-paths` / `ha-cwd` 三行上下文（与普通行同源）+5 条；
+      #      `test/grant-dialog.test.js` 一条既有源码锚点按本意收窄到 `permGrantTip` 函数体，
+      #      并新增「两条通道区间内不许出现 join("\n")」的全局断言 ⇒ 净 +13 条用例）。
+      #   **MIN_TESTS 故意留 2 条余量（748 - 2 = 746）**：`test/host-0.2-compat.test.js` 里有一条硬编码
       #   macOS 路径的用例，在 ubuntu runner 上会 **skip**（`SKIPPED_ALLOWED: 1` 正是为它留的）⇒
-      #   CI 实际 pass 期望 734；若把 MIN_TESTS 钉到 735 会因这条 skip 直接红（余量 0 太脆）。
+      #   CI 实际 pass 期望 747；若把 MIN_TESTS 钉到 748 会因这条 skip 直接红（余量 0 太脆）。
       # 新增用例时请一起把这个数抬上去。
       - name: 单元 / 集成测试（含用例条数守卫）
         env:
-          MIN_TESTS: 733
+          MIN_TESTS: 746
           SKIPPED_ALLOWED: 1
         run: |
           set -uo pipefail

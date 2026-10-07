@@ -224,7 +224,8 @@ async function mountAmberRow(permissionPending, extra = {}) {
   const sp = spies()
   const posts = []
   const entry = {
-    childId: extra.childId || 'child-A',
+    // `childId: null` 是显式用例（缺子代理标识的降级分支），不能退化成 'child-A'
+    childId: 'childId' in extra ? extra.childId : 'child-A',
     agentId: extra.agentId || 'coder',
     agentName: extra.agentName || '编码子代理',
     parentSessionId: 'parent-1',
@@ -233,6 +234,7 @@ async function mountAmberRow(permissionPending, extra = {}) {
   const mount = compilePermFab({
     document: doc,
     openGrantDialog: sp.openGrantDialog,
+    openAgentSession: extra.openAgentSession,
     apiGet: () => Promise.resolve({ active: [entry] }),
     apiPost: (route, body) => { posts.push([route, body]); return Promise.resolve({ ok: true }) },
   })
@@ -243,7 +245,8 @@ async function mountAmberRow(permissionPending, extra = {}) {
   ball.click()
   const rows = byClass(doc.body, 'ad-perm-item')
   assert.equal(rows.length, 1, `琥珀球列表应恰好渲染 1 行，实际 ${rows.length}`)
-  return { doc, row: rows[0], posts, spyCalls: sp.calls, ball }
+  const [pop] = byClass(doc.body, 'ad-perm-pop')
+  return { doc, row: rows[0], pop, posts, spyCalls: sp.calls, ball }
 }
 
 /** 蓝球：注册 approval/request → 服务端上下文回传 → 点球展开列表 */
@@ -491,5 +494,221 @@ describe('v1.12.15 蓝球（宿主原生审批通道）：dangerRule 命中同�
     const { row } = await mountHostRow({ ...nativeCtx, askReason: null, dangerRule: null, dangerSegment: null, commandText: '' })
     assert.deepEqual(buttonLabels(row), ['允许一次', '本会话总是允许该工具', '总是允许(项目)', '拒绝'])
     assert.doesNotMatch(row.textContent, /高危操作权限申请/)
+  })
+})
+
+// ── v1.12.16（用户实测反馈）：高危行缺「跳转到对应子代理会话」──
+// 用户原话：「黄色浮球，高危弹窗，缺失了 **跳转到对应子代理会话** 的功能。普通权限弹窗有跳转功能。」
+// 普通行的跳转挂在**整行**（v1.11.14(E)：row.addEventListener("click", openSelf)），
+// 1.12.15 的整行短路把它一起短路掉了 ⇒ 高危行看得到命令、点不进对应会话。
+// 要钉住的是"**同一个实现**"而不是"长得像"：目标会话 id 来源、成功收起、三种失败文案
+// 都必须与普通行逐字一致（两处各写一遍必然漂移）。
+describe('v1.12.16 高危行的跳转子代理会话入口：与普通行同一实现、且不是决策按钮', () => {
+  /** 记录型跳转替身：@param result 替 openAgentSession 的三态返回（true / 'unverified' / false） */
+  const jumpSpy = (result = true) => {
+    const seen = []
+    return { seen, fn: (...args) => { seen.push(args); return Promise.resolve(result) } }
+  }
+
+  /** 浮层里出现过的提示行文案（permTip 的可观察面：普通行与高危行共用同一条降级路） */
+  const tipTexts = (doc) => byClass(doc.body, 'ad-perm-empty').map((n) => n.textContent)
+
+  /** 高危行的跳转入口（独立于决策按钮的那个） */
+  const jumpOf = (row) => {
+    const list = byClass(row, 'ad-danger-jump')
+    assert.equal(list.length, 1, `高危行必须恰好渲染 1 个跳转入口，实际 ${list.length}`)
+    return list[0]
+  }
+
+  it('高危行渲染跳转入口：可点、可键盘激活、有 title；决策按钮集合仍恰好 {允许一次, 拒绝}', async () => {
+    const { row } = await mountAmberRow(dangerPending())
+    assertDangerRow(row)
+    const jump = jumpOf(row)
+    assert.equal(jump.getAttribute('role'), 'button', '键盘/读屏要能识别这是一个入口')
+    assert.equal(jump.tabIndex, 0, '可 Tab 聚焦（与普通行整行的 tabIndex=0 同一形态）')
+    assert.ok(jump.title.length > 0, '入口要有和普通行整行 title 同义的解释文案')
+    assert.ok(jump.textContent.trim().length > 0, '入口要有可见文案')
+    assert.deepEqual(buttonLabels(row), ['允许一次', '拒绝'],
+      `跳转入口不得混进决策按钮集合，实际：${buttonLabels(row).join(' / ')}`)
+    assert.equal(byClass(jump, 'ad-btn').length, 0, '跳转入口不是 .ad-btn（不是决策按钮）')
+    const actions = byClass(row, 'ad-danger-actions')
+    assert.equal(actions.length, 1)
+    assert.equal(actions[0].contains(jump), false, '入口与决策按钮分离：不得渲染进操作行容器')
+  })
+
+  it('点跳转入口 ⇒ 用该行的 childId + parentSessionId 调 openAgentSession，且不投递任何决策', async () => {
+    const spy = jumpSpy(true)
+    const { row, posts, pop } = await mountAmberRow(dangerPending(), { openAgentSession: spy.fn })
+    jumpOf(row).click()
+    await flush()
+    assert.deepEqual(spy.seen, [['child-A', 'parent-1']], '目标会话 id 来源必须与普通行一致（childId + parentSessionId）')
+    assert.equal(posts.length, 0, '跳转不是决策：不得 POST permission-decision')
+    assert.equal(pop.classList.contains('visible'), false, '核实成功的跳转要收起浮层（与普通行同一语义）')
+  })
+
+  it('键盘 Enter 激活跳转入口（与普通行整行的 keydown 同一语义）', async () => {
+    const spy = jumpSpy(true)
+    const { row } = await mountAmberRow(dangerPending(), { openAgentSession: spy.fn })
+    jumpOf(row).fire('keydown', { key: 'Enter' })
+    await flush()
+    assert.deepEqual(spy.seen, [['child-A', 'parent-1']])
+  })
+
+  it('三种结果（未跳转 / 未核实 / 缺 childId）的文案与普通行**逐字相同**，失败时浮层保留', async () => {
+    const cases = [
+      { result: false, childId: 'child-A', expect: /无法自动跳转/ },
+      { result: 'unverified', childId: 'child-A', expect: /已请求打开该子代理会话，但未确认页面已切换/ },
+      { result: true, childId: null, expect: /该行缺少子代理标识，无法跳转/ },
+    ]
+    for (const c of cases) {
+      const danger = await mountAmberRow(dangerPending(), { openAgentSession: jumpSpy(c.result).fn, childId: c.childId })
+      jumpOf(danger.row).click()
+      await flush()
+      const dangerTips = tipTexts(danger.doc)
+      assert.equal(dangerTips.length, 1, `高危行跳转失败要给且只给一条可见指引，实际：${dangerTips.join(' / ')}`)
+      assert.match(dangerTips[0], c.expect)
+      assert.equal(danger.pop.classList.contains('visible'), true, '未核实成功不得收起浮层（用户还能重试）')
+
+      // 同一条数据渲染成普通行（去掉归因信号）时的文案 ⇒ 必须与高危行完全一致
+      const plain = await mountAmberRow({ ...dangerPending(), askReason: null, dangerRule: '', dangerSegment: '', dangerCommand: '' },
+        { openAgentSession: jumpSpy(c.result).fn, childId: c.childId })
+      assert.equal(byClass(plain.row, 'ad-danger-item').length, 0, '对照组必须是普通行')
+      plain.row.click()
+      await flush()
+      assert.deepEqual(tipTexts(plain.doc), dangerTips, `降级文案必须出自同一个实现（${c.expect}）`)
+    }
+  })
+
+  it('缺 childId 时不触碰导航 API（与普通行同：先判标识再跳转）', async () => {
+    const spy = jumpSpy(true)
+    const { row } = await mountAmberRow(dangerPending(), { openAgentSession: spy.fn, childId: null })
+    jumpOf(row).click()
+    await flush()
+    assert.deepEqual(spy.seen, [], '没有 childId 就不该调 openAgentSession')
+  })
+
+  it('跳转入口不影响「允许一次 / 拒绝」的投递：点入口不投递、点按钮不跳转', async () => {
+    const spy = jumpSpy(true)
+    const { row, posts } = await mountAmberRow(dangerPending(), { openAgentSession: spy.fn })
+    await clickBtn(row, '允许一次')
+    assert.deepEqual(spy.seen, [], '决策按钮不得触发跳转')
+    assert.equal(posts.length, 1)
+    assert.equal(posts[0][1].answer, 'allow-once')
+  })
+
+  it('非高危行仍然靠整行点击跳转（本轮没把普通行的接线改成入口按钮）', async () => {
+    const spy = jumpSpy(true)
+    const { row } = await mountAmberRow({ permId: 'tc-n#1', product: 'qoder', toolName: 'Bash', description: 'Allow bash?', paths: ['/x'] },
+      { openAgentSession: spy.fn })
+    assert.equal(byClass(row, 'ad-danger-jump').length, 0, '普通行没有独立入口，跳转挂在整行（v1.11.14(E) 原样）')
+    row.click()
+    await flush()
+    assert.deepEqual(spy.seen, [['child-A', 'parent-1']])
+  })
+
+  it('蓝球高危行**不**渲染跳转入口：蓝球普通行本来就没有跳转（不为对称发明新功能）', async () => {
+    const nativeCtx = {
+      toolName: 'Bash', paths: ['/tmp/a'], cwd: '/proj', rootSessionId: 'root-1', callId: 'call-1',
+      askReason: 'danger', dangerRule: 'rm -rf', dangerSegment: 'rm -rf /tmp/a', commandText: 'rm -rf /tmp/a',
+    }
+    const d = await mountHostRow(nativeCtx)
+    assertDangerRow(d.row)
+    assert.equal(byClass(d.row, 'ad-danger-jump').length, 0, '蓝球通道没有子代理会话可跳，不得凭空加入口')
+    const n = await mountHostRow({ ...nativeCtx, askReason: null, dangerRule: null, dangerSegment: null, commandText: '' })
+    assert.equal(byClass(n.row, 'ad-danger-jump').length, 0)
+    assert.equal(byClass(n.row, 'ad-ha-item')[0].getAttribute('role') || null, null, '蓝球普通行连整行点击都不是按钮形态')
+  })
+})
+
+// ── v1.12.16（用户裁定）：蓝球高危行补齐**上下文三行** ──
+// 蓝球普通行显示 原因(`ha-reason`) / 涉及路径(`ha-paths`) / 工作目录(`ha-cwd`)，
+// 而 1.12.15 的整行短路把三行一起短路掉了 ⇒ 高危时用户只看到规则名与命令，
+// 看不到「为什么弹、动到哪些路径、在哪个目录」。
+// 本轮只补渲染，且**口径必须由普通行钉住**：同一个 item 分别渲成高危行与普通行，
+// 三行的 class 与 textContent 必须逐字相同（另写一份截断/拼接规则就是下一处漂移）。
+// 数据只许来自同一次 host-approval-context 的回参（`item.reason/paths/cwd`）——
+// 不新造字段、不从命令正文里扫路径。
+describe('v1.12.16 蓝球高危行的上下文三行：与普通行同口径，且不碰按钮/跳转', () => {
+  const INFO_CLS = ['ha-reason', 'ha-paths', 'ha-cwd']
+  const ctxOf = (over = {}) => ({
+    toolName: 'Bash',
+    paths: ['/proj/src/a.ts', '/tmp/out'],
+    structuredPaths: ['/proj/src/a.ts'],
+    inferredPaths: [],
+    cwd: '/proj',
+    home: '/Users/x',
+    rootSessionId: 'root-1',
+    callId: 'call-1',
+    askReason: 'danger',
+    dangerRule: 'rm -rf',
+    dangerSegment: 'rm -rf /tmp/out',
+    commandText: 'cd /proj && rm -rf /tmp/out',
+    ...over,
+  })
+  /** 同一份上下文、去掉归因 ⇒ 渲染成普通行（对照用） */
+  const plainCtx = (c) => ({ ...c, askReason: null, dangerRule: null, dangerSegment: null, commandText: '' })
+  /** 按文档顺序取三行信息（[class, 文案]）——空值不渲染 ⇒ 数组更短 */
+  const infoLines = (row) => walk(row)
+    .filter((n) => INFO_CLS.includes(String(n.className || '')))
+    .map((n) => [n.className, n.textContent])
+
+  it('高危行渲染出三行，class 与文案和普通行**逐字同源**', async () => {
+    const c = ctxOf()
+    const reason = 'Run a shell command: cd /proj && rm -rf /tmp/out'
+    const d = await mountHostRow(c, { reason })
+    const n = await mountHostRow(plainCtx(c), { reason })
+    assertDangerRow(d.row)
+    assert.equal(infoLines(d.row).length, 3, `原因/路径/工作目录三行都要出现，实际：${JSON.stringify(infoLines(d.row))}`)
+    assert.deepEqual(infoLines(d.row), infoLines(n.row), '三行必须与普通行同 class、同文案（口径只有一份）')
+    const map = Object.fromEntries(infoLines(d.row))
+    assert.equal(map['ha-reason'], reason)
+    assert.equal(map['ha-paths'], c.paths.join('\n'), '路径逐行 join，与普通行一致')
+    assert.equal(map['ha-cwd'], '📁 ' + c.cwd, '工作目录带 📁 前缀，与普通行一致')
+    assert.match(d.row.textContent, /高危操作权限申请/, '补了三行也不能破掉高危形态')
+    assert.ok(d.row.textContent.includes('cd /proj && rm -rf /tmp/out'), '命令正文仍完整可见（没被信息行挤掉）')
+  })
+
+  it('三行是信息行：不进操作行容器、不是 .ad-btn，按钮集合仍恰好 {允许一次, 拒绝}，跳转入口仍为 0', async () => {
+    const { row } = await mountHostRow(ctxOf())
+    assert.deepEqual(buttonLabels(row), ['允许一次', '拒绝'],
+      `补信息行不得动决策按钮集合，实际：${buttonLabels(row).join(' / ')}`)
+    assert.equal(byClass(row, 'ad-danger-jump').length, 0, '用户已裁定：蓝球不加跳转入口')
+    const actions = byClass(row, 'ad-danger-actions')
+    assert.equal(actions.length, 1)
+    for (const [cls] of infoLines(row)) {
+      for (const el of byClass(row, cls)) {
+        assert.equal(actions[0].contains(el), false, `${cls} 不得渲染进操作行容器`)
+        assert.equal(String(el.className).split(/\s+/).includes('ad-btn'), false, `${cls} 不是按钮`)
+      }
+    }
+  })
+
+  it('字段为空 ⇒ 整行不渲染（与普通行同一守卫），不许出现空行或 "📁 null"', async () => {
+    const d = await mountHostRow({ ...ctxOf(), paths: [], cwd: null }, { reason: null })
+    assertDangerRow(d.row)
+    assert.deepEqual(infoLines(d.row), [], `空字段不该渲出信息行，实际：${JSON.stringify(infoLines(d.row))}`)
+    assert.doesNotMatch(d.row.textContent, /📁/, '没有 cwd 就不该出现目录行')
+    const n = await mountHostRow({ ...plainCtx(ctxOf()), paths: [], cwd: null }, { reason: null })
+    assert.deepEqual(infoLines(n.row), [], '普通行的同一守卫也是空 ⇒ 两边口径一致')
+  })
+
+  it('原因超 200 字符 ⇒ 截到 200（截断规则与普通行同一条），只有部分字段缺失时也只渲存在的那几行', async () => {
+    const long = 'rm -rf /tmp/out 的说明 ' + 'y'.repeat(300)
+    const d = await mountHostRow(ctxOf(), { reason: long })
+    assert.equal(Object.fromEntries(infoLines(d.row))['ha-reason'], long.slice(0, 200))
+    const partial = await mountHostRow({ ...ctxOf(), cwd: null }, { reason: long })
+    assert.deepEqual(infoLines(partial.row).map(([cls]) => cls), ['ha-reason', 'ha-paths'],
+      'cwd 缺失 ⇒ 只少目录那一行，原因与路径照常给（与普通行同）')
+  })
+
+  it('黄球不受影响：高危行不出现蓝球的 ha-* 三行，普通行仍是 p-name/p-desc', async () => {
+    const d = await mountAmberRow(dangerPending())
+    assertDangerRow(d.row)
+    assert.deepEqual(infoLines(d.row), [], '本轮只改蓝球高危行：黄球不传 info ⇒ 一行都不该多')
+    assert.deepEqual(buttonLabels(d.row), ['允许一次', '拒绝'])
+    assert.equal(byClass(d.row, 'ad-danger-jump').length, 1, '上一轮补的黄球跳转入口不能被本轮顶掉')
+    const n = await mountAmberRow({ permId: 'tc-n#1', product: 'qoder', toolName: 'Bash', description: 'Allow bash?', paths: ['/x'] })
+    assert.equal(byClass(n.row, 'p-name').length, 1, '黄球普通行仍是原来的信息行形态')
+    assert.deepEqual(infoLines(n.row), [])
   })
 })
