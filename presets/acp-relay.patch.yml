@@ -1,0 +1,301 @@
+# ⚠ 待人工合并片段 —— 本文件【不自动生效】，不会被任何构建/加载流程读取。
+#
+# 它是 `acp-relay` preset 的定义片段，供人工审核后**追加**到
+# `~/.dsh/profiles/web/cordis.patch.yml`（与既有的 `preset-orchestrator` 同层，
+# 见该文件 :128-175）。写入 `~/.dsh` 属高风险操作，须由用户明确授权后单独执行；
+# 本仓库不代为写入。
+#
+# 目的：收窄 ACP 中继子代理的本地工具面到**只剩** `product_submit`。
+# 背景与完整证据链见 `docs/agent-preset-migration.md`（§1.4 / §1.5 / §2 Q3）。
+#
+# ────────────────────────────────────────────────────────────────────────────
+# ★★ 一个已知风险（纸面结论，尚未实机验证 —— 放行前必须先验证）★★
+# ────────────────────────────────────────────────────────────────────────────
+#
+# 风险 ①：`tools.restrict()` 在 preset 层生效【尚未实机验证】，目前只是代码级推演。
+#   原文（docs/agent-preset-migration.md §4）：
+#     「**`restrict()` 在 preset 层生效的实机验证未做**（本文只做了代码级推演：
+#      §1.5 的 scope 链 + `admits` 交集）。第 3 步必须实机验证，这是整条链路唯一的
+#      「纸面结论」。」
+#   ⇒ 推演依据：preset 的行挂在 preset generation 的 scoped ctx 下
+#     （dsh-agent-preset-registry/lib/index.js:497-505、:219-236），子 agent scope 通过
+#     bindScopeParent 挂其下（:670），可见性判定是 layers.every(l => l.admits(name))
+#     （dsh-tools/lib/index.js:3050）。**但这整条链未在真机上跑过一次。**
+#   ⚠ 2026-10-15 更新：**机制级**已实测（真宿主模块 + 最小合成树，见下「本次判定」），
+#     结论与推演一致；但**真 profile + 真 Loader 树的整机挂载仍未跑过**，风险 ① 未完全解除。
+#
+# 风险 ②：`product_submit` 是否真在 preset scope 的 `restrictableNames`（= inherited 面）
+#   里 —— **本次已判定为「是」（代码级 + 机制级实测），不再是未知项**。
+#
+#   证据（**代码级判定**）：`product-subagents` 行是 profile 的**顶层行**
+#   （~/.dsh/profiles/web/cordis.patch.yml:35 `- id: product-subagents`，列 0，未被任何
+#   preset 的 plugins 列表包裹）⇒ 挂在**未 scope** 的 ctx 上 ⇒ 它 `ctx.tools.register()`
+#   的 `product_submit` 落 **global 层**：
+#     · 注册点：dsh-plugin-product-subagents/lib/index.js:960 `registerProductSubmit(ctx, deps)`
+#       （`apply` 收到的即行 ctx，**无条件**调用，不按 child 门控）；
+#       实际 register：同包 lib/tools/product-submit.js:64-67 `ctx.tools.register(defineTool({
+#       name: 'product_submit' … }))`。
+#     · global 层即 `restrictableNames` 的来源之一：dsh-tools/lib/index.js:3039。
+#
+#   【机制级实测】/tmp/probe-dsh/probe5.mjs 中 `product_submit` 以「profile 顶层行」方式注册，
+#   结果：`acp-relay` generation 的 `restrictableNames` **含 `product_submit`**，
+#   `allow=[product_submit]` → applied OK。（对照：`send_message` 以「preset 内部行」方式注册
+#   时**不在**该集合里，见 Q1。）
+#
+#   ⇒ 风险 ② **解除**：allow 里写 `product_submit` 不会 loud throw。
+#     （失败形态仅在本行改为挂在某 scope 下时才会重现：dsh-tools/lib/index.js:2983-2985 抛
+#      `tools.restrict() names unknown global tool "product_submit"; known global tools: …`
+#      由于本行与 preset 同生共死，**preset 会整体挂载失败**，不是静默降级。）
+#
+# ────────────────────────────────────────────────────────────────────────────
+# ⚠⚠ 上游前提缺口（本次定稿时发现，**独立于 Q1/Q2/Q3，但决定本 preset 是否会生效**）⚠⚠
+# ────────────────────────────────────────────────────────────────────────────
+#
+# **本 preset 目前根本不会被挂载**：派发期从未把 `agentPreset` 传给宿主。
+#
+#   证据（**代码级判定**）：`lib/dispatch.js` 里对 `startActivation` 的**唯一**调用点
+#   （:1151 `const { childId } = await start({`）构造的 spec 中，**没有任何 `agentPreset` 键**。
+#   实测过滤该对象字面量（去掉注释后）的实际键只有：
+#     · 顶层：`provider` / `label` / `signal` / `delivery` / `request`
+#     · `request` 内：`label` / `prompt` / `parent` / `persona` / `agentOptions` /
+#       `productSettings` / `toolFilter` / `maxDepth`
+#   全文件搜 `^\s*agentPreset\s*:`（作为**键**）⇒ **0 命中**；`git show HEAD:lib/dispatch.js`
+#   同样 0 命中 ⇒ 不是本次改动删掉的，而是**从未接上**。
+#   其余 `agentPreset` 出现处全是注释（dispatch.js:1172/1184/1186）或注册表字段归一化
+#   （lib/agents.js:130/131/184/185/221/222）与 GUI 下拉（lib/client.js）——**读盘存下了、
+#   派发时没人读**。
+#
+#   ⇒ 宿主侧因此走「未指定」分支：`composition: { agentPreset: request.agentPreset }`
+#     （dsh-subagent/lib/index.js:1452）中该字段为 `undefined` ⇒ `applyChildComposition`
+#     落到 `childCtx.get("agentPresets")?.composeFrom(childCtx, parent.ctx)`
+#     （dsh-subagent/lib/index.js:381）⇒ ACP 中继子代理**继承父会话的 preset**，
+#     而不是 `acp-relay`。
+#   ⇒ 这与 lib/relay-guard.js 模块头记录的现场症状**完全吻合**：
+#     「relay 子代理手里 **64 个工具**（与父会话相同）」——因为它拿的就是父会话
+#     （编排层 `orchestrator`）的工具面，而 `orchestrator` 的 delegation 组里有
+#     `send_message`（~/.dsh/profiles/web/cordis.patch.yml:239-242）。
+#
+#   ⚠ 这意味着：**本次 allow 定稿是对的，但只有把 `agentPreset` 接上派发期之后才会生效。**
+#     在接通之前，`acp-relay` preset 是「定义了但没人用」的死配置，收窄效果为 0，
+#     唯一实际生效的仍是 `lib/relay-guard.js` 的执行期闸。
+#     接通位置：`lib/dispatch.js:1151` 的 start spec 需补 `request.agentPreset`
+#     （取自 `this.registry.get(agentId).agentPreset`，即 lib/agents.js:184-185 存下的值）。
+#     本片段**不代改**该文件（超出本任务范围）。
+#     另注：宿主对 ACP provider 有 `assertCapabilities` 门禁——带 `agentPreset` 的请求要求
+#     provider 的 `capabilities.agentPreset === true`（dsh-subagent/lib/index.js:3312）；
+#     该能力位已由 product-subagents 翻为 true（lib/host-compat.js:127），故接通可行。
+#
+# ────────────────────────────────────────────────────────────────────────────
+# ★★ Q1 / Q2 判定结论（本次定稿依据）★★
+# ────────────────────────────────────────────────────────────────────────────
+#
+# 【Q1】对 `acp-relay` preset 的 scope 而言，`send_message` **不在** `restrictableNames` 里。
+#   ⇒ 把 `send_message` 写进 allow 会让 preset **整体挂载失败**（loud throw）。
+#
+#   证据链（**代码级判定**）：
+#   1. `restrictableNames` 只收 **inherited** 面（global 层 + 祖先层，**排除 own 层**）：
+#      dsh-tools/lib/index.js:3036-3051 —— inherited 于 :3039-3043 组装，restrictableNames
+#      于 :3047-3049 填充；own 层在 :3052-3055 只进 visible/knownNames，**不进**
+#      restrictableNames。
+#   2. 每个 preset 的 generation 是**独立 scope**，父级是 registry 的 owner ctx（未 scope）：
+#      dsh-agent-preset-registry/lib/index.js:495-501（`createScope(this.owner, key)`；
+#      `this.owner` = 同文件 :453 收到的 registry ctx，而 registry 行本身挂在 profile 根
+#      ~/.dsh/profiles/web/cordis.patch.yml:294-298 ⇒ 未 scope）。
+#      ⇒ 两个 preset 的 generation 之间**没有**父子关系，`acp-relay` 的祖先链里**不含**
+#        `preset-orchestrator` 的 generation。
+#   3. 只有**子 agent** 才通过 `bindScopeParent(key, generation.key)` 挂到 generation 下：
+#      dsh-agent-preset-registry/lib/index.js:668-671。scope 链实现见
+#      dsh-scope/lib/index.js:162-169（chainLayers）+ :276-279（scopeChainOf）。
+#   4. web profile 下 `send_message` 的**唯一**存活注册点在 `preset-orchestrator` preset
+#      **内部**的 `delegation` 组：~/.dsh/profiles/web/cordis.patch.yml:239-242
+#      （嵌在该 preset 的 plugins 列表内）。宿主面的同名行已被关掉：
+#      dsh-web-app/cordis.patch.yml:552-553 `- id: tool-subagent-control` + `disabled: true`
+#      （对照 dsh-base/cordis.patch.yml:373-375 —— 宿主面原本挂它）。
+#      ⇒ `send_message` 只活在 preset-orchestrator 的 generation 层。
+#
+#   ⇒ 结论：`acp-relay` 的 inherited 面里没有 `send_message`，写进 allow 必然 loud throw
+#     `tools.restrict() names unknown global tool "send_message"; known global tools: …`
+#     （dsh-tools/lib/index.js:2983-2985）；该行与 preset 同生共死 ⇒ **preset 挂载失败**。
+#
+#   【机制级实测】用宿主**真实模块**（@deepseek-ai/cordis + dsh-scope + dsh-tools，Node ESM
+#   直接 import 宿主 node_modules）搭最小三 scope 树复现：
+#     · 脚本：/tmp/probe-dsh/probe5.mjs（`cd /tmp/probe-dsh && node probe5.mjs`）
+#     · `acp-relay` generation 的 restrictableNames = product_submit, read_mcp_resource,
+#       working_directory（**无 send_message**）；
+#     · allow=[product_submit]               → applied OK；
+#     · allow=[product_submit, send_message] → THREW
+#       `tools.restrict() names unknown global tool "send_message"; known global tools:
+#        product_submit, read_mcp_resource, working_directory`。
+#   ⚠ 这是**机制级**实测（真宿主代码 + 最小合成树），**不是**整机实机挂载：真 profile +
+#     真 Loader 树尚未跑过，见文末「待实机验证」。
+#
+# 【Q2】挂在 preset generation 层上的 restriction **会**遮蔽该层自身注册的工具——
+#   但**只对后代 scope（真正的 agent）生效**；该层**自己的 view 豁免**。
+#
+#   证据（**代码级判定**）：`admits()` 实现于 dsh-tools/lib/index.js:2719-2722
+#   （allow 不含该名、或 deny 含该名 ⇒ false）；可见性判据是
+#   `layers.every(l => l.admits(name))`（同文件 :3050），而 `layers` 是该 viewing scope 的
+#   整条祖先链（:3037）：
+#     · viewing scope = **generation 自己**时：own 层被 :3041 排除在 inherited 之外，故
+#       :3052-3055 无条件放进 visible ⇒ 本层 restriction **不**遮蔽自己的注册；
+#     · viewing scope = **子 agent**（bindScopeParent 挂其下）时：generation 层的注册对它是
+#       **inherited**，须过 :3050 的 `admits` ⇒ 本层 restriction **生效**。
+#
+#   ⇒ 这直接判死了 Q3 的 (c) 方案：在 preset 内挂 `tool-subagent-control` 提供
+#     `send_message`、又**不**把它写进 allow —— 子 agent 依然**看不到** `send_message`。
+#     【机制级实测】/tmp/probe-dsh/probe5.mjs 末段：generation own view =
+#     `product_submit, send_message`；agent view = `product_submit` **only**。
+#     (c) 仅当改用 **deny 补集**写法才成立（实测 /tmp/probe-dsh/probe6.mjs：deny 宿主面工具
+#     + 本 preset 内挂 control 行 ⇒ agent view = `product_submit, send_message`），
+#     但 deny 补集是 **fail-open**（宿主新增工具默认放行），与本插件「默认剥 / 正向名单」
+#     的 fail-closed 口径相反，故**不采用**。
+#
+# ────────────────────────────────────────────────────────────────────────────
+#
+# 风险 ③（已实测确认，**当前必然触发**）：`relay-allowlist` 行的插件名**无法解析**，
+#   本 preset 按现状直接挂载**必定失败**（不是静默降级）。
+#
+#   本行写的是包**子路径**插件名：
+#       name: '@kiligzzz/dsh-agent-dispatch/relay-allowlist'
+#   而本包 `package.json` 的 `exports` **尚未声明** `"./relay-allowlist"`：
+#       { ".": "./index.js", "./client": "./lib/client.js",
+#         "./cordis.patch.yml": "./cordis.patch.yml", "./package.json": "./package.json" }
+#   实测（在临时目录 symlink 本包后 import）：
+#       ERR_PACKAGE_PATH_NOT_EXPORTED:
+#         Package subpath './relay-allowlist' is not defined by "exports" in .../package.json
+#
+#   机制依据（宿主按**裸模块 specifier** 加载 preset 行，因此受 `exports` 门禁约束）：
+#     - preset 行的 `name` 被当作模块名：`moduleName: row.name`
+#       （dsh-agent-preset-registry/lib/index.js:307；同文件 :251、:338 同理）。
+#     - 该模块名交给 Cordis 加载器 import：
+#       `else return await import(__rewriteRelativeImportExtension(name))`
+#       （cordis-plugin-loader/lib/index.js:223-226）——即原生 ESM `import(specifier)`，
+#       **不是**自有映射，也**没有**"找不到就退回文件路径"的兜底分支
+#       （:219 的 `name.startsWith(".")` 是**相对路径**分支，见下方备选方案）。
+#     - 对照先例：profile 里确实有子路径插件行
+#       （~/.dsh/profiles/web/cordis.patch.yml:241-242
+#        `@deepseek-ai/dsh-tool-subagent-control/list-agents`），而**该包的 `exports`
+#        明确声明了 `"./list-agents"`**（其 package.json 里
+#        `"./list-agents": { "types": …, "default": "./lib/types/list-agents.js" }`）。
+#       ⇒ 子路径插件名的前提就是"包自己在 exports 里声明该子路径"。
+#
+#   修复方式（一行，需人工合并到 package.json 的 `exports`）：
+#       "./relay-allowlist": "./lib/relay-allowlist.js"
+#   注：`files` 数组已含 `"lib"`，**无需**再往 `files` 里加条目。
+#
+#   ⚠ 还有一处**部署前提**（同样必须满足，否则运行时仍找不到）：profile 装的是
+#     **实体目录副本**（~/.dsh/profiles/web/node_modules/@kiligzzz/dsh-agent-dispatch，
+#     当前版本 1.12.17，`lib/` 下**没有** relay-allowlist.js），不是 symlink 到本仓库。
+#     ⇒ exports 改完还需**重新发版 + 重装 profile 依赖**，新文件与 exports 才会到位。
+#
+#   备选方案（不改 exports 时）：Cordis 加载器对以 `.` 开头的名字走**相对 baseUrl** 分支
+#     （cordis-plugin-loader/lib/index.js:219-222，
+#      `new URL(name, this.ctx.baseUrl)`）。preset 的 ctx 继承声明方的 baseUrl
+#     （dsh-agent-preset-registry/lib/index.js:248-252、:501）。
+#     ⇒ 理论上可写相对 specifier 指向本包 lib 下的文件。**但本片段不采用**：
+#       文件名/相对基准随安装位置变化，脆弱且难以核对，`exports` 方案是正规入口。
+#
+# ────────────────────────────────────────────────────────────────────────────
+# 设计要点
+# ────────────────────────────────────────────────────────────────────────────
+#
+# 1. **刻意不挂任何本地工具行** —— tool-bash / tool-fs / tool-fs-search / tool-jobs /
+#    tool-skill / tool-goal / tool-todo / tool-web / tool-subagent* / compaction /
+#    planning / delegation 组，一律不写。「省略即不存在」：Web 面已把这些工具从宿主面
+#    全部关掉（dsh-web-app/cordis.patch.yml:474-577，23 个 disabled: true 行），
+#    改由各 preset 自行挂载，所以 preset 不写 = 该 agent 真的没有。
+#
+# 2. **relay-allowlist 行是必需的，不是可选** —— 单靠第 1 点收不干净：
+#    `working_directory`（dsh-base/cordis.patch.yml:169-170）、
+#    `list_mcp_resources`/`list_mcp_resource_templates`/`read_mcp_resource`
+#    （dsh-base/cordis.patch.yml:485）、cordis inspect 工具
+#    （dsh-web-app/cordis.patch.yml:163-164）等**宿主面（global）工具**不在任何 preset 里，
+#    任何 preset 都收不掉，只能靠正向白名单遮掉（dsh-tools/lib/index.js:3050-3055）。
+#
+# 3. **order 取 7** —— 已占用的取值：standard=1、ptc=2、minimal=3、cordis=4、
+#    本 profile 的 orchestrator=6。7 未被占用。（若后续新增 preset 占用 7，改这里即可，
+#    与 orchestrator 的 order 语义无关。）
+#
+# 4. **persona 行是「通用中继 persona」，不按角色拆** —— ACP 档只负责转发，角色语义由
+#    远端产品侧承担，因此所有 ACP 档共享这一份 preset（总量 N+1 而不是 2N，见 §2 Q2）。
+#
+# 5. **product_delegate 已删除（本次决定）** —— 它是「**再起一个新的产品子代理**」（向下委派），
+#    不是「与主代理通讯」，与用户明确要求「限定 acp 只有和主代理会话通讯的工具」不符；
+#    且与插件既有的「子代理不得再向下委派」硬护栏方向相反
+#    （index.js:135-147 的 noDelegateTools / 递归护栏）。
+#    ⚠ **取代声明**：`docs/agent-preset-migration.md` §2「可选（增强）」里
+#      「白名单恒含 `product_delegate`」的建议**已被本次决定取代**，不再适用。
+#      （原方案 (i) 的「越权交给 permissionMode 等级检查兜住」不再是本 preset 的取舍依据。）
+#
+# 6. **send_message 不保留 —— 不是「取舍」，而是「不可能」**（Q1 判定，见上文）：
+#    它只注册在 `preset-orchestrator` 的 generation 层，对 `acp-relay` 是**非 inherited**，
+#    故既**不可见**、也**不可 restrict**；写进 allow 会 loud throw ⇒ preset 整体挂载失败。
+#    这一结果**恰好也是安全的且自洽**：宿主只在 send_message 对该 child 可见时才注入
+#    「用 send_message 回传」的指引（dsh-subagent/lib/index.js:1460，判据
+#    isAdjacentAgentSendMessageTool），遮掉后指引自动消失，不会出现「让模型调不存在的工具」。
+#    父级→子级方向不受影响。
+#    ⚠ 不要为「看起来一致」而把 `send_message` 塞进 allow —— 那会让 preset 挂不上。
+#
+# 7. **agent-instructions 行是否必需未确认**（§4 第 3 条）：standard preset 挂了它，
+#    且 web 面把它从宿主面关掉。本片段暂时挂上它以保留 ~/.dsh/AGENTS.md 全局指令注入；
+#    若实测发现 relay 不需要全局指令，删掉该行可进一步收窄。
+#   ⚠ 注意：lib/relay-allowlist.js 未把 `agent-instructions` 写进 allow 白名单——
+#     该行注册的是 prompt section，不是工具，不参与 tools.restrict()。
+#
+# 8. **本 preset 的 `allow` 集合必须与 `lib/relay-guard.js:73` 的 `RELAY_ALLOWED_TOOLS`
+#    保持「逐项一致」** —— 那是执行期闸（已上线）。
+#
+#    现状（**已知且有意的偏差，安全方向正确**）：
+#      · guard 侧 `RELAY_ALLOWED_TOOLS = new Set(['product_submit', 'send_message'])`
+#        （lib/relay-guard.js:73）；
+#      · preset 侧只能给 `allow: [product_submit]`（Q1：`send_message` 不可 restrict）。
+#    ⇒ preset 侧比 guard 侧**更窄**。这是**允许的、也是唯一可行**的方向，理由：
+#      (a) guard 更宽**不会放行危险工具** —— 它只多放行 `send_message`（子代理→父级回传，
+#          宿主服务本身强制相邻关系，只能发给直接父级），本就是插件既有豁免口径；
+#      (b) `send_message` 对本 preset 的子代理**不可见** ⇒ guard 永远不会遇到它，
+#          这条更宽的豁免在本 preset 下是**死条款**，不构成实际放行；
+#      (c) 反向（preset 比 guard 宽）才是危险的：会出现「看得见却调不动」的错位。
+#
+#    ⚠ **不要为了「两套逐项一致」去改 `lib/relay-guard.js`** —— 那会把 `send_message`
+#      从 guard 白名单里删掉，而 guard 是**全局**的、同时覆盖 `preset-orchestrator`
+#      （那里 `send_message` **可见**，见设计要点 6 与 Q1 证据链第 4 条），
+#      删掉会**打断编排层子代理的回传**，是真实回归。
+#    ⇒ 两套机制若不一致会产生「看得见调不动」或「调得动看不见」的静默不一致缺陷；
+#      本 preset 下的偏差属**前者之外的第三种**：guard 宽、preset 窄且不可见，无错位。
+
+# ↓↓↓ 以下为待合并片段本体，请整体追加到 ~/.dsh/profiles/web/cordis.patch.yml ↓↓↓
+
+- insert:
+    - id: preset-acp-relay
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: acp-relay
+        name: ACP 中继
+        description: 仅 product_submit 的只读中继；不挂任何本地工具。
+        order: 7
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: >-
+                你是到某个 ACP CLI 代理（qoder / deveco / opencode …）的中继。
+                对每个任务，调用 product_submit 把任务【原样完整转发】给产品会话执行，
+                产品返回后如实转达。不要自己用本地工具完成任务。
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          # ★ 正向白名单：遮住宿主面残留（见上文设计要点 2）。
+          #   名单里每个名字必须属于 inherited 面（已加载的 global/祖先层工具），
+          #   否则 restrict() loud throw ⇒ preset 整体挂载失败。
+          #   名单来源：Q1/Q2 判定（见文件顶部）——`send_message` **不可**列入
+          #   （它只在 preset-orchestrator 的 generation 层，对本 preset 非 inherited）；
+          #   `product_delegate` 按设计要点 5 删除。
+          #   ⇒ 最终值恒为 `[product_submit]`，与设计要点 8 一致。
+          - id: relay-allowlist
+            name: '@kiligzzz/dsh-agent-dispatch/relay-allowlist'
+            config:
+              allow: [product_submit]
+          # 注意：刻意【不】挂 tool-bash / tool-fs / tool-fs-search / tool-jobs /
+          #       tool-skill / tool-goal / tool-todo / tool-web / tool-subagent* /
+          #       compaction / planning / delegation 组 —— 省略即不存在。

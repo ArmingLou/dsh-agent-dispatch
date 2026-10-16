@@ -31,7 +31,11 @@ function makeHarness() {
   const ctx = {
     subagents: {
       getProvider: (name) => (isAcp(name) ? { name } : undefined),
-      startContinuable: async (spec) => {
+      // v1.12.17：宿主 0.2.1-alpha.3 把 startContinuable 改名为 startActivation。
+      // 桩必须跟着改名（且不保留旧名）：否则"桩还挂在旧名上"会让"被测代码是否真的走
+      // 新名"变成假绿。注：本文件的多数用例直接构造 activeChildren/#retryOnChildFailure
+      // 驱动换档链，只有端到端那几条会经 real dispatch() 走到新建分支。
+      startActivation: async (spec) => {
         started.push(spec)
         return { childId: `child-${started.length}` }
       },

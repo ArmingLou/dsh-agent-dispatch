@@ -13,7 +13,13 @@ data/
 .agents/
 .squads/
 *.bak-before-*
+*.bak
 *.tgz
+
+# 编辑器 / 补丁工具残留（防误提交）
+*.orig
+*~
+*.swp
 
 # CLI 本地权限/会话产物
 .qoder/

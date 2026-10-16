@@ -20,11 +20,18 @@ import { Dispatcher } from '../lib/dispatch.js'
 
 function makeHarness({ sendMessage } = {}) {
   const sent = []
+  const startCalls = []
   const parentAgent = { session: { id: 'parent-1' }, options: { subagentDepth: 0 } }
   const ctx = {
     subagents: {
       getProvider: () => undefined,
-      startContinuable: async () => ({ childId: 'child-new' }),
+      // v1.12.17：宿主 0.2.1-alpha.3 把 startContinuable 改名为 startActivation。
+      // 桩跟着改名（且**不**提供旧名），否则"桩还挂在旧名上"会让"被测代码是否真的走
+      // 新名"变成假绿：旧实现读 startContinuable 会拿到 undefined，用例照样通过。
+      startActivation: async (spec) => {
+        startCalls.push(spec)
+        return { childId: 'child-new' }
+      },
       sendMessage: sendMessage ?? (async (sender, targetId, content) => {
         sent.push({ sender, targetId, content })
         return 'msg-1'
@@ -45,7 +52,25 @@ function makeHarness({ sendMessage } = {}) {
     dataDir: mkdtempSync(join(tmpdir(), 'dispatch-childid-test-')),
     idleReleaseMs: 0,
   })
-  return { dispatcher, sent, parentAgent }
+  return { dispatcher, sent, startCalls, parentAgent }
+}
+
+/**
+ * v1.12.17：宿主换代护栏的**可证伪**判据。
+ *
+ * 只把桩改名是不够的——要能证明"被测代码真的调到了新名"。判据：桩不暴露旧名
+ * startContinuable，且唯一入口 startActivation 记录每次调用；跑一次真实 dispatch 后，
+ * `startCalls.length` 必须为 1。旧实现（读 startContinuable）下该计数恒为 0 ⇒ 用例变红。
+ * @param {object} dispatcher
+ * @returns {void}
+ */
+function assertStartActivationIsTheOnlyEntry(dispatcher) {
+  assert.equal(typeof dispatcher.ctx.subagents.startActivation, 'function')
+  assert.equal(
+    dispatcher.ctx.subagents.startContinuable,
+    undefined,
+    '桩不得暴露旧名 startContinuable——否则本用例无法证明被测代码走的是新名',
+  )
 }
 
 function seedPool(dispatcher, childId) {
@@ -66,6 +91,27 @@ function seedPool(dispatcher, childId) {
 }
 
 describe('v1.11.11 定向续聊（childId）回归', () => {
+  it('v1.12.17 宿主换代护栏：subagents 只暴露新名 startActivation 时，新建 child 真的走新名并带 delivery:\'parent\'（旧实现读 startContinuable ⇒ TypeError，计数恒为 0）', async () => {
+    const { dispatcher, startCalls, parentAgent } = makeHarness()
+    assertStartActivationIsTheOnlyEntry(dispatcher)
+    await dispatcher.dispatch(parentAgent, 'senior-dev', '全新独立任务（池为空 ⇒ 必走新建分支）')
+    assert.equal(
+      startCalls.length,
+      1,
+      '新建 child 必须调到 startActivation；旧实现读的是已不存在的 startContinuable，此处会恒为 0',
+    )
+    assert.equal(
+      startCalls[0].delivery,
+      'parent',
+      "delivery 必须为 'parent'（结果回传父代理）；'caller' 会让宿主吞掉 settlement 通知",
+    )
+    assert.equal(
+      typeof (startCalls[0].signal?.aborted ?? false),
+      'boolean',
+      'signal 仍是硬性字段（宿主 spec 必填）',
+    )
+  })
+
   it('池外线程定向续聊应成功，并补记池条目（旧实现报 Cannot access \'reuseKey\'）', async () => {
     const { dispatcher, sent, parentAgent } = makeHarness()
     const r = await dispatcher.dispatch(parentAgent, 'senior-dev', '追加任务：继续上一个线程', {

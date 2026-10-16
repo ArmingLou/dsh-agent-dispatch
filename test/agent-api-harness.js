@@ -37,7 +37,8 @@ export async function boot(o = {}) {
       return () => {}
     },
   }
-  const services = { webServer: ws, llm: o.llm, settings: o.settings }
+  // v1.12.18：agentPresets 可选（不传 ⇒ ctx.get('agentPresets') === undefined ⇒ 端点降级为 []）
+  const services = { webServer: ws, llm: o.llm, settings: o.settings, agentPresets: o.agentPresets }
   const ctx = {
     tools: { register: () => () => {}, guard: () => () => {}, view: () => ({ knownNames: [] }) },
     systemPrompt: { section: () => () => {} },

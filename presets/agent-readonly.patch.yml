@@ -1,0 +1,130 @@
+# ⚠ 待人工合并片段 —— 本文件【不自动生效】，不会被任何构建/加载流程读取。
+#
+# 它是 `agent-readonly` preset 的定义片段，供人工审核后**追加**到
+# `~/.dsh/profiles/web/cordis.patch.yml`（与既有的 `preset-orchestrator` 同层，
+# 见该文件 :128-175）。写入 `~/.dsh` 属高风险操作，须由用户明确授权后单独执行；
+# 本仓库不代为写入。
+#
+# agent-readonly preset —— 只读代理
+#
+# 用途：给子代理使用的**严格只读**工具面（能读/能搜/能查 web、**保留 memory 与 MCP 读工具**，不能写文件、不能执行命令）。
+# 设计证据与层归属分析见文件内注释；`dsh-web-app/cordis.patch.yml:474-577` 是层归属的权威依据。
+#
+# 关键判断：
+# 1. **tool-bash 不给**（结论：不挂）——bash 本身不是"写工具"，但它能 `echo > file`、
+#    `rm`、`git commit`，任何 shell 命令都可能产生副作用。strict readonly 意味着**连间接写能力都禁止**。
+#    （宿主对 bash 并无可用的 config 级写限制：`dsh-tool-bash` 的 config 只有 `timeoutMs`/`description`。）
+#    另：`bash` 工具在 web 面**不在 preset 面**（`dsh-web-app/cordis.patch.yml` 已 disable 宿主 tool-bash 行），
+#    因此"不写这一行"就真的移除，无需也不能 deny。
+# 2. **skill-filesystem 会写盘**——它提供 skill 的本地发现/加载，并会写 skill 文件；
+#    同理 host 行已被 disable ⇒ 属于 preset 面，省略即不存在。（核实结论：会写，故一并不挂。）
+# 3. **memory/MCP 自动继承**——这两者注册在 global 层（profile 顶层 `agentmemory` 行 +
+#    `dsh-base/cordis.patch.yml:485` 的 mcp-resources），任何 preset 的子代理都会继承，
+#    **不需要在本 preset 里重复挂载**。已实测验证（见 docs/ 与探针）。
+#
+# 策略（两件事同时做）：
+# ① preset 里**只**挂读侧插件行 —— 省略即不存在（写能力工具全在 preset 面）；
+# ② 再加一条 `tools.restrict({ deny: [...] })` 遮掉**宿主面残留**（省略不掉的 global 工具）。
+#
+# ★ deny 名单的命名空间：必须是**工具名**（`bash`/`write`），不是插件 id（`tool-bash`）。
+#   写错名字会 loud throw ⇒ **整个 preset 挂载失败**（preset 注册表记为 broken）。
+#   宿主面（web profile 实测 `restrictableNames` 共 38 个名字）里真正需要遮的只有：
+#     - `working_directory`（`dsh-base/cordis.patch.yml:169-170`，web 面未 disable）
+#     - 11 个 `agent_*`（本仓库根 bundle 行 `index.js:588+`）
+#     - `product_delegate` / `product_submit`（product-subagents 根行 `lib/index.js:960-961`）
+#   其余 38 个名字是 memory_* / MCP 读工具 / cordis_inspect_* / product_agents 等只读项，**要求保留**。
+#
+
+- insert:
+    - id: preset-agent-readonly
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: agent-readonly
+        name: 只读代理
+        description: 只读子代理：能读代码/文件/搜索/Web，但不能写文件或执行命令；用于安全探索。
+        order: 8
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: >-
+                你是只读子代理（Read-Only Agent），由 {{model}} 模型驱动。
+                核心职责：**只读探索、定位、分析**，绝不写入文件或执行有副作用的命令。
+                - 任务拆解：接到任务后第一步永远是确认需求边界与读写权限，若涉及写操作则明确上报“需要写权限”而非尝试绕过。
+                - 可用工具：read/grep/glob（工具档）、web_search/web_fetch（Web 查询）、memory_*（记忆检索）、MCP read（第三方资源读取）。
+                - 禁作：write/edit（写文件）、bash/pwsh（命令行，可能写盘）、job 起后台进程、goal/todo/planning 写状态、任何委派（dispatch/squad/product）。
+                - 遇到权限不足：直接上报“需要访问 X（读/写），当前权限不足”，请用户或主代理授权，不尝试绕行。
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          # ★ tool-fs：只读模式（可读文件/图片，不可写不可 edit）
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              read: true
+              readImage: true
+              write: false
+              edit: false
+          # ★ tool-fs-search：全文搜索（只读）
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          # ★ tool-web：Web 查询（fetch + search）
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          # ★ compaction：对话压缩
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          # ★ deny：遮掉宿主面（global）上省略不掉的残留能力
+          #   ⚠ 每个名字必须是**工具名**且在 inherited 面，否则 loud throw ⇒ preset 挂载失败
+          #
+          #   复用已发布的 `relay-allowlist`：它的 apply() 同时支持 allow 与 deny 两种形态
+          #   （`lib/relay-allowlist.js:61-72`：仅当 allow 与 deny **均**为空才 loud throw），
+          #   正好满足本 preset 的「只 deny 不 allow」用法。
+          #   **为何不新建专用模块**：profile 消费的是**打包产物**
+          #   （`~/.dsh/profiles/web/package.json` 里 `@kiligzzz/dsh-agent-dispatch` 指向
+          #   `file:~/.dsh/packages/kiligzzz-dsh-agent-dispatch-1.12.19.tgz`），
+          #   安装副本 `profiles/web/node_modules/@kiligzzz/dsh-agent-dispatch/` 里**没有**
+          #   新加的 lib 文件与 exports 子路径 ⇒ 引用它会 ERR_PACKAGE_PATH_NOT_EXPORTED，
+          #   导致 preset 整体挂载失败。relay-allowlist 在已发布产物里已存在且已声明 exports，
+          #   故直接复用；待下次打包发布若确需专用命名，再换成专用子路径即可（仅改 name 一行）。
+          - id: readonly-deny
+            name: '@kiligzzz/dsh-agent-dispatch/relay-allowlist'
+            config:
+              deny:
+                # 宿主面：唯一会改变会话状态的工具（切 cwd），只读代理不需要
+                - working_directory
+                # 宿主面：委派逃生通道（不遮则只读代理可把写任务委派给读写子代理）
+                - agent_dispatch
+                - agent_squad
+                - agent_squad_continue
+                - agent_squad_upsert
+                - agent_failover
+                - agent_followup
+                - agent_upsert
+                - agent_import_skill
+                - agent_list
+                - agent_children
+                - agent_close
+                - product_delegate
+                - product_submit

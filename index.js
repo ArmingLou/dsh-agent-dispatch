@@ -34,6 +34,9 @@ import { readFabConfig, mergeFabConfig } from './lib/fab-config.js'
 import { renderRoster } from './lib/roster.js'
 import { HostApprovalRules, resolveApprovalContext, resolveRootSessionId, isDisallowedAutoGrant, isSandboxEscalation, isAcpTwinApproval, isDelegatedSession, validateDeclaredPaths, dangerousCommandMatch, boundDangerText, MAX_DANGER_TEXT_CHARS, COMMAND_TOO_LONG_RULE } from './lib/host-approval.js'
 import { jsonSafe } from './lib/json-safe.js'
+// v1.12.18：ACP 中继子代理的执行期工具闸（机制结论与局限见模块头注释）。
+// 登记侧（relayChildren.add）在 lib/dispatch.js，两侧 import 同一模块实例共享状态。
+import { relayDenialReason } from './lib/relay-guard.js'
 
 export const name = '@kiligzzz/dsh-agent-dispatch'
 
@@ -149,6 +152,15 @@ export function apply(ctx, config = {}) {
   ])
   try {
     ctx.tools.guard((exec) => {
+      // v1.12.18：ACP 中继闸优先于递归护栏判定——relay 子代理的工具面是
+      // 「只放行 product_submit（+ 豁免 send_message）」，比下面的委派黑名单更严；
+      // 先判它才能给出"你是中继，必须用 product_submit"这条**可操作**的拒绝原因
+      //（否则 relay 子代理调 bash 只会撞上"禁止再向下委派"这类不相关的文案）。
+      // 见 lib/relay-guard.js 的机制结论与**局限**说明：这是执行期拦截，
+      // 挡不住"工具可见"（relay child 仍看得到 64 个工具），但能挡住
+      // "自作主张用本地工具把活干完"——本次事故的真实危害。
+      const relayReason = relayDenialReason(exec)
+      if (relayReason !== undefined) return relayReason
       const depth = exec?.agent?.options?.subagentDepth ?? 0
       if (depth >= 1 && noDelegateTools.has(exec.name)) {
         return `[dsh-agent-dispatch] 子代理（深度 ${depth}）禁止再向下委派/另起代理：${exec.name} 已禁用，必须自己完成任务；超出能力时明确说明卡在哪，并向上（父级）汇报。`
@@ -1657,6 +1669,42 @@ export function apply(ctx, config = {}) {
       return []
     }
   }
+  /**
+   * v1.12.18：宿主 Agent Preset 枚举（GUI 下拉的唯一来源）。
+   *
+   * 为什么必须枚举而不是让用户手填字符串：未知 preset id 会让**整次派发硬失败**
+   * （宿主 dsh-agent-preset-registry/lib/index.js:636 `Unknown agent preset: X`），
+   * 盲填 = 派发期才炸。服务名是 `agentPresets`（宿主 :451 `super(ctx, "agentPresets")`），
+   * `list()` 返回 `{id, name?, description?, order?, broken?}`，宿主已按 order→id 排好序。
+   *
+   * 刻意**不**把 'agentPresets' 加进本插件的 `inject` 数组：inject 是**必需**依赖，
+   * 缺服务时 Cordis 会让整个插件 apply() 永不执行（实测：inject 含 agentPresets 而无该服务
+   * ⇒ apply 不跑），于是 /agent-api 连同整个委派工具链一起消失——而本端点要的是
+   * "无此服务就返回 [] 并降级"。ctx.get() 本身**不需要** inject（实测可读到其他 fiber 提供的服务），
+   * 故这里直接读 + try/catch：宿主无此服务（如仅装 dsh-base 的 profile）时返回 []。
+   *
+   * 只取 GUI 需要的字段，并**丢掉 broken 的 preset**：它激活失败，选它必然派发失败。
+   */
+  const readAgentPresets = async () => {
+    try {
+      const svc = ctx.get('agentPresets')
+      if (!svc || typeof svc.list !== 'function') return []
+      const rows = await svc.list()
+      if (!Array.isArray(rows)) return []
+      return rows
+        .filter((r) => r && typeof r.id === 'string' && r.id !== '' && !r.broken)
+        .map((r) => ({
+          id: r.id,
+          ...(typeof r.name === 'string' && r.name !== '' ? { name: r.name } : {}),
+          ...(typeof r.description === 'string' && r.description !== '' ? { description: r.description } : {}),
+          ...(typeof r.order === 'number' ? { order: r.order } : {}),
+        }))
+    } catch (err) {
+      // 服务在但 list() 抛错（preset 定义加载失败等）：降级为空列表，绝不让 /agent-api 挂掉
+      console.error('[dsh-agent-dispatch] 读取 agentPresets 失败（GUI 下拉降级为空）:', err?.message || String(err))
+      return []
+    }
+  }
   /** 路由是否走 ACP 中继（与 lib/dispatch.js 判定一致）——registry 校验用 */
   const isSubagentProviderRoute = (provider) => {
     if (typeof provider !== 'string' || provider.trim() === '') return false
@@ -1868,6 +1916,9 @@ export function apply(ctx, config = {}) {
           subagentProviders: readSubagentProviders(),
           productModels: readProductCatalog(),
           llmEfforts: await readLlmEfforts(models),
+          // v1.12.18：Agent Preset 枚举（GUI 编辑表单的下拉选项来源）。缺服务时为空数组，
+          // 前端据此退化为「只有一个空选项」——而不是让用户手填 id 在派发期才炸。
+          agentPresets: await readAgentPresets(),
         })
       }
       if (req.method === 'GET' && pathname === '/agent-api/dispatches') {

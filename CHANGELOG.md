@@ -1,3 +1,449 @@
+## 1.12.20（2026-10-16）
+
+> 一句话：**修 v1.12.18 relay 闸的 fail-open（Blocker A/B）** —— 登记原来只有「首建」一条
+> 路径（`lib/dispatch.js:1252` 的 `if (acpMode) relayChildren.add(childId)`），而**续聊/恢复有
+> 三条独立入口**（定向 childId 续聊、复用池续聊、`agent_followup` 工具）且**没有一条补登记**
+> ⇒ 续聊后的中继子代理重新拿回全部本地工具，闸形同不存在。修法是把补登记**收敛到
+> `Dispatcher#followup` 这一个所有续聊的公共通道**，按三层账本判定 ACP 语义后补登记。
+> 路由链、复用池语义、换档链、GUI **一字未动**。
+
+> 用户原话（经编排层转述）：「把仓库 A 的版本从 1.12.19 提到 1.12.20，并补 CHANGELOG 条目」；
+> 「v1.12.20 的工作已经写完并验证过（`npm test` 实测全绿），但 `package.json` 与
+> `CHANGELOG.md` 还停在 1.12.19」。
+
+### 现场（为什么必须改）
+
+`v1.12.18` 的 relay 闸（`lib/relay-guard.js` 的 `relayChildren` 集合 + `relayDenialReason`）
+只在 **ACP 档 child 新建**那一条路径上登记（`lib/dispatch.js:1252`）。但中继子代理的生命周期
+**不止首建**：一个 ACP child 结束后会进复用池（`reuse` 策略）或留历史记录（`completedFresh`，
+`fresh` 策略），之后被**续聊/冷恢复**唤醒继续干活。而续聊有三条独立入口，**没有一条**补登记：
+
+| 续聊入口 | 修前是否补登记 | 后果 |
+|---|---|---|
+| 定向 childId 续聊（`agent_dispatch(childId=…)`，池内线程） | ❌ | 闸 fail-open |
+| 复用池续聊（自动命中同角色空闲线程） | ❌ | 闸 fail-open |
+| `agent_followup` 工具 | ❌ | 闸 fail-open |
+
+三条入口在代码里**都经 `Dispatcher#followup`** —— 这正是修法收敛在该方法的原因（只补其中
+一条入口都会漏掉另两条）。
+
+fail-open 的形态是**静默**的：闸认不出这个 childId，`relayDenialReason` 返回 `undefined`，
+于是续聊后的中继子代理手里 `bash`/`write`/`edit`/`grep` 全部可用，模型照旧"自己把活干完"
+——正是 v1.12.18 修掉的那个事故形态，在**续聊路径**上原样复活。
+
+### Fixed
+
+- **`lib/dispatch.js`：续聊补登记收敛到 `Dispatcher#followup`**（fail-open 修复，Blocker A/B）。
+  投递成功后按**三层账本**判 ACP 语义（`lib/dispatch.js:1471-1475`）：
+
+  ```js
+  const relayAcp =
+    this.childPool.get(childId)?.acpMode ??
+    this.activeChildren.get(childId)?.acpMode ??
+    this.completedFresh.get(childId)?.acpMode ??
+    false
+  ```
+
+  判为 ACP 才 `markRelayChild(deliveredTo)`（`lib/dispatch.js:1476-1477`）。`?? false` 兜底是
+  刻意的：**判不出 ACP 语义就不登记** —— 宁可漏收窄，也不误伤 LLM 档。补登记时序与首建路径
+  对齐（**投递成功之后**才登记；续聊失败时宿主已拒绝、线程不可用，不登记）。
+- **换档改投场景两个 childId 都登记**（`lib/dispatch.js:1478-1481`）：v1.11.22 的换档改投会让
+  `deliveredTo !== childId`（消息改投到链上当前活跃档，原目标留在 `product_submit` 里阻塞等
+  整条链）⇒ 两边**都必须保持登记**，否则原目标会在阻塞期间重新获得本地工具。
+- **`lib/dispatch.js:1002-1005` 复用池续聊再兜一次**：池条目明确 `acpMode` 时同时调
+  `markRelayChild(pooled.childId)`，使「followup 判据缺位、但池条目明确是 ACP」的场景不漏登记
+  （薄封装幂等，重复登记无副作用）。
+- **`completedFresh` 写入时补 `provider` / `acpMode`**（`lib/dispatch.js:2257-2260`）：此前该历史
+  条目**完全没有**这两个字段 ⇒ 池外/历史线程**永远判不出** ACP 语义（是 Blocker B 的直接成因）。
+- **`followup` 从历史重建 `activeChildren` 时继承 `acpMode`**（`lib/dispatch.js:1502-1505`）：
+  冷恢复续聊后该 entry 仍带着 ACP 语义，后续判定与 `listChildren` 展示都不再失忆。
+
+### Added
+
+- **`lib/relay-guard.js` 新增两个具名薄封装**：`markRelayChild(childId)`（`lib/relay-guard.js:101-106`，
+  幂等 + 非空字符串校验，返回本次是否发生新登记）与 `isRelayChild(childId)`
+  （`lib/relay-guard.js:118-121`，供测试/调用方查询登记态）。语义分别**等价于**
+  `relayChildren.add` / `relayChildren.has` —— 包一层的理由：参数校验与去重语义只能有一份，
+  各调用点各写一遍必然分叉；同时让 `verify.mjs` 能断言"补登记入口存在"。
+- **`test/acp-relay-persona.test.js` 新增 D 组 6 例**（`describe('v1.12.20 D：续聊/恢复路径必须
+  补登记 relay（fail-open 修复，Blocker A/B）')`）：① 首建后登记生效（基线，修后不得回归）；
+  ② 定向续聊（`childId`）后登记仍生效 —— **池内** ACP 线程（Blocker A）；③ 定向续聊后登记仍
+  生效 —— **池外/历史**（`completedFresh`）线程（Blocker B）；④ 复用池续聊后登记仍生效；
+  ⑤ 四向失效语义：`dispose` 全清 / 已结算线程 `closeChild` 注销 / **运行中线程 `closeChild`
+  不得注销** / `purgeParent` 注销该父会话（该清的清掉、该留的留住）；⑥ 反向：**非 ACP 线程
+  续聊不得被登记**（防"修过头"把 LLM 档一起锁死）。
+- **`verify.mjs` 新增 v1.12.20 守卫断言（结构 6 条 + 行为 7 条）**，每条都对应一个**静默**失效
+  点：结构侧焊死 `markRelayChild` / `isRelayChild` 导出、`followup` 里的补登记、`completedFresh`
+  带 `acpMode`、历史重建继承 `acpMode`、`dispatch.js` 的 import 形态；行为侧焊死上述 7 条断言在
+  测试文件里**真的存在**（缺任一条都会让 Blocker A/B 无声回归）。
+
+### 遗留（本版**未**完成，不要当成已生效）
+
+- ⚠ **DSH 真重启后仍会 fail-open**：三张账本（`childPool` / `activeChildren` / `completedFresh`）
+  **全是进程内 Map**，**真重启后全部丢失** ⇒ 此时用**持久 childId** 定向续聊，`followup` 的三层
+  判据一条都取不到 ⇒ `?? false` ⇒ **不补登记** ⇒ 闸对这条线程失效。要彻底修需**落盘**账本，
+  或改用宿主 `recoverRemoteSessionId` 恢复后重建登记 —— **超本次范围**。
+  故本版只修「**进程存活期内**」的续聊 fail-open，**不要读成"彻底修复"**。
+- 与 `Dispatcher#dispose` 的 `relayChildren.clear()`（`lib/dispatch.js:3408-3415`）方向相反、
+  **缺一不可**：卸载清空防的是**陈旧 childId 残留**（模块级单例跨重载），本版补登记防的是
+  **续聊丢闸**。
+- guard 仍是**执行期拦截**，挡不住"工具可见"：relay 子代理的系统提示词里依旧列着 `write`/
+  `edit`/`bash`（64 个工具），只是调用时被拒。可见性收窄由 profile 级 `acp-relay` preset 承担，
+  需人工合并配置且尚未实机验证，见 v1.12.18 / v1.12.19 的遗留段。
+
+### Tests
+
+`npm test` **789 pass / 0 fail**（`1..198`，190 suites，含新增 D 组 6 例）；
+`node verify.mjs` → `OK: @kiligzzz/dsh-agent-dispatch v1.12.20 一致性链（无内置 Agent）+ 11 工具 + / 命令`。
+
+## 1.12.19（2026-10-15）
+
+> 一句话：**接通「逐档 Agent Preset」** —— 宿主 `SubagentStartRequest` 移除
+> `persona` / `toolFilter` 后，工具面收窄的**唯一可行入口**是 `agentPreset`（Agent Preset
+> 本质是一串 Cordis 插件行 ⇒ 工具面是**结构性**的，不是参数过滤）。但宿主 `agentPreset`
+> 是**单个标量**，而本插件的 failover 链**跨 provider 类型**，故本版在 failover 循环内
+> **按该档类型**取值：ACP 档用新增的 `agent.acpPreset`（中继收窄），LLM/spawn 档用既有的
+> `agent.agentPreset`（宿主真过滤）。**默认 OFF**，未配置 ⇒ 不展开该键 ⇒ 宿主照旧继承父会话
+> preset（零回归）。路由链、复用池、换档链一字未动。
+
+> 用户原话：「toolFilter 这条路已经死了，别再指望它——要收窄只能走 agentPreset。那么是否支持，
+> 一套角色预设，对应两套工具预设？如果不行，可能需要 一个角色，拆分成两套预设，分别对应只配置
+> llm 和 只配置 acp 。并且限定 acp 只有 和主代理会话通讯的工具。」
+> 「关键是有两个维度， 角色 和 provider ，两维度组合，要配置不同的工具预设？」
+
+### 现场（为什么必须改）
+
+`v1.12.18` 修好了「ACP 档静默退化为本地 LLM 执行」的**执行期**那一面（relay 闸 +
+persona 经初始 prompt 送达），但**工具面的结构性收窄**当时仍是空的：`request.persona` /
+`request.toolFilter` 在新宿主上是**死字段**（被静默忽略），唯一还会被宿主真正读到并生效的
+工具面通道只剩 `agentPreset` —— 而它**没有任何配置入口**（注册表里没有这个字段的语义、
+GUI 里 grep `acpPreset` = 0 命中）。
+
+宿主 `@deepseek-ai/dsh@0.2.1-alpha.3` 已移除 `SubagentStartRequest.persona` 与 `toolFilter`
+（**静默忽略，不报错**），工具面收窄**唯一可行入口**是 Agent Preset。而 Agent Preset 本质是
+**一串 Cordis 插件行**（`PresetDefinition.plugins`，
+`@deepseek-ai/dsh-agent-preset-registry/lib/types/definition.d.ts`），**工具本身就是插件**
+（`@deepseek-ai/dsh-tool-bash` / `dsh-tool-fs` / `dsh-tool-fs-search` 等）⇒ **工具面是
+结构性的，不是参数过滤** —— 这也正是 `toolFilter` 那条路彻底走不通的原因。
+
+更关键的是**它不能是一个标量**：本插件的 failover 链天然跨 provider 类型，例
+`explorer = qodercli(ACP) → deveco(ACP) → opencode(ACP) → workbuddy(LLM) → deepseek-official(LLM)`。
+两档的工具面语义**不对称**：
+
+| 档位 | preset 的语义 | 生效位置 | 该配什么 |
+|---|---|---|---|
+| **ACP 档** | **中继收窄**（工具在外部产品进程里，DSH 侧只需 `product_submit` 通讯） | 外部产品进程 | `acpPreset`（如 `acp-relay`） |
+| **LLM/spawn 档** | **宿主真过滤**（工具由宿主工具插件提供） | 宿主工具插件 | `agentPreset` |
+
+⇒ 二者**不能共用一个字段**，也不该要求"一个角色配两套预设"：那会产生 **2N 份冗余**，且两份
+定义会各自漂移（改一处忘一处）。**正确形态是 N+1** —— 每个角色 **1 个逻辑定义 + 1 个 ACP
+专用 preset**（`acp-relay`），由插件**按档位自动选择**，用户无需维护两份角色定义。
+
+故在 failover 循环内按**该档**取值（`lib/dispatch.js:1141`）：
+
+```js
+const presetForRoute = (() => {
+  const configured = acpMode ? agent.acpPreset : agent.agentPreset
+  return typeof configured === 'string' && configured.trim() !== '' ? configured.trim() : undefined
+})()
+```
+
+并**只在有值时展开键**（`lib/dispatch.js:1219`）：
+
+```js
+...(presetForRoute !== undefined ? { agentPreset: presetForRoute } : {}),
+```
+
+### Added
+
+- **逐档 Agent Preset 选择**（`lib/dispatch.js`）：failover 循环内按档类型取值，ACP 档读
+  `agent.acpPreset`、LLM/spawn 档读 `agent.agentPreset`，未配置 ⇒ `undefined` ⇒
+  request 里**该键根本不出现** ⇒ 宿主照旧走 `composeFrom(childCtx, parent.ctx)`
+  继承父会话 preset（**零回归**）。新增键**不替换**任何既有分支：`provider` / `persona` /
+  `toolFilter` 的语义与取值全部不变。
+- ★ **ACP 档绝不回落 `agent.agentPreset`**（交叉污染防护，本版最重要的安全约束）：用户此前
+  经 GUI 存过的 `agentPreset` 在旧版是**静默忽略**的，本版接通后会**变成真实生效**；若 ACP
+  档回落去读它，就会把 **LLM 档的工具面误用到 ACP 档**上（ACP 档的工具面语义是中继收窄，
+  与 LLM 档完全不同）。故两个字段**各自独立、互不回落**，并由 `verify.mjs` 反向断言焊死。
+- **新注册表字段 `acpPreset`**（每 agent，可选、默认不配置）：`lib/agents.js` 的
+  `validateAgent` 校验（非空字符串，空串/纯空白/null/非字符串一律**响亮拒绝**）、
+  `normalizeAgent` 归一化（缺失 / 空串 / 纯空白 / 非字符串 ⇒ **不落键**）、
+  `needsNormalize` 偏离口径（与 `agentPreset` 同一口径），四处口径一致。
+- **GUI 输入项**（`lib/client.js`）：`Agent Preset` 下拉旁边新增同构的 **`ACP Preset`** 下拉，
+  复用同一套宿主枚举（`GET /agent-api` 的 `agentPresets`）与同一套 **stale 保护**
+  （已存值不在枚举中时额外注入一项，避免"打开表单什么都没动"就把已配值静默清掉）；
+  说明文案如实表达语义差异：「Agent Preset：该 agent 在 **LLM 档**使用的工具面预设；
+  ACP Preset：在 **ACP 档**使用的（中继收窄）预设。ACP 档不回落 LLM 档的值。」
+- `test/acp-preset-per-route.test.js`（5 例全绿）：① ACP+配了 ⇒ 值为该值；② ACP+未配 ⇒
+  request **无**该键；③ LLM+配了 ⇒ 用该值；④ LLM+未配 ⇒ 无该键；⑤
+  **混合 failover 链（ACP 失败 → LLM 接管）⇒ 两档 preset 不同**（核心断言）。
+- `verify.mjs` 新增 **v1.12.19 守卫 6 条**（正向 3 + 反向 2 + 行为 1），每条都对应一个
+  **静默**失效点；其中反向断言「ACP 分支不得引用 `agent.agentPreset`」是本次最重要的安全约束。
+
+### Fixed
+
+- **`verify.mjs` 补 6 组 v1.12.19 源码守卫，防静默回归**：正向取值 / 条件展开（未配置 ⇒ 键不
+  出现）/ **交叉污染反向断言**（ACP 档分支不得引用 `agent.agentPreset`）/ `lib/agents.js`
+  **三处归一化**（`validateAgent` / `normalizeAgent` / `needsNormalize`）/ 4 条测试断言存在性。
+  每条都对应一个**静默**失效点（改坏了不报错、只是行为悄悄变了），故必须由守卫焊死。
+- **`verify.mjs` v1.12.19 守卫 ④ 的假红（守卫自咬）**：初版反向断言用
+  `m.index + m[0].indexOf(':')` 反推偏移判定"无条件赋值"，而正则的前导空白会让 `m.index`
+  落在**空白**而非键名首字符上 ⇒ 系统性偏 1 字符 ⇒ 把**合法**的
+  `? { agentPreset: presetForRoute }` 误判为无条件写入，`verify.mjs` 必红。改为两段式
+  （先去行注释 + 抹掉合法形态，再扫剩余声明），不再依赖任何偏移算术。
+
+### ★ 关键决策 ①：为何 `acpPreset` **默认 OFF**（缺省不设是刻意的，不要改成硬编码兜底）
+
+若这里硬编码兜底为 `'acp-relay'`，而用户 profile 里**并未挂载**该 preset，宿主会因 preset
+解析失败让**整次 ACP 派发直接报错**（`dsh-agent-preset-registry/lib/index.js:636`，
+`Unknown agent preset: X`）—— 那会把「配置没生效」升级成「**ACP 完全不可用**」，比不设更糟。
+未配置 ⇒ 不展开该键 ⇒ 宿主走 `composeFrom` 继承父会话 preset（零回归）。
+**这是刻意设计，不是遗漏。**
+
+### ★ 关键决策 ②：部署顺序硬约束（顺序反了会硬崩）
+
+宿主 `dsh-subagent/lib/index.js:3312` 校验 `provider.capabilities.agentPreset === true`，
+否则抛 `UNSUPPORTED_CAPABILITY`。`dsh-plugin-product-subagents` 自 **0.7.20** 起该位为 `true`
+（**0.7.19 及之前仍是 `false`**）。
+
+⇒ **必须先把 `dsh-plugin-product-subagents` 升到 ≥0.7.20，再启用本版的 `acpPreset`**；
+顺序反了会让每次 ACP 派发**直接抛错** —— 与 0.7.19 那次 `depthLimit: false` 导致全站宕机
+是**同一种失效模式**。
+
+### 遗留（本版**未**完成，不要当成已生效）
+
+- **GUI 已补 `acpPreset` 输入项**（见上 Added），但 `Agent Preset` 的**枚举**仍依赖宿主
+  `agentPresets` 服务；该服务缺失时两个下拉都退化为「只有空选项 + 保留已存值」。
+- `presets/acp-relay.patch.yml` 是**待人工合并**片段，**不是自动生效的产物**：需合并进
+  `~/.dsh/profiles/web/cordis.patch.yml` 并**重启**后才真正生效；在那之前本版的 `acpPreset`
+  **即使配置了也无 preset 可挂**（写入 `~/.dsh` 属高风险操作，须用户明确授权后单独执行，
+  本仓库不代写）。
+- preset 侧 `allow` 最终**只能给 `[product_submit]`**：`send_message` **不在**
+  `restrictableNames`（只收 inherited、排除 own 层，`dsh-tools/lib/index.js:3036-3051`），
+  写进 allow 会让 **preset 整体挂载失败**（实测 THREW）。这与 `lib/relay-guard.js:73` 的
+  `RELAY_ALLOWED_TOOLS = {product_submit, send_message}` 的差异是**安全方向正确的有意偏差**
+  （preset 更窄；guard 是全局闸、还覆盖 `preset-orchestrator`，删 `send_message` 会打断
+  编排层子代理回传），**不是 bug**，不要"修齐"。
+
+## 1.12.18（2026-10-15）
+
+> 一句话：**修「ACP 档静默退化为本地 LLM 执行」** —— 宿主 0.2.1-alpha.3 移除
+> `SubagentStartRequest.persona` / `toolFilter` 并**静默忽略**后，ACP 档的**中继指示**与
+> **agent.systemPrompt（角色语义 + 两条硬护栏）双双丢失**，工具面也不再受限 ⇒ ACP 子代理
+> 根本不知道要 `product_submit` 转发，直接抄起本地 `bash`/`write` 把活干完。
+> 本版把 persona 内容改由**初始 prompt**（宿主必然投递的通道）送达，并用**执行期工具闸**
+> 补上收窄。路由链、复用池、换档链、GUI **一字未动**。
+
+> 用户原话：「修复 `dsh-agent-dispatch` 的 **ACP 档静默退化为本地 LLM 执行**（宿主
+> 0.2.1-alpha.3 移除 `request.persona` 后，中继指示丢失 ⇒ 子代理不再调 `product_submit`，
+> 改用本地工具自己干活）。这是**最高优先级**：ACP 档名义上可用，实际完全绕过 ACP 产品。」
+
+### 现场（为什么必须改）
+
+派发 `explorer`（routes 首档 `qodercli`/ACP），**子代理成功返回**——所以从外面看这次委派
+"一切正常"。但解压它的会话（`~/.dsh/sessions/**/session.v4.jsonl.zstd`）后，真相是：
+
+| 观测 | 值 | 应该是什么 |
+|---|---|---|
+| `product_submit` 工具调用次数 | **0** | ≥1（中继协议要求必须调它转发任务） |
+| 系统提示词含「中继」/「ACP 执行模式」/「调用 product_submit」 | **false / false / false** | 全 true（`lib/dispatch.js` 构造的 `acpPersona` 明明含这些文本） |
+| 子代理实际驱动模型 | `workbuddy/deepseek-v4.1-flash` | ACP 产品侧的模型 |
+| 子代理实际调用的工具 | `grep` / `read` / `bash`（**本地宿主工具**） | `product_submit` |
+| 子代理手里的工具数 | **64**（与父会话完全相同，含 `write`/`edit`/`bash`） | 仅 `product_submit` |
+
+⇒ ACP 档**名义上可用，实际完全绕过 ACP 产品**：它退化成"挂着 ACP 名头的本地 LLM 档"。
+附带后果：v0.7.18 的 `EMPTY_RESPONSE` 重试**从未被触发**（根本没走 ACP 的 `bridge.submit()`）。
+
+### 根因
+
+`request.persona` 与 `request.toolFilter` 在新宿主上**都是死字段**：
+
+- 宿主 `dsh-subagent` 0.2.1-alpha.3 的 `SubagentStartRequest` 已移除二者（宿主侧
+  `request.persona` / `request.toolFilter` **0 命中**，被静默忽略）；
+- 唯一生效点 `applyChildOverrides` 读的是 `composition.persona` / `composition.toolFilter`
+  （`dsh-subagent/lib/index.js:384-396`），而 `startLocal` 构造 composition 时**只写**
+  `{ agentPreset: request.agentPreset }`（同文件 `:1452`）——**从不**写入这两个字段
+  ⇒ 从 request 传进去**必然到不了**那里；
+- 唯一会写入它们的入口是 resume 路径读历史 descriptor（`:2177-2181`），而 descriptor 由
+  `snapshotSubagentDescriptor` 生成、**同样不含**这两字段（`:1404-1412`）⇒ 新建 child 无法利用。
+
+**`request.agentPreset` 也不可用**：ACP provider 自己声明 `capabilities.agentPreset = false`
+（`dsh-plugin-product-subagents/lib/host-compat.js:106-124`），宿主 `assertCapabilities` 会对任何
+带 `agentPreset` 的请求直接抛 `UNSUPPORTED_CAPABILITY`（宿主 `:3311-3312`）。
+
+两处失效的**危害等级不同**，这是本版最值得记的一点：
+
+| 死字段 | 失效形态 | 用户可见性 |
+|---|---|---|
+| `toolFilter: { allow: ['product_submit'] }` | 工具面**完全不收窄** | 看得见（64 个工具）但**没人看** |
+| `persona`（= `agent.systemPrompt` + 中继指示） | 中继指示**与角色 persona 一起丢** | **完全静默** |
+
+第二行更危险：`agent.systemPrompt` 不只承载角色描述，还承载两条**硬护栏**
+（「严禁再向下委派」与「权限不足必须上报、绝不自行扩大权限」）。它丢了以后，
+子代理既不转发任务、也不守护栏——而**测试全绿**，因为测试桩看不到宿主的忽略行为。
+
+### Fixed
+
+- **`lib/dispatch.js` 中继指示与角色 persona 改由初始 prompt 送达（本次核心修复）**：
+  初始 prompt 是宿主**必然投递**的通道（`startLocal` → `materialize` → `submitMaterialized`
+  投递 `request.prompt`），不依赖任何已被移除的 request 字段。构造顺序固定为
+  **`acpPersona`（角色 → 中继）→ `upgradeHandoff.summary`（前情）→ `taskText`（任务本体）**，
+  用数组 + `filter(非空)` + `join('\n\n')` 拼接，空段自动消失。
+  **ACP 与 LLM 两档都修**（两条路径的 persona 原本都只走已死的 `request.persona`）。
+- **单一真源，不重复注入**：新增 `const relayDirective`，中继文案**只定义一次**；
+  `acpPersona = acpMode ? \`${agent.systemPrompt}\n\n${relayDirective}\` : agent.systemPrompt`。
+  旧宿主走 `persona`、新宿主走 `prompt`，**同一份文本**；`initialPrompt` 首段直接复用
+  `acpPersona`（而非再拼一次 `relayDirective`）⇒ 文案不可能两处分叉、也不可能重复出现。
+- **`lib/relay-guard.js`（新增）：ACP relay 子代理的执行期工具闸**。
+  `RELAY_ALLOWED_TOOLS = { product_submit, send_message }`，其余工具在执行期一律拒绝，
+  拒绝原因**指向正确路径**（"你是 ACP 中继子代理……必须调用 `product_submit` 转发"），
+  而不是只说不许。登记表 `relayChildren` 由 `dispatch.js` 在 ACP 档 child 建立后立刻登记，
+  在 `purgeParent` / `closeChild`（仅真正回收时）/ `dispose` 中清理。
+- **`index.js` 的全局 `tools.guard` 接上 relay 闸**，且**先于**既有递归护栏判定
+  （relay 的面更严；先判它才能给出可操作的拒绝原因，否则 relay 子代理调 `bash` 只会撞上
+  "禁止再向下委派"这类不相关文案）。豁免口径与既有递归护栏一致（`send_message` 回传结果）。
+- **`lib/dispatch.js` 死字段旁加显式警告注释**：`persona` / `toolFilter` 处写明"**以下
+  persona / toolFilter 在新宿主上是死字段，不得再当作防护依赖**"，并给出宿主侧行号证据。
+  本次事故的成因正是"看起来在防护、实则无效"的代码——**不再留下这种代码**。
+
+### 明确的局限（不得淡化）
+
+工具闸是**执行期拦截**，**挡不住"工具可见"**：relay 子代理的系统提示词里依然列着
+`write`/`edit`/`bash` 等 64 个工具，模型**看得见**它们，只是调用时被拒。
+它能挡住的是本次事故的**真实危害**——"模型自作主张用本地工具把活干完"。
+**可见性收窄在本宿主版本上不可行**（见上方根因：`persona`/`toolFilter` 死字段、
+`agentPreset` 被 ACP provider 声明为 `false`），需要宿主重新提供送达路径。
+
+### 防「假绿」（本版的方法论要点）
+
+两条修复都对应**静默**失效点，普通测试抓不到（测试桩看不见宿主的忽略行为），因此
+`verify.mjs` 新增 v1.12.18 守卫，每条都**可证伪**：
+
+- **正向**：断言 `initialPrompt` 是数组拼接形态且**首段必须是 `acpPersona`**；
+- **反向**：断言 `initialPrompt` **不得退回**"只拼 `upgradeHandoff.summary` + `taskText`"的
+  **旧事故形态**（正则匹配旧写法，改回去即抛）；
+- **单一真源**：断言 `【ACP 执行模式】` 文案在 `dispatch.js` 中**只出现一次**；
+- **死字段警告**：断言 `persona`/`toolFilter` 旁存在"死字段、不得当防护依赖"的显式注释；
+- **接线完整性**：断言 `relayChildren` 有登记、有 `import`、**有清理路径**，
+  且 `index.js` 的 `tools.guard` **真的调用了** `relayDenialReason` 并 `return` 拒绝原因
+  ——"注册了却没人调用"正是本次事故的形态。
+
+### Added
+
+- **`test/acp-relay-persona.test.js`**：7 条用例、三组断言。
+  A 组钉 persona 送达（含 `systemPrompt` **与**中继指示同时出现、各只出现一次、顺序正确、
+  LLM 档同样修复）；B 组钉 relay 闸（本地工具被拒且拒绝原因指向 `product_submit`、
+  `product_submit`/`send_message` 放行、非 relay 子代理与父代理**不受影响**、
+  结算后登记**不失效**——否则续聊/冷恢复第二次调用就重新获得全部本地工具）；
+  C 组从 `apply()` 真实注册的 guard 上驱动，断言行为而非源码。
+- **`verify.mjs` 新增 20 条 v1.12.18 守卫（15 条源码锚点 + 5 条行为断言）**（见上「防假绿」）。
+
+### Tests
+
+`npm test` **756 pass / 0 fail**（749 → 756，新增 7 条）；`node verify.mjs` OK；
+`node scripts/check-host-compat.mjs` 21 项全绿。
+
+**自证（测试有牙）** —— 新测试在未打补丁的版本上**必须失败**，三种变异各跑一遍：
+
+| 变异 | 做法 | 结果 |
+|---|---|---|
+| M1 | `initialPrompt` 退回"只送 taskText"的旧形态 | **2 fail**（A 组两条） |
+| M2 | 去掉 `relayChildren.add(childId)` 登记 | **2 fail**（B 组两条） |
+| M3 | pre-patch 快照 + relay-guard 空桩（让断言而非 import 错误决定成败） | **6 fail / 7**（A、B、C 三组全红） |
+
+### 遗留
+
+- **工具可见性未收窄**（执行期拦截可绕过路径：模型若坚持调 `bash` 会一直拿到拒绝错误，
+  但工具仍在提示词里）。根治需宿主为 ACP provider 恢复 persona/toolFilter 送达路径，
+  或让 ACP provider 声明 `capabilities.agentPreset = true` —— 两者都要动
+  `dsh-plugin-product-subagents`（**本次未改该仓**，方案见交付报告）。
+- 旧宿主（≤0.2.0）下 `persona` 与初始 prompt **会各送一次**同一份文本：功能正确
+  （内容重复但一致），仅提示词略长。未做版本分支——分支会让两条通道的文案有分叉风险，
+  而重复一份等长文本的代价远小于再次静默丢失。
+
+## 1.12.17（2026-10-15）
+
+> 一句话：**修宿主换代（`@deepseek-ai/dsh@0.2.1-alpha.3`）把本插件打瘫** —— 宿主把
+> `SubagentRuntime.startContinuable` 改名为 **`startActivation`**（且新增**必填**字段 `delivery`）、
+> `drainContinuableChildren` 改名为 **`drainChildren`**。前者让**全路由派发**直接抛
+> `startContinuable is not a function`，后者让空闲回收**静默失效**。委派链路、
+> 复用池语义、路由链、GUI 渲染**一字未动**（本版纯粹是宿主契约接线 + 护栏）。
+
+> 用户原话：「刚升级了 dsh，是否需要修改当前插件，修复 agent_dispatch 问题」；
+> 后续：「修好两个插件后，帮我打包并安装，由我来重启验证」。
+
+### 现场（为什么必须改）
+
+升级宿主后 `agent_dispatch` **5 条路由全灭**，且报错本身就在指认根因：
+
+```
+Error: Agent 初级编码员(simple-dev) 所有路由均失败，已尝试:
+our-free-model/…, deveco, qodercli/qfmodel, opencode, deepseek-official/…
+；最后一个错误: this.ctx.subagents.startContinuable is not a function
+```
+
+两处失效的性质**不同**，这是本版最值得记的一点：
+
+| 旧调用 | 新宿主 | 失效形态 |
+|---|---|---|
+| `startContinuable` | `startActivation` | **loud throw** —— 全路由派发失败（用户立刻可见） |
+| `drainContinuableChildren` | `drainChildren` | **静默跳过** —— `typeof … === 'function'` 恒 false ⇒ 驻留 Activation 永不回收（空闲释放 / LRU 淘汰 / `agent_close` 全部失效，用户**看不见**） |
+
+第二行是更危险的那个：`lib/dispatch.js` 的 `#drainChild` 原本写成
+`if (parent && typeof this.ctx.subagents.drainContinuableChildren === 'function')`，
+新宿主下整个分支被跳过且**不报任何错**，资源静默挂账。
+
+### Fixed
+
+- **`lib/dispatch.js` 新建 child（根因之一）**：软兼容双名 ——
+  `startActivation?.bind(...) ?? startContinuable?.bind(...)`，优先新名、回退旧宿主（≤0.2.0）；
+  **两端全无则 loud throw**（`宿主 subagents 服务未暴露 startActivation/startContinuable`），
+  不再静默失败。`.bind(this.ctx.subagents)` 保留 `this` —— 两个方法都是
+  `SubagentRuntime.prototype` 上的方法，detach 后调用会丢 `this`。
+- **`lib/dispatch.js` 补 `delivery: 'parent'`**：0.2.1-alpha.3 起该字段**必填、无默认值**。
+  语义见宿主 `dsh-subagent/lib/types/types.d.ts:36-37`：`'parent'` = 结算结果作为 settlement
+  通知投递给父代理/模型；`'caller'` = 宿主 `index.js:2049` 的 `notifySettlement` 第一行
+  `if (!activation.announced || activation.delivery === 'caller') return` **直接吞掉通知**，
+  只留 `activation.result` 给调用方 `await`。本插件是「用户发起的后台子代理」语义 ⇒ 必须 `'parent'`。
+  附带效应（同一判定点）：`'caller'` 走可选的 `sessionPersistence`（`index.js:1395`），
+  `'parent'` 走 `requirePersistence()` —— 冷恢复所依赖的持久化，与本插件的复用池/续聊语义一致。
+- **`lib/dispatch.js` 空闲回收（根因之二，静默失效）**：
+  `drainChildren ?? drainContinuableChildren`，并改用
+  `drain.call(this.ctx.subagents, parent, [childId])`。**签名两代同形**
+  （`drainChildren(parent: Agent, childIds: readonly SessionId[])`，见
+  `dsh-subagent/lib/types/index.d.ts:218`）⇒ 只需改名，传参顺序不动。
+
+### 防「假绿」（本版的方法论要点）
+
+只把测试桩改名是**不够的**：旧实现读 `startContinuable` 拿到 `undefined`，
+桩里记录的 `started` / `startCalls` 恒为空，而原有断言只校验注记与降级语义 ⇒ **用例照样全绿**。
+因此三个桩（`test/childid-continuation.test.js`、`test/acp-config-fallback.test.js`、
+`test/failover.test.js`）改名后**刻意不保留旧名**，并新增
+`assertStartActivationIsTheOnlyEntry()`：断言旧名必须为 `undefined`、新名调用计数必须为 1
+（旧实现下恒为 0 ⇒ 用例变红）。这是一条**可证伪**判据，而不是「改完看起来对」。
+
+### Added
+
+- **`scripts/check-host-compat.mjs`**：对**真实安装的宿主** d.ts 做契约自检（21 项），
+  既校验宿主侧形状（`startActivation.length === 1`、`drainChildren.length === 2`、
+  `SubagentActivationSpec` 含必填 `delivery`、`SubagentStartRequest` 已移除 `persona`/`toolFilter`），
+  也**反向断言插件已接线**（优先新名、保留回退、两端全断 loud throw、顶层 `delivery: 'parent'`、
+  `drain` 保留 `this`、无残留直连旧名）。挂为 `npm run check:host`。
+- **`verify.mjs` 新增 8 条 v1.12.17 守卫**，双向设防：既断言软兼容链存在，
+  也**反向断言不得再直连旧名** —— 旧写法在新宿主下是「绿着但生产静默失效」，单向守卫抓不到。
+
+### 遗留（重要）
+
+宿主 0.2.1-alpha.3 的 `SubagentStartRequest` **已移除 `persona` / `toolFilter`**，
+本插件仍传这两个字段，宿主当前**静默忽略**（`lib/dispatch.js` 中已留注释）。
+⇒ **权限边界不要依赖 `persona` / `toolFilter`**；替代方案是 `request.agentPreset`（Agent Preset），
+迁移设计见 `docs/agent-preset-migration.md`。本版**未**改用 `agentPreset`，留待后续版本。
+
+### Tests
+
+`npm test` **749 pass / 0 fail**；`node verify.mjs` OK；`node scripts/check-host-compat.mjs`
+21 项全绿（`宿主契约 OK on @deepseek-ai/dsh@0.2.1-alpha.3`）。
+
 ## 1.12.16（2026-10-07）
 
 > 一句话：**高危专用行的两处缺口补上** —— 黄球（ACP）高危行补回「↗ 打开该子代理会话」，

@@ -39,7 +39,11 @@ function makeHarness({ routes = [{ provider: 'deveco', model: 'GLM-5.1', effort:
   const ctx = {
     subagents: {
       getProvider: (name) => (ACP_PROVIDERS.has(name) ? { name } : undefined),
-      startContinuable: async (spec) => {
+      // v1.12.17：宿主 0.2.1-alpha.3 把 startContinuable 改名为 startActivation。
+      // 桩必须跟着改名（且不保留旧名）：否则"桩还挂在旧名上"会让"被测代码是否真的走
+      // 新名"变成假绿——旧实现读 startContinuable 拿到 undefined，`started` 恒为空，
+      // 而下面的断言只校验"注记/降级语义"，不会因此变红。
+      startActivation: async (spec) => {
         if (failOn && spec.provider === failOn) throw new Error(`${spec.provider} 起不来`)
         started.push(spec)
         return { childId: `child-${started.length}` }

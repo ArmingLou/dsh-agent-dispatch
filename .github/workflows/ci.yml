@@ -151,13 +151,19 @@ jobs:
       #      蓝球高危行补 `ha-reason` / `ha-paths` / `ha-cwd` 三行上下文（与普通行同源）+5 条；
       #      `test/grant-dialog.test.js` 一条既有源码锚点按本意收窄到 `permGrantTip` 函数体，
       #      并新增「两条通道区间内不许出现 join("\n")」的全局断言 ⇒ 净 +13 条用例）。
-      #   **MIN_TESTS 故意留 2 条余量（748 - 2 = 746）**：`test/host-0.2-compat.test.js` 里有一条硬编码
-      #   macOS 路径的用例，在 ubuntu runner 上会 **skip**（`SKIPPED_ALLOWED: 1` 正是为它留的）⇒
-      #   CI 实际 pass 期望 747；若把 MIN_TESTS 钉到 748 会因这条 skip 直接红（余量 0 太脆）。
+      #   **MIN_TESTS 故意留 1 条余量**：`test/host-0.2-compat.test.js` 里有一条硬编码
+      #   macOS 路径的用例，在 ubuntu runner 上会 **skip**（`SKIPPED_ALLOWED: 1` 正是为它留的）。
+      #   v1.12.19/v1.12.20 收尾实测（macOS 本机，`node --test --test-reporter=tap test/*.test.js`）：
+      #   `# tests 789 / # pass 789 / # fail 0 / # cancelled 0 / # skipped 0 / # todo 0`，exit 0
+      #   ——**本机实测 789（macOS 跳过 0）**，故 `MIN_TESTS: 746 → 789`（抬高 43）。
+      #   ubuntu runner 上那条 macOS 用例会 skip ⇒ CI 期望 pass 789 - 1 = 788，
+      #   `floor = MIN_TESTS - SKIPPED_ALLOWED = 788` 正好留 1 条余量。
+      #   （语义：`# tests ≥ 789` 用 MIN_TESTS 本身卡；`# pass ≥ 788` 用 floor 卡。）
+      #   （注意：不是 2 条余量——旧值 746 是 1.12.16 时代的 748-2，早已落后于用例增长。）
       # 新增用例时请一起把这个数抬上去。
       - name: 单元 / 集成测试（含用例条数守卫）
         env:
-          MIN_TESTS: 746
+          MIN_TESTS: 789
           SKIPPED_ALLOWED: 1
         run: |
           set -uo pipefail

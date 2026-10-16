@@ -1,6 +1,6 @@
 {
   "name": "@kiligzzz/dsh-agent-dispatch",
-  "version": "1.12.16",
+  "version": "1.12.20",
   "description": "User-defined agents with automatic routing for DeepSeek Harness: fixed-persona continuable subagents, per-agent model routes with failover, dispatch/followup/list/squad/import/upsert tools, and a routing prompt section. No built-in agents — create your own via the panel, import from skills, or upsert programmatically without restart. Dual-face dsh plugin (host + browser half), no DSH source changes.",
   "keywords": [
     "dsh",
@@ -27,17 +27,20 @@
   "main": "index.js",
   "scripts": {
     "test": "node --test test/*.test.js",
-    "verify": "node verify.mjs"
+    "verify": "node verify.mjs",
+    "check:host": "node scripts/check-host-compat.mjs"
   },
   "exports": {
     ".": "./index.js",
     "./client": "./lib/client.js",
+    "./relay-allowlist": "./lib/relay-allowlist.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
     "index.js",
     "lib",
+    "scripts",
     "cordis.patch.yml",
     "README.md",
     "README.en.md",

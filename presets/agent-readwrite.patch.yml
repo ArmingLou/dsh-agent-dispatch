@@ -1,0 +1,164 @@
+# ⚠ 待人工合并片段 —— 本文件【不自动生效】，不会被任何构建/加载流程读取。
+#
+# 它是 `agent-readwrite` preset 的定义片段，供人工审核后**追加**到
+# `~/.dsh/profiles/web/cordis.patch.yml`（与既有的 `preset-orchestrator` 同层，
+# 见该文件 :128-175）。写入 `~/.dsh` 属高风险操作，须由用户明确授权后单独执行；
+# 本仓库不代为写入。
+#
+# agent-readwrite preset —— 读写代理（不含委派）
+#
+# 用途：给子代理使用的**完整写能力**工具面，与主代理 (preset-orchestrator) 的区别是：
+#       **去除所有委派类工具**（子代理不该再向下委派）。
+# 层归属的权威依据：`dsh-web-app/cordis.patch.yml:474-577`（宿主层 disable 的 23 行）。
+#
+# 关键判断：
+# 1. **product_submit 不给**（结论：不挂 + 显式 deny）——它在 global 层可见，但 LLM/spawn 档调用
+#    **必失败**：`no remote product session is bound to this agent (recovery failed)`
+#    （`dsh-plugin-product-subagents/lib/tools/product-submit.js:104`；bindings 只在 ACP 档
+#    `prepareContinuable` 时建卡）。它挂在 profile 根行 ⇒ 省略无效，须靠 restrict deny。
+#    `product_delegate` 同样能起产品子代理（也是委派类），一并 deny。
+# 2. **memory/MCP 自动继承**——注册在 global 层（profile 顶层 `agentmemory` 行 +
+#    `dsh-base/cordis.patch.yml:485` 的 mcp-resources），无需重复挂载，已实测验证。
+# 3. **委派组本身在 preset 面**——`subagent`/`subagent_fork`/`workflow`/`ralph`/`send_message`/
+#    `list_agents`/`interrupt_agent` 对应的宿主行已被 `dsh-web-app` disable ⇒ 不挂即真的没有，
+#    无需（也不能）deny。
+#
+# 策略（两件事同时做）：
+# ① 镜像 orchestrator preset 的插件行，**减去 delegation 组**（含 subagent/fork/workflow/ralph）；
+# ② 再加一条 `tools.restrict({ deny: [...] })` 遮掉**宿主面残留的委派通道**。
+#
+# ★ deny 名单的命名空间：必须是**工具名**（`agent_dispatch`），不是插件 id（`tool-subagent`）。
+#   写错名字会 loud throw ⇒ **整个 preset 挂载失败**（preset 注册表记为 broken）。
+#
+
+- insert:
+    - id: preset-agent-readwrite
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: agent-readwrite
+        name: 读写代理
+        description: 读写子代理：具备完整本地工具能力（读/写/命令执行），但不可向下委派；用于实现任务。
+        order: 9
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: >-
+                你是读写子代理（Read-Write Agent），由 {{model}} 模型驱动。
+                核心职责：**安全执行实现、修改、测试**，不调用委派工具（subagent/workflow/product）。
+                最高优先级动作：接到任务后拆解步骤，用本地工具直接实现；遇到复杂需求先 plan 再执行。
+                - 可用工具：read/write/edit/grep/glob（工具档）、bash/pwsh（命令行）、job 起后台进程、
+                  skill/goal/todo（项目管理）、web_search/web_fetch（Web 查询）、memory_*（记忆）、MCP。
+                - 禁作：subagent/fork/workflow/ralph（向下委派）；agent_dispatch/agent_squad 等委派工具；product_submit（无 ACP 绑定）。
+                - 边界确认：涉及跨目录/敏感路径/大改动时主动确认；不确定则 ask_user_question。
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          # ★ tool-bash / tool-pwsh：命令行执行（可写盘）
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          # ★ tool-fs：读写模式
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            # read/write/edit/readImage = true (全开)
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          # ★ tool-jobs：起后台进程
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          # ★ skill 系统（会写 skill 文件）
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          # ★ goal / todo（写目标/plan 状态）
+          - id: command-goal
+            name: '@deepseek-ai/dsh-command-goal'
+          - id: tool-goal
+            name: '@deepseek-ai/dsh-tool-goal'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          # ★ planning 组
+          - id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
+            config:
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                    You are in plan mode. Stay in plan mode until exit_plan_mode succeeds or the user switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+                    Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
+
+                    The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+                    Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
+
+                    Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
+
+                    When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+          # ★ compaction 组
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          # ★ tool-web（Web 查询 + fetch）
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          # ★ ask-user（人工询问）
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          # ★ deny：遮掉宿主面（global）上省略不掉的委派通道
+          #   ⚠ 每个名字必须是**工具名**且在 inherited 面，否则 loud throw ⇒ preset 挂载失败
+          #
+          #   复用已发布的 `relay-allowlist`（其 apply() 同时支持 allow/deny 两种形态，
+          #   `lib/relay-allowlist.js:61-72`）。**为何不新建专用模块**：profile 消费的是打包产物
+          #   （`file:~/.dsh/packages/kiligzzz-dsh-agent-dispatch-1.12.19.tgz`），安装副本里没有
+          #   新加的 lib 文件/exports 子路径 ⇒ 引用会 ERR_PACKAGE_PATH_NOT_EXPORTED 而整体挂载失败。
+          - id: readwrite-deny
+            name: '@kiligzzz/dsh-agent-dispatch/relay-allowlist'
+            config:
+              deny:
+                # 本仓库根 bundle 行：11 个 agent_* 委派工具
+                - agent_dispatch
+                - agent_squad
+                - agent_squad_continue
+                - agent_squad_upsert
+                - agent_failover
+                - agent_followup
+                - agent_upsert
+                - agent_import_skill
+                - agent_list
+                - agent_children
+                - agent_close
+                # product-subagents 根行：产品子代理通道
+                - product_delegate
+                - product_submit

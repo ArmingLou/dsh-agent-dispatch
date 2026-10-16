@@ -154,7 +154,168 @@ if (!dispatchSrc.includes('reasoningEffort: route.effort')) throw new Error('v1.
 // v1.5.0：同角色子代理复用池 + 空闲回收（drainChildren）
 if (!dispatchSrc.includes('this.childPool = new Map()')) throw new Error('v1.5.0: 缺同角色复用池 childPool')
 if (!dispatchSrc.includes('reusePolicy === \'fresh\' ? \'fresh\' : \'reuse\'')) throw new Error('v1.5.0: dispatch 应解析 Agent reusePolicy')
-if (!dispatchSrc.includes('drainContinuableChildren(parent, [childId])')) throw new Error('v1.5.0/v1.5.2: 空闲回收应调用 ctx.subagents.drainContinuableChildren 释放驻留（drainChildren 未暴露，统一走 #drainChild）')
+// v1.12.17：宿主 0.2.1-alpha.3 把 drainContinuableChildren 改名为 drainChildren
+// （签名同形 (parent, childIds)）。断言软兼容链与真实调用形态，而不是某个具体旧名——
+// 只写旧名会让这条守卫在新宿主上"绿着但生产静默失效"，反之只写新名会丢掉回退。
+if (!dispatchSrc.includes('drainChildren ?? this.ctx.subagents.drainContinuableChildren')) throw new Error('v1.12.17: 空闲回收应软兼容 drainChildren（新名）?? drainContinuableChildren（旧名）')
+if (!dispatchSrc.includes('drain.call(this.ctx.subagents, parent, [childId])')) throw new Error('v1.12.17: 空闲回收应经 .call(this.ctx.subagents, parent, [childId]) 调用（detach 会丢 this；参数序 parent, childIds 两代同形）')
+for (const bad of ['this.ctx.subagents.drainContinuableChildren(parent, [childId])', "typeof this.ctx.subagents.drainContinuableChildren === 'function'"]) {
+  if (dispatchSrc.includes(bad)) throw new Error(`v1.12.17: #drainChild 不得再直连旧名（新宿主下静默跳过 ⇒ 驻留 Activation 永不回收）: ${bad}`)
+}
+// v1.12.17：宿主 0.2.1-alpha.3 把 startContinuable 改名为 startActivation，且新增必填 delivery
+if (!dispatchSrc.includes('this.ctx.subagents.startActivation?.bind(this.ctx.subagents)')) throw new Error('v1.12.17: 新建 child 必须优先走 startActivation（新宿主名）')
+if (!dispatchSrc.includes('this.ctx.subagents.startContinuable?.bind(this.ctx.subagents)')) throw new Error('v1.12.17: 必须保留 startContinuable 回退（旧宿主 ≤0.2.0）')
+if (!dispatchSrc.includes('宿主 subagents 服务未暴露 startActivation/startContinuable')) throw new Error('v1.12.17: 两个方法都不存在时必须 loud throw，不得静默失败')
+if (!dispatchSrc.includes("delivery: 'parent'")) throw new Error("v1.12.17: 顶层必须带 delivery: 'parent'（宿主必填；'caller' 会吞掉 settlement 通知）")
+for (const f of ['persona: acpPersona', "toolFilter: { allow: ['product_submit'] }"]) {
+  if (!dispatchSrc.includes(f)) throw new Error(`v1.12.17: 不得删除 request 中的既有字段（本次只加注释不改存在性）: ${f}`)
+}
+if (!dispatchSrc.includes('SubagentStartRequest 已移除二者')) throw new Error('v1.12.17/v1.12.18: persona/toolFilter 旁必须留"宿主已移除并静默忽略"的注释（替代方案见 lib/relay-guard.js 机制结论）')
+
+// ── v1.12.18：ACP 档静默退化为本地 LLM 执行的修复护栏 ──────────────────────────
+// 事故：宿主 0.2.1-alpha.3 移除 request.persona/toolFilter 并静默忽略 ⇒ 中继指示与
+// agent.systemPrompt 双双丢失、工具面不再受限 ⇒ ACP 档子代理用本地 bash 把活干完
+// （实测 product_submit 调用 0 次、64 个工具全在手）。下面每条都对应一个**静默**失效点。
+//
+// ① persona 内容（角色 systemPrompt + 中继指示）必须经【初始 prompt】送达。
+//    这是本次修复的正面断言：只靠 request.persona 时，新宿主上这条链是断的。
+if (!/const initialPrompt = \[/.test(dispatchSrc)) throw new Error('v1.12.18: initialPrompt 必须是数组拼接形态（才能承载 persona 前置注入）')
+if (!/const initialPrompt = \[\s*\n\s*acpPersona,/.test(dispatchSrc)) throw new Error('v1.12.18: initialPrompt 首段必须是 acpPersona（角色 systemPrompt + 中继指示）——否则新宿主下 persona 静默丢失')
+// 反向断言：不得退回"只送 taskText"的旧形态（那正是事故形态）。
+if (/const initialPrompt = upgradeHandoff\s*\n\s*\? `\$\{upgradeHandoff\.summary\}/.test(dispatchSrc))
+  throw new Error('v1.12.18: initialPrompt 不得退回"只拼 upgradeHandoff.summary + taskText"的旧形态（persona 会静默丢失）')
+// ② 单一真源：中继指示只在 relayDirective 里定义一次，acpPersona 复用它。
+if (!dispatchSrc.includes('const relayDirective = acpMode')) throw new Error('v1.12.18: 中继指示必须有单一真源 relayDirective')
+if (!dispatchSrc.includes('`${agent.systemPrompt}\\n\\n${relayDirective}`')) throw new Error('v1.12.18: acpPersona 必须复用 relayDirective（不得复制第二份文案，否则两处会分叉）')
+if ((dispatchSrc.match(/【ACP 执行模式】/g) || []).length !== 1) throw new Error('v1.12.18: 【ACP 执行模式】文案在 dispatch.js 中必须只出现一次（单一真源）')
+// ③ 死字段必须带显式警告注释——本次事故的成因就是"看起来在防护、实则无效"。
+if (!dispatchSrc.includes('**以下 persona / toolFilter 在新宿主上是死字段')) throw new Error('v1.12.18: persona/toolFilter 旁必须留"死字段、不得当防护依赖"的显式警告注释')
+// ④ ACP 档工具面必须靠 relay 闸收窄（可见性收窄在本宿主不可行，见 lib/relay-guard.js）。
+if (!dispatchSrc.includes('if (acpMode) relayChildren.add(childId)')) throw new Error('v1.12.18: ACP 档 child 必须登记进 relayChildren，否则执行期工具闸认不出中继')
+if (!dispatchSrc.includes("import { relayChildren, markRelayChild } from './relay-guard.js'")) throw new Error('v1.12.18: dispatch.js 必须 import relayChildren（v1.12.20 起同时 import markRelayChild 补登记辅助）')
+if (!dispatchSrc.includes('relayChildren.delete')) throw new Error('v1.12.18: relayChildren 必须有关闭/清理路径（否则集合只增不减）')
+const relayGuardSrc = rf(path.join(root, 'lib', 'relay-guard.js'), 'utf8')
+if (!relayGuardSrc.includes("export const RELAY_ALLOWED_TOOLS = new Set(['product_submit', 'send_message'])")) throw new Error('v1.12.18: relay 闸只放行 product_submit + send_message')
+if (!relayGuardSrc.includes('export function relayDenialReason(exec)')) throw new Error('v1.12.18: relay 闸必须导出可单测的 relayDenialReason')
+// v1.12.20（fail-open 修复）：补登记必须是**薄封装**而非外部直接 add，否则
+// 参数校验/去重语义会在每个调用点各写一遍并分叉。
+if (!relayGuardSrc.includes('export function markRelayChild(childId)')) throw new Error('v1.12.20: relay-guard.js 必须导出 markRelayChild（续聊/恢复补登记的唯一入口）')
+if (!relayGuardSrc.includes('export function isRelayChild(childId)')) throw new Error('v1.12.20: relay-guard.js 必须导出 isRelayChild（外部查询登记态，避免直接摸 Set）')
+// v1.12.20：补登记必须落在**所有续聊的公共通道** followup() 上（定向 childId 续聊
+// 与复用池续聊都经它），否则任一入口单独补都会漏掉另一条。
+if (!/async followup\([\s\S]{0,6000}?if \(relayAcp\) \{\s*markRelayChild\(deliveredTo\)/.test(dispatchSrc))
+  throw new Error('v1.12.20: followup() 必须在投递成功后按账本 acpMode 补登记 relay（Blocker A/B 的唯一收敛点）')
+// v1.12.20：completedFresh 是"池外/历史线程"唯一可判定的账本，两处写入口
+// （onChildEnd 尾部、followup 历史重建）都必须带 acpMode，否则冷恢复无从判定。
+if (!/completedFresh\.set\(childId, \{[\s\S]{0,500}?acpMode: entry\.acpMode \?\? false/.test(dispatchSrc))
+  throw new Error('v1.12.20: onChildEnd 写入 completedFresh 时必须带 acpMode（否则历史线程冷恢复判不出 ACP）')
+if (!/if \(!this\.activeChildren\.has\(childId\)\)[\s\S]{0,900}?acpMode:/.test(dispatchSrc))
+  throw new Error('v1.12.20: followup 从历史重建 activeChildren 时必须继承 acpMode')
+// relay 闸必须真的接在全局 tools.guard 上（注册了却没人调用 = 静默无效，正是本次事故的形态）。
+if (!host.includes("import { relayDenialReason } from './lib/relay-guard.js'")) throw new Error('v1.12.18: index.js 必须 import relayDenialReason')
+if (!host.includes('const relayReason = relayDenialReason(exec)')) throw new Error('v1.12.18: index.js 的 tools.guard 必须调用 relayDenialReason（否则 relay 闸是死代码）')
+if (!host.includes('if (relayReason !== undefined) return relayReason')) throw new Error('v1.12.18: relay 闸判定必须先于递归护栏并真的 return 拒绝原因')
+// ⑤ 行为断言（有牙）：新测试必须存在，且覆盖「初始 prompt 含 systemPrompt + 中继指示」与「relay child 本地工具被拒」。
+const relayTest = rf(path.join(root, 'test', 'acp-relay-persona.test.js'), 'utf8')
+for (const [pat, msg] of [
+  [/agent\.systemPrompt（角色语义 \+ 递归\/权限护栏）必须出现在初始 prompt 中/, 'v1.12.18: 缺「systemPrompt 必须送达初始 prompt」的行为断言'],
+  [/中继指示必须只出现一次/, 'v1.12.18: 缺「中继指示不得重复注入」的行为断言'],
+  [/relay child 调 \$\{tool\} 必须被拒/, 'v1.12.18: 缺「relay child 本地工具被拒」的行为断言'],
+  [/非 relay 子代理的 bash 不得被 relay 闸拒绝/, 'v1.12.18: 缺「防修过头」的反向断言'],
+  [/guard 必须放行 relay child 调 product_submit/, 'v1.12.18: 缺「product_submit 必须放行」的断言（否则中继无法转发任务）'],
+  // v1.12.20：fail-open 修复的行为断言（缺任一条都会让 Blocker A/B 无声回归）
+  [/定向续聊命中池内 ACP 线程后必须补登记/, 'v1.12.20: 缺「定向续聊（池内）补登记」断言——Blocker A/B'],
+  [/历史线程定向续聊后必须补登记/, 'v1.12.20: 缺「定向续聊（历史线程）补登记」断言——Blocker B'],
+  [/复用池续聊 ACP 线程后必须补登记/, 'v1.12.20: 缺「复用池续聊补登记」断言——Blocker A'],
+  [/dispose 后必须注销/, 'v1.12.20: 缺「dispose 注销」断言（防模块级单例残留陈旧 childId）'],
+  [/运行中线程 closeChild 不得注销/, 'v1.12.20: 缺「运行中 closeChild 保留登记」断言（刻意设计不得退化）'],
+  [/purgeParent 后必须注销该父会话的 relay 登记/, 'v1.12.20: 缺「purgeParent 注销」断言'],
+  [/LLM 档 child 不得登记为 relay/, 'v1.12.20: 缺「防修过头：LLM 档不得被补登记」的反向断言'],
+]) {
+  if (!pat.test(relayTest)) throw new Error(msg)
+}
+// ── v1.12.19：逐档（per-route）Agent Preset 选择的护栏 ─────────────────────────
+// 背景：宿主移除 request.persona / request.toolFilter 后，工具面收窄的唯一可行
+// 入口是 `agentPreset`（Agent Preset = 一串 Cordis 插件行 ⇒ 收窄是**结构性**的，
+// 不是参数过滤）。但宿主 agentPreset 是**单个标量**，而本插件的 failover 链跨
+// provider 类型（例 explorer = qodercli(ACP) → deveco → opencode → workbuddy(LLM)
+// → deepseek-official），ACP 档与 LLM 档的工具面语义**不对称**（前者 = 中继收窄，
+// 后者 = 宿主真过滤），故必须在 failover 循环内**按该档类型**取值。
+// 下面每条都对应一个**静默**失效点（改坏即报红）。
+
+// ① 正向：必须存在逐档取值表达式，且 ACP 分支只读 `agent.acpPreset`。
+//    这条同时承担"防退化回单标量"的职责——把它改成 `acpMode ? agent.agentPreset`
+//    会被 ③ 的反向断言直接判红。
+if (!dispatchSrc.includes('acpMode ? agent.acpPreset : agent.agentPreset'))
+  throw new Error('v1.12.19: 必须存在逐档 preset 取值（ACP 档读 agent.acpPreset、LLM/spawn 档读 agent.agentPreset）——否则退回"给 agent 钉死一个标量 preset"的旧形态')
+
+// ② 正向：request 里该键必须是**条件展开**，未配置 ⇒ 键**根本不出现**。
+//    这是"零回归"的唯一可断言形态：未配置的用户必须完全继承父会话 preset。
+if (!dispatchSrc.includes('presetForRoute !== undefined ? { agentPreset: presetForRoute } : {}'))
+  throw new Error('v1.12.19: request 里的 agentPreset 必须是条件展开（presetForRoute !== undefined ? {…} : {}）——否则未配置时也会下发该键，破坏"继承父会话 preset"的零回归语义')
+
+// ③（反向，**本次最重要的安全约束**）ACP 分支不得引用 agent.agentPreset。
+//    防的是**交叉污染**：ACP 档的工具在外部产品进程里，该档只应挂"中继收窄"preset；
+//    一旦回落 LLM 档的值，就会把一个为"宿主真过滤"设计的 preset 挂到中继档上
+//    ——工具面与预期不符且**静默生效**（正是本插件反复中招的"看起来在防护、实则无效"形态）。
+if (/acpMode\s*\?\s*agent\.agentPreset/.test(dispatchSrc))
+  throw new Error('v1.12.19: ACP 档不得引用 agent.agentPreset（交叉污染：ACP 档是中继收窄、LLM 档是宿主真过滤，二者语义不对称，绝不可互相回落）')
+
+// ④（反向）不得退回无条件写入该键的旧形态——`agentPreset: X` / `agentPreset: undefined`
+//    无条件赋值会让"未配置"变成"下发 undefined"，宿主侧 preset 解析失败即整次派发报错。
+//
+//    ⚠ 判别口径（上一轮踩过的坑）：本插件里**合法**的形态长这样——
+//        ...(presetForRoute !== undefined ? { agentPreset: presetForRoute } : {}),
+//    即"键在条件对象字面量里，紧跟在 `?` 之后"。它**必须不被判红**，否则守卫自己就成了
+//    假红来源（改坏验证时会误以为守卫有牙，实际只是咬了自己）。
+//    故判据 = 键前一个非空白字符：
+//      · `?`   ⇒ 条件真分支 ⇒ 合法（② 已正向断言该形态存在）；
+//      · 其余（`,` `{` `(` 行首 …）⇒ 无条件写入 ⇒ 判红。
+//    另：`(?<![.\w}])` 排除读宿主字段的注释/代码（`request.agentPreset:`、`{agentPreset:` 嵌套）。
+const unconditionalPreset = (() => {
+  // 为什么不用 `m.index + m[0].indexOf(':')` 这类偏移反推：本正则的前导空白会让 `m.index`
+  // 落在**空白**而非键名首字符上，于是"键名偏移 + m.index"系统性偏 1 个字符，把**合法**的
+  // `? { agentPreset: X }` 误判成无条件写入 ⇒ 守卫自咬成假红（实测踩过）。
+  // 改用**两段式**，每段都简单到不需要偏移算术，且两步都有直观的"漏判/误判"含义：
+  //   ① scrubbed = 源码去掉行注释，再把**合法形态** `? { agentPreset:` 抹成占位符
+  //      —— 这一步只可能造成"漏判"（漏刮），不会造成误判；
+  //   ② 在 scrubbed 上找**剩下的** `agentPreset: <值>` 声明（`(?<!…)` 排除 `a.agentPreset:`
+  //      这种读字段写法）—— 剩下的每一个都是无条件写入 ⇒ 判红。
+  // 合法形态只有一种（② 已正向断言它在场），故白名单用 `?` 精确匹配即可，不必容忍歧义。
+  const scrubbed = dispatchSrc
+    .replace(/\/\/[^\n]*/g, '')
+    .replace(/\?\s*\{\s*agentPreset\s*:/g, '?{SCRUBBED:')
+  const declRe = /(?<![.\w$}])agentPreset\s*:\s*(?:undefined|null|['"`]|[\w$])/g
+  return declRe.exec(scrubbed)
+})()
+if (unconditionalPreset)
+  throw new Error(`v1.12.19: request 里的 agentPreset 不得无条件赋值（${unconditionalPreset[0]}）——必须保持条件展开，否则未配置的用户会被下发一个非法 preset 值`)
+
+// ⑤ 注册表侧：validateAgent 校验 + normalizeAgent 归一化 + needsNormalize 偏离口径，
+//    三者必须**同时**覆盖 acpPreset 与 agentPreset（缺任一侧都会让"配置了却不生效"或
+//    "空串静默落键"这类问题重现）。
+const agentsSrc = readFileSync(path.join(root, 'lib', 'agents.js'), 'utf8')
+if (!agentsSrc.includes('agent.acpPreset !== undefined')) throw new Error('v1.12.19: validateAgent 必须校验 acpPreset（空串/纯空白/null/非字符串一律响亮拒绝）')
+if (!agentsSrc.includes("typeof agent?.acpPreset === 'string' && agent.acpPreset.trim() !== ''"))
+  throw new Error('v1.12.19: normalizeAgent 必须归一化 acpPreset（缺失/空串/纯空白/非字符串 ⇒ 不落键）')
+if (!agentsSrc.includes('raw.acpPreset'))
+  throw new Error('v1.12.19: needsNormalize 必须把 acpPreset 纳入偏离口径（否则手写坏记录不会被判为需规整）')
+if (!agentsSrc.includes('raw.agentPreset') || !agentsSrc.includes('agent.agentPreset !== undefined'))
+  throw new Error('v1.12.19: 归一化/校验必须同样覆盖 agentPreset（两个字段同口径，不得只做一侧）')
+
+// ⑥ 行为断言（有牙）：新测试必须覆盖"逐档取值"与"未配置即无键"两个方向，
+//    尤其必须有**混合 failover 链（ACP 失败 → LLM 接管）两档 preset 不同**的用例
+//    ——那正是"共用一个标量"会在真实链路上暴露的失败点。
+const presetTest = readFileSync(path.join(root, 'test', 'acp-preset-per-route.test.js'), 'utf8')
+for (const [pat, msg] of [
+  [/request \*\*无\*\* agentPreset 键（零回归）/, 'v1.12.19: 缺「未配置 ⇒ request 无 agentPreset 键」的零回归断言'],
+  [/ACP 档取 acpPreset/, 'v1.12.19: 缺「ACP 档取 acpPreset」的断言'],
+  [/LLM 档不得借用 acpPreset/, 'v1.12.19: 缺「LLM 档不得借用 acpPreset」的反向断言（防交叉污染）'],
+  [/两档 preset 必须不同/, 'v1.12.19: 缺「混合 failover 链两档 preset 不同」的断言——这正是单标量方案会失败的场景'],
+]) {
+  if (!pat.test(presetTest)) throw new Error(msg)
+}
+
 if (!dispatchSrc.includes('#scheduleReleaseFor(childId)')) throw new Error('v1.5.0: onChildEnd 应排空闲释放定时器')
 if (!dispatchSrc.includes('purgeParent(parentSessionId)')) throw new Error('v1.5.0: 缺父会话清理 purgeParent')
 // v1.5.1：智能复用——延续性启发式 + 调用方 reuse 参数 + 多线程 LRU 池

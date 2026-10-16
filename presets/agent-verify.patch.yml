@@ -1,0 +1,188 @@
+# agent-verify preset —— 可执行审查
+#
+# ★ 待人工合并 / 不自动生效：本文件只是**片段**，需要人工把它 insert 进
+#   `~/.dsh/profiles/web/cordis.patch.yml`（插在 `preset-agent-readwrite` 段之后、
+#   `- id: agent-preset-registry` 之前），并**重启 DSH** 才会被加载。
+#   在重启之前，任何引用 `agentPreset: agent-verify` 的派发都会硬失败
+#   （`Unknown agent preset: agent-verify`）。
+#
+# 用途：给**审查/复核类子代理**使用的工具面 —— 与 `agent-readonly` **完全相同**，
+#       只多一个 `bash`。存在的唯一理由：审查角色必须能**真跑命令做实测**
+#       （`npm test` / `node verify.mjs` / `git diff --stat`），而只读 preset 没有 bash，
+#       上一轮终审报告明确写了「本会话工具面只有 read/grep/glob/web，无 bash」，
+#       六条测试命令一条都没跑成 —— 空口审查等于没审。
+# 层归属的权威依据：`dsh-web-app/cordis.patch.yml:474-577`（宿主层 disable 的 23 行）。
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# ★★ 必须写明的取舍：本 preset **不是严格只读**，而是「**无写工具、但有 shell**」。
+#
+#   `bash` 本身就能写文件（`echo x > f`、`rm`、`git commit`、`mv`……），
+#   任何 shell 命令都可能产生副作用。所以这里**刻意放弃了"严格只读"这一属性**，
+#   换来的是"能跑测试做实测"的能力：
+#     - 拿掉的：`write` / `edit` 这两个**结构化写工具** —— 模型不会主动去"编辑文件"，
+#       fs 写通道被 config 级关死（`tool-fs: { read: true, readImage: true, write: false, edit: false }`）。
+#     - 留下的：`bash` —— 走 shell 的**间接写能力仍然存在**，只是不再是"一等公民"路径。
+#   也就是说：这是**能力分级**（无写工具 → 有 shell），不是**权限分级**。
+#   真正的沙箱边界由会话的 DSH file policy（`workspace-write` / `danger-full-access`）
+#   与 persona 的纪律（"只做只读检查，除测试命令外不产生副作用"）承担，
+#   **不**由本 preset 承担。若要"能跑测试但绝对写不了盘"，宿主当前没有这个档位。
+#
+#   ⚠ 复核（`dsh-tool-bash/lib/index.js:231-234`，实测原文）：
+#       const Config = z.object({
+#         enableRunInBackground: z.boolean().default(true),
+#         promoteOnTimeout: z.boolean().default(true)
+#       });
+#     ⇒ 宿主对 bash **没有 config 级写限制手段**。上一轮"config 只有 `timeoutMs`/`description`"
+#       的说法**在细节上不准确**：`timeoutMs` / `description` / `workdir` / `run_in_background`
+#       是**工具入参**（`inputSchema`），不是插件 config；插件 config 只有上面这两个布尔开关，
+#       二者都只影响**后台/超时行为**，与"能否写盘"无关。**结论不变：无写限制手段可用。**
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 关键判断：
+# 1. **skill / goal / todo / planning / jobs 一律不给** —— 理由同 `agent-readonly`：
+#    `skill-filesystem` 会写 skill 文件，`tool-goal`/`tool-todo`/`plan-mode` 会写状态，
+#    `tool-jobs` 起后台进程（绕过 timeout 的间接副作用通道）。这些宿主行都已被
+#    `dsh-web-app` disable ⇒ 属于 **preset 面**，**省略即真的移除**，无需也不能 deny。
+# 2. **memory / MCP 自动继承** —— 注册在 **global 层**（profile 顶层 `agentmemory` 行 +
+#    `dsh-base/cordis.patch.yml:485` 的 mcp-resources），任何 preset 的子代理都会继承，
+#    **不需要在本 preset 里重复挂载**，也不应 deny（审查要能查记忆/MCP 资源）。已实测验证。
+# 3. **编队/委派一律不给** —— 理由同 `agent-readonly`：审查角色不得把活再外包出去
+#    （那会让"谁审的"变得不可追溯）。delegation 组在 preset 面（省略即无），
+#    宿主面残留的委派通道靠下面的 deny 行遮掉。
+#
+# 策略（两件事同时做）：
+# ① preset 里**只**挂读侧插件行 + `tool-bash` —— 省略即不存在（写工具全在 preset 面）；
+# ② 再加一条 `tools.restrict({ deny: [...] })` 遮掉**宿主面残留**（省略不掉的 global 工具）。
+#
+# ★ deny 名单的命名空间：必须是**工具名**（`bash`/`write`），不是插件 id（`tool-bash`）。
+#   ⚠ 写错名字会 loud throw：`tools.restrict() names unknown global tool "tool-bash"`
+#   ⇒ **整个 preset 挂载失败**（preset 注册表记为 broken）。
+#   本 preset 的 deny 名单与 `agent-readonly` **同一份 14 名名单**（工具面本就相同，只是多挂一个 bash）：
+#     - `working_directory`（`dsh-base/cordis.patch.yml:169-170`，web 面未 disable）
+#     - 11 个 `agent_*`（本仓库根 bundle 行）
+#     - `product_delegate` / `product_submit`（product-subagents 根行）
+#   其余宿主面名字是 memory_* / MCP 读工具 / `product_agents` / `product_roles` / `product_wait` /
+#   `cordis_inspect_*` 等只读项，**要求保留**。
+#
+# ★ 为何复用 `@kiligzzz/dsh-agent-dispatch/relay-allowlist` 而不新建专用模块：
+#   profile 消费的是**打包产物**（`~/.dsh/profiles/web/package.json` 里
+#   `@kiligzzz/dsh-agent-dispatch` 指向 `file:~/.dsh/packages/kiligzzz-dsh-agent-dispatch-1.12.19.tgz`），
+#   安装副本 `profiles/web/node_modules/@kiligzzz/dsh-agent-dispatch/` 里**没有**工作树新加的
+#   lib 文件与 exports 子路径 ⇒ 引用它会 `ERR_PACKAGE_PATH_NOT_EXPORTED`，
+#   导致 preset 整体挂载失败。`relay-allowlist` 在已发布产物里已存在、已声明 exports，
+#   且其 `apply()` 本就同时支持 allow / deny 双形态
+#   （`lib/relay-allowlist.js:61-72`：仅当 allow 与 deny **均**为空才 loud throw），
+#   正好满足本 preset 的「只 deny 不 allow」用法。
+#
+
+- insert:
+    - id: preset-agent-verify
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: agent-verify
+        name: 可执行审查
+        description: 可执行审查子代理：无 write/edit 写工具，但可用 bash 真跑测试/检查命令做实测；用于审查与复核。
+        order: 10
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: >-
+                你是可执行审查子代理（Verifiable-Review Agent），由 {{model}} 模型驱动。
+                核心职责：**读代码 + 真跑命令做实测**，产出有证据的审查结论；不写业务文件、不向下委派。
+                - 你的工具面**没有** write/edit：不要试图"顺手改好"，发现问题只报告不代改。
+                - 但你有 **bash**：审查结论必须落到实测证据上——改动的测试命令、lint、
+                  回归套件、`git diff --stat` 等，**能跑就跑**，跑不了要写明为什么跑不了，
+                  不要把"没跑"包装成"通过"。
+                - bash 有副作用（可写盘）：**只执行只读/验证类命令**（读、搜、测试、状态查询）。
+                  严禁用于写文件、改配置、`git add/commit`、安装依赖、删除文件——除非任务明确要求。
+                - 可用工具：read/read_image/grep/glob（工具档）、bash（命令行，纪律见上）、
+                  web_search/web_fetch（Web 查询）、memory_*（记忆）、MCP read（第三方资源读取）。
+                - 禁作：write/edit（写文件）、job 起后台进程、skill/goal/todo/planning 写状态、
+                  任何委派（dispatch/squad/product/subagent）。
+                - 遇到权限不足：直接上报"需要访问 X（读/写），当前权限不足"，不尝试绕行。
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          # ★ tool-fs：只读模式（可读文件/图片，不可写不可 edit）
+          #   这是本 preset 与读写代理的**能力分界线**：写通道在 fs 层就被关死
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              read: true
+              readImage: true
+              write: false
+              edit: false
+          # ★ tool-fs-search：全文搜索（只读）
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          # ★ tool-web：Web 查询（fetch + search）
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          # ★ tool-bash：本 preset 相对 agent-readonly 的**唯一增项**
+          #   为什么必须给：审查要跑 `npm test` / `node verify.mjs` 等做实测，
+          #   没有 bash 的审查只能"纸面通过"，价值接近零。
+          #   代价：bash 可写盘 ⇒ 本 preset 是「无写工具、但有 shell」，**非严格只读**
+          #   （完整权衡说明见仓库 `presets/agent-verify.patch.yml` 文件头「★★ 必须写明的取舍」段）。
+          #   宿主 config 无写限制手段（`dsh-tool-bash/lib/index.js:231-234` 只有
+          #   enableRunInBackground / promoteOnTimeout），故此处不加任何 config。
+          #   平台守卫沿用 `agent-readwrite` 的写法：win32 上不挂（本 preset 不含 tool-pwsh，
+          #   故 win32 下将没有任何 shell —— 若将来需要，另行评估）。
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          # ★ compaction：对话压缩
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          # ★ deny：遮掉宿主面（global）上省略不掉的残留能力
+          #   ⚠ 每个名字必须是**工具名**且在 inherited 面，否则 loud throw ⇒ preset 挂载失败
+          #   （写插件 id `tool-bash` 会抛 `tools.restrict() names unknown global tool "tool-bash"`）
+          #
+          #   复用已发布的 `relay-allowlist`：它的 apply() 同时支持 allow 与 deny 两种形态
+          #   （`lib/relay-allowlist.js:61-72`：仅当 allow 与 deny **均**为空才 loud throw），
+          #   正好满足本 preset 的「只 deny 不 allow」用法。
+          #   **为何不新建专用模块**：见文件头第 ★ 段（profile 消费打包产物，
+          #   安装副本里没有新加的 lib 文件/exports 子路径 ⇒ 引用即
+          #   ERR_PACKAGE_PATH_NOT_EXPORTED ⇒ preset 挂载失败）。
+          - id: verify-deny
+            name: '@kiligzzz/dsh-agent-dispatch/relay-allowlist'
+            config:
+              deny:
+                # 宿主面：唯一会改变会话状态的工具（切 cwd），审查代理不需要
+                - working_directory
+                # 宿主面：委派逃生通道（不遮则审查代理可把活外包给读写子代理，
+                # "谁审的"变得不可追溯）
+                - agent_dispatch
+                - agent_squad
+                - agent_squad_continue
+                - agent_squad_upsert
+                - agent_failover
+                - agent_followup
+                - agent_upsert
+                - agent_import_skill
+                - agent_list
+                - agent_children
+                - agent_close
+                - product_delegate
+                - product_submit
