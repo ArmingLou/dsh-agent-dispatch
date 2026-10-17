@@ -84,13 +84,124 @@ function resolveRuntimeRoot() {
   throw new Error('定位不到已安装的 @deepseek-ai/dsh 包；用 DSH_RUNTIME_ROOT 指向它的目录')
 }
 
-/** 插件真正调用的宿主方法名（从源码抽取，不手写清单——手写清单会漂移）。 */
+/**
+ * 抹掉注释与字符串/模板字面量（保留模板串里 `${...}` 内的表达式）。
+ *
+ * 为什么必须剥：调用点名在注释与文案里到处出现（模块头、JSDoc、
+ * `console.error` 的模板串），一旦抽取正则放宽到"方法名后任意后续"，
+ * 这些**提及**就会被当成**调用**抽进来，检查项 3 立刻退化成一堆噪声。
+ *
+ * 手写扫描器而非正则：够用的近似即可——目标是"别把注释/文案里的名字当调用"，
+ * 不追求 100% 符合 JS 词法（下界断言负责在漏抽时报警）。O(n) 单遍。
+ */
+function stripCommentsAndStrings(src) {
+  const out = []
+  let i = 0
+  const n = src.length
+  // 上一个已输出字符（用于判别 `/` 是正则还是除法）。
+  let prevChar = ''
+  // 跳过引号字符串，返回结束下标（开引号在 start）。
+  const skipQuoted = (start) => {
+    const quote = src[start]
+    let j = start + 1
+    while (j < n && src[j] !== quote) {
+      if (src[j] === '\\') j += 1
+      j += 1
+    }
+    return j + 1
+  }
+  // 跳过正则字面量，返回结束下标（开 `/` 在 start）；`[...]` 类内的 `/` 不算结尾。
+  const skipRegex = (start) => {
+    let j = start + 1
+    let inClass = false
+    while (j < n) {
+      const c = src[j]
+      if (c === '\\') { j += 2; continue }
+      if (c === '[') inClass = true
+      else if (c === ']') inClass = false
+      else if (c === '/' && !inClass) return j + 1
+      else if (c === '\n') return j // 行尾还没闭合：不是正则，退回普通字符
+      j += 1
+    }
+    return j
+  }
+  // 上一个 token 是否是"表达式位置"（决定 `/` 当正则还是除法）。
+  const afterExpr = /(?:^|[^\w$])(?:return|typeof|instanceof|in|of|new|delete|void|case|do|else|yield|await)$/.test(out.join('').trimEnd())
+  while (i < n) {
+    const c = src[i]
+    const d = src[i + 1]
+    if (c === '/' && d === '/') { while (i < n && src[i] !== '\n') i += 1; continue }
+    if (c === '/' && d === '*') { i += 2; while (i < n && !(src[i] === '*' && src[i + 1] === '/')) i += 1; i += 2; continue }
+    if (c === '"' || c === "'") { const end = skipQuoted(i); out.push(' '); i = end; prevChar = ' '; continue }
+    if (c === '`') {
+      // 模板串：抹掉字面文本，但 `${...}` 里的表达式要继续参与抽取。
+      i += 1
+      while (i < n && src[i] !== '`') {
+        if (src[i] === '\\') { i += 2; continue }
+        if (src[i] === '$' && src[i + 1] === '{') {
+          let depth = 1
+          let j = i + 2
+          while (j < n && depth > 0) {
+            const cj = src[j]
+            if (cj === '{') depth += 1
+            else if (cj === '}') { depth -= 1; if (depth === 0) break }
+            else if (cj === '"' || cj === "'") { j = skipQuoted(j); continue }
+            else if (cj === '`') { // 嵌套模板串：整段当数据
+              j += 1
+              while (j < n && src[j] !== '`') { if (src[j] === '\\') j += 1; j += 1 }
+              j += 1
+              continue
+            } else if (cj === '/' && src[j + 1] === '/') { while (j < n && src[j] !== '\n') j += 1; continue }
+            else if (cj === '/' && src[j + 1] === '*') { j += 2; while (j < n && !(src[j] === '*' && src[j + 1] === '/')) j += 1; j += 2; continue }
+            j += 1
+          }
+          out.push(` ${stripCommentsAndStrings(src.slice(i + 2, j))} `)
+          i = j + 1
+          prevChar = ' '
+          continue
+        }
+        i += 1
+      }
+      i += 1 // 收尾反引号
+      out.push(' ')
+      prevChar = ' '
+      continue
+    }
+    if (c === '/') {
+      // 正则字面量：上一个有意义的字符不是标识符/数字/右括号右方括号时才按正则处理
+      //（否则 `a / b` 这种除法会被当成正则起点，一路吞到下一个 `/`）。
+      if (!/[\w$)\]"'`]/.test(prevChar) || afterExpr) {
+        const end = skipRegex(i)
+        out.push(src.slice(i, end).replace(/[^\n]/g, ' '))
+        i = end
+        prevChar = '/'
+        continue
+      }
+    }
+    out.push(c)
+    if (!/\s/.test(c)) prevChar = c
+    i += 1
+  }
+  return out.join('')
+}
+
+/**
+ * 插件真正调用的宿主方法名（从源码抽取，不手写清单——手写清单会漂移）。
+ *
+ * v1.12.20 修正：旧正则 `ctx\.subagents\?*\.\s*([A-Za-z]+)\s*\(` 要求方法名后紧跟
+ * `(`，于是这些**真实调用形态**全都抽不到，检查项 3 实际只覆盖了 {sendMessage, interrupt}：
+ *   - `this.ctx.subagents.startActivation?.bind(...)`（lib/dispatch.js:1177）
+ *   - `this.ctx.subagents.drainChildren ?? ...`（lib/dispatch.js:3069）
+ *   - `ctx.subagents?.list?.()`（index.js:1667）/ `ctx.subagents?.getProvider?.()`（index.js:1712 等）
+ * 现在只要方法名后跟 `(` / `.` / `?` 就认（可选链、空值合并、`.bind` 全覆盖），
+ * 形态再漂移也逃不过检查项 3；误抽由上面的 stripCommentsAndStrings 兜住。
+ */
 function pluginUsedMethods() {
   const used = new Set()
   const files = ['index.js', ...readdirSync(join(root, 'lib')).filter((f) => f.endsWith('.js')).map((f) => join('lib', f))]
   for (const rel of files) {
-    const src = readFileSync(join(root, rel), 'utf8')
-    for (const m of src.matchAll(/(?:this\.)?ctx\.subagents\?*\.\s*([A-Za-z]+)\s*\(/g)) used.add(m[1])
+    const src = stripCommentsAndStrings(readFileSync(join(root, rel), 'utf8'))
+    for (const m of src.matchAll(/(?:this\.)?ctx\??\.subagents\??\.\s*([A-Za-z]+)(?=\s*[.(?])/g)) used.add(m[1])
   }
   return [...used].sort()
 }
@@ -130,6 +241,14 @@ async function main() {
     drainContinuableChildren: 'drainChildren',
   }
   const used = pluginUsedMethods()
+  // 下界断言：这些名字**必须**被抽到。漏掉说明上面的抽取正则又跟不上调用形态漂移
+  // （v1.12.17 事故的同型漏洞：宿主改名了，used 里根本没有它 ⇒ 检查项 3 一次都没跑）。
+  for (const must of ['startActivation', 'drainChildren']) {
+    if (!used.includes(must)) {
+      bad(`pluginUsedMethods() 没抽到 ctx.subagents.${must}()（插件在用，检查项 3 却不会覆盖它）`,
+        '请检查 scripts/check-host-compat.mjs 里 pluginUsedMethods() 的抽取正则是否跟上了调用形态漂移')
+    }
+  }
   for (const method of used) {
     const alias = ALIASES[method] // 旧名 → 新名
     if (alias) {
@@ -147,7 +266,12 @@ async function main() {
   // 参数个数：改名不改参的假设必须被验证；形状变了下面这条会红。
   const arity = (name, expected) => {
     const fn = proto[name]
-    if (typeof fn !== 'function') return
+    if (typeof fn !== 'function') {
+      // 别静默 return：宿主下次再改名时，若 used 抽不到它（或它在 ALIASES 之外），
+      // 静默跳过会让脚本照旧打印「宿主契约 OK」——正是 v1.12.17 那次的放大器。
+      bad(`ctx.subagents.${name} 不存在（宿主已移除/改名；参数个数断言无法执行）`)
+      return
+    }
     if (fn.length === expected) ok(`ctx.subagents.${name}.length === ${expected}（调用形态匹配）`)
     else bad(`ctx.subagents.${name}.length === ${fn.length}，期望 ${expected}（改名不改参的假设不成立，调用点要跟着改）`)
   }

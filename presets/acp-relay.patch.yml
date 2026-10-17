@@ -152,12 +152,13 @@
 #
 # ────────────────────────────────────────────────────────────────────────────
 #
-# 风险 ③（已实测确认，**当前必然触发**）：`relay-allowlist` 行的插件名**无法解析**，
-#   本 preset 按现状直接挂载**必定失败**（不是静默降级）。
+# 风险 ③（**已解除**）：`relay-allowlist` 行的插件名曾**无法解析**，本 preset 按旧版
+#   原样挂载会失败（不是静默降级）。
 #
+#   历史成因（v1.12.17 时点的真实状态，保留作说明）：
 #   本行写的是包**子路径**插件名：
 #       name: '@kiligzzz/dsh-agent-dispatch/relay-allowlist'
-#   而本包 `package.json` 的 `exports` **尚未声明** `"./relay-allowlist"`：
+#   而当时本包 `package.json` 的 `exports` **未声明** `"./relay-allowlist"`：
 #       { ".": "./index.js", "./client": "./lib/client.js",
 #         "./cordis.patch.yml": "./cordis.patch.yml", "./package.json": "./package.json" }
 #   实测（在临时目录 symlink 本包后 import）：
@@ -179,21 +180,23 @@
 #        `"./list-agents": { "types": …, "default": "./lib/types/list-agents.js" }`）。
 #       ⇒ 子路径插件名的前提就是"包自己在 exports 里声明该子路径"。
 #
-#   修复方式（一行，需人工合并到 package.json 的 `exports`）：
+#   解除方式（一行，已合入 `package.json` 的 `exports`）：
 #       "./relay-allowlist": "./lib/relay-allowlist.js"
 #   注：`files` 数组已含 `"lib"`，**无需**再往 `files` 里加条目。
 #
-#   ⚠ 还有一处**部署前提**（同样必须满足，否则运行时仍找不到）：profile 装的是
-#     **实体目录副本**（~/.dsh/profiles/web/node_modules/@kiligzzz/dsh-agent-dispatch，
-#     当前版本 1.12.17，`lib/` 下**没有** relay-allowlist.js），不是 symlink 到本仓库。
-#     ⇒ exports 改完还需**重新发版 + 重装 profile 依赖**，新文件与 exports 才会到位。
+#   ⚠ 原部署前提（profile 装的是**实体目录副本**
+#     ~/.dsh/profiles/web/node_modules/@kiligzzz/dsh-agent-dispatch，当时版本 1.12.17，
+#     `lib/` 下**没有** relay-allowlist.js，不是 symlink 到本仓库 ⇒ 光改 exports 还不够，
+#     必须重新发版 + 重装 profile 依赖）也已解除：profile 现在是 `link:` 到本工作区
+#     （v1.12.20），`package.json:36` 已带上述 exports 条目，`lib/relay-allowlist.js`
+#     就在工作树里。
 #
 #   备选方案（不改 exports 时）：Cordis 加载器对以 `.` 开头的名字走**相对 baseUrl** 分支
-#     （cordis-plugin-loader/lib/index.js:219-222，
-#      `new URL(name, this.ctx.baseUrl)`）。preset 的 ctx 继承声明方的 baseUrl
-#     （dsh-agent-preset-registry/lib/index.js:248-252、:501）。
-#     ⇒ 理论上可写相对 specifier 指向本包 lib 下的文件。**但本片段不采用**：
-#       文件名/相对基准随安装位置变化，脆弱且难以核对，`exports` 方案是正规入口。
+#   （cordis-plugin-loader/lib/index.js:219-222，
+#   `new URL(name, this.ctx.baseUrl)`）。preset 的 ctx 继承声明方的 baseUrl
+#   （dsh-agent-preset-registry/lib/index.js:248-252、:501）。
+#   ⇒ 理论上可写相对 specifier 指向本包 lib 下的文件。**但本片段不采用**：
+#     文件名/相对基准随安装位置变化，脆弱且难以核对，`exports` 方案是正规入口。
 #
 # ────────────────────────────────────────────────────────────────────────────
 # 设计要点
