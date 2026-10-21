@@ -550,15 +550,15 @@ export function apply(ctx, config = {}) {
   } catch (err) {
     console.error('[dsh-agent-dispatch] approval/request 订阅失败（宿主审批自动放行不可用）:', err.message)
   }
+  // v1.12.x：注册表初始化失败必须降级而非致命——原先这里 throw 会让插件加载失败，
+  // 最终表现为 `dsh: fatal load failure` 整个服务起不来（多实例写盘竞态时高发）。
   const ready = registry.init().catch((error) => {
-    console.error('[dsh-agent-dispatch] Agent 注册表初始化失败:', error)
-    throw error
+    console.error('[dsh-agent-dispatch] Agent 注册表初始化失败（已降级为空注册表，服务继续启动）:', error)
   })
 
   const squadRegistry = new SquadRegistry(dataDir)
   const squadsReady = squadRegistry.init().catch((error) => {
-    console.error('[dsh-agent-dispatch] 小队注册表初始化失败:', error)
-    throw error
+    console.error('[dsh-agent-dispatch] 小队注册表初始化失败（已降级为空注册表，服务继续启动）:', error)
   })
   const squadById = () => new Map(squadRegistry.list().map((s) => [s.id, s]))
 
