@@ -29,11 +29,18 @@ describe('gradeSubmitFailure（编排层本地兜底，与 product-subagents 同
     assert.equal(gradeSubmitFailure('RATE_LIMITED', '429'), 'failover')
     assert.equal(gradeSubmitFailure(null, 'insufficient_quota'), 'failover')
     assert.equal(gradeSubmitFailure('EMPTY_RESPONSE', '空正文'), 'failover')
+    // ACP 语义性拒绝（stopReason=refusal）：换一档模型可能不再拒绝 ⇒ failover
+    assert.equal(gradeSubmitFailure('ACP_REFUSAL', 'The ACP agent declined to answer this request.'), 'failover')
     assert.equal(gradeSubmitFailure('INVALID_API_KEY', 'invalid api key'), 'fatal')
     assert.equal(gradeSubmitFailure(null, 'HTTP 401 Unauthorized'), 'fatal')
     assert.equal(gradeSubmitFailure('SUBMIT_ABORTED', 'aborted'), 'interrupted')
     // v1.11.24：交接完成的收尾码必须归入 interrupted，绝不可再触发一条换档链
     assert.equal(gradeSubmitFailure('FAILOVER_HANDED_OFF', '本档已由编排层换档'), 'interrupted')
+    // v1.12.x：产品进程崩溃（桥内重连预算耗尽）⇒ failover，换一档产品/模型可能不再崩；
+    // WATCHDOG_FREEZE 不再归 interrupted——桥内冻结一律 catch 成重连，重连超限抛的是
+    // PRODUCT_CRASH，把它当"人为中断"会让进程反复冻结的档位**不换档**。
+    assert.equal(gradeSubmitFailure('PRODUCT_CRASH', 'ACP product process crashed/exited (after 3 reconnect attempts): exitCode=1, signal=null'), 'failover')
+    assert.notEqual(gradeSubmitFailure('WATCHDOG_FREEZE', 'deveco 看门狗触发：180000ms 无输出'), 'interrupted')
   })
 })
 
