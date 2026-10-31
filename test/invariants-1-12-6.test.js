@@ -263,6 +263,8 @@ describe('不变量③：auto-review / hook「ask」有意**不**排除（用户
     const end = idx.indexOf('}, { prepend: true })', start)
     assert.ok(start > 0 && end > start, 'approval/request 监听器边界定位失败')
     const body = idx.slice(start, end)
+    // v1.12.25：归因（markAsk）刻意写成「早退之前独立的一行」而不是把早退包成块——
+    // 本用例的锚点就是**单行** `if (…) return next()`，包成块会让这道守卫失明。
     const gates = [...body.matchAll(/^\s*if \((.{0,120}?)\) return next\(\)$/gm)].map((m) => m[1])
     assert.deepEqual(
       gates,

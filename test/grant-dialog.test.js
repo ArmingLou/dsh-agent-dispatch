@@ -137,7 +137,7 @@ function buildGrantModule(inputDoc) {
   const doc = inputDoc || fakeDocument()
   const pending = []
   const factory = new Function('document', 'setTimeout',
-    helpersSrc + '\nreturn { isEscalationReason, toolGrantKeyOf, parentDirOf, resolveAgainstCwd, dirsOfPaths, absolutizeDirs, linesToPaths, permGrantTip, openGrantDialog };')
+    helpersSrc + '\nreturn { isEscalationReason, toolGrantKeyOf, parentDirOf, resolveAgainstCwd, dirsOfPaths, absolutizeDirs, linesToPaths, permGrantTip, openGrantDialog, askReasonLabel, buildGrantAskBlock, appendPendingAskLines, pendingAskLinesOf, PENDING_CMD_PREVIEW_CHARS };')
   const mod = factory(doc, (fn) => { pending.push(fn); return pending.length })
   return { mod, doc, flushTimeouts: () => pending.splice(0).forEach((f) => f()) }
 }
@@ -651,11 +651,14 @@ describe('U4 两组预填：实际触达默认勾选、文本推测默认不勾�
     const { groups, rows } = dialogParts(doc)
     assert.equal(groups.length, 2, '必须渲染两组（合成一组就等于把不可信来源默认授权出去）')
     assert.match(groupTitle(groups[0]), /实际触达/)
-    assert.match(groupTitle(groups[1]), /推测/)
+    // v1.12.25（追加 A5）：第二组并入了「未能自动解析的路径候选」，标题随之改名
+    // （两个并排的"推测区"用户分不清）。语义不变：**默认不选 + 可编辑**。
+    assert.match(groupTitle(groups[1]), /未能自动解析/)
     assert.match(groupTitle(groups[1]), /默认不选/, '第二组标题自己就要写明默认不选')
+    assert.match(groupTitle(groups[1]), /可编辑/, '合并后必须写明可编辑（用户要能手动改成要授权的目录）')
     assert.match(groupSub(groups[0]), /工具调用里真实的路径字段/, '要标注来源')
-    assert.match(groupSub(groups[1]), /只是文本里出现的字符串/, '小字必须点明推测项的来源不可信')
-    assert.match(groupSub(groups[1]), /被编辑的文件内容/)
+    assert.match(groupSub(groups[1]), /命令正文里出现的字符串/, '小字必须点明推测项的来源不可信')
+    assert.match(groupSub(groups[1]), /默认不选/, '小字再强调一次默认不选')
     assert.equal(rowsOfGroup(groups[0]).length, 2)
     assert.equal(rowsOfGroup(groups[1]).length, 3)
     assert.deepEqual(rows.map((r) => r.chk.checked), [true, true, false, false, false],
@@ -1040,6 +1043,136 @@ function btnCancelAndResolve(_mod, p, doc) {
   return p
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// v1.12.25（用户裁定「面板显示命令原文 + 拦截原因」）：弹框顶部**只读区**。
+//
+// 现场问题：授权面板只渲染「工具：Bash」+ 目录列表，用户看不到要执行什么、也看不到
+// 为什么被拦 ⇒ 点「允许」等于盲批。这里钉住三件事：
+//   ① 命令原文原样进 DOM（`textContent`，绝不 innerHTML —— 载荷来自产品/宿主）；
+//   ② >200 字符折叠，且能展开（按钮文案随状态变）；
+//   ③ 「拦截原因」按 askReason 映射成中文短标签，认不出的值原样显示、不吞。
+// ────────────────────────────────────────────────────────────────────────────
+describe('v1.12.25 弹框只读区：命令原文 + 拦截原因', () => {
+  it('① 命令原文按 textContent 原样渲染（HTML 不被解释）', async () => {
+    const { mod, doc } = buildGrantModule()
+    const cmd = 'echo "<b>hi</b>" && cat a.txt'
+    const p = mod.openGrantDialog({ toolName: 'Bash', suggestedDirs: ['/tmp/a'], commandText: cmd, askReason: 'shape:multi-command' })
+    const { pop } = dialogParts(doc)
+    const pre = one(pop, 'ad-grant-cmd')
+    assert.ok(pre, '弹框里必须有命令原文块（.ad-grant-cmd）')
+    assert.equal(pre.tagName, 'pre', '命令必须放在 pre 里（保留空白与换行）')
+    assert.equal(pre.textContent, cmd, '命令原文必须逐字进 DOM')
+    assert.equal(byClass(pre, 'b').length, 0, '不得把命令当 HTML 解析（标签必须被转义成文本）')
+    assert.equal(pre.getAttribute('innerHTML'), null)
+    btnCancelAndResolve(mod, p, doc)
+  })
+
+  it('② >200 字符折叠，按钮可展开；≤200 不出现折叠按钮', async () => {
+    const long = 'echo ' + 'x'.repeat(240)
+    const modA = buildGrantModule()
+    const pA = modA.mod.openGrantDialog({ toolName: 'Bash', suggestedDirs: ['/tmp/a'], commandText: long })
+    const preA = one(dialogParts(modA.doc).pop, 'ad-grant-cmd')
+    assert.match(preA.className, /collapsed/, '超长命令初始必须是折叠态')
+    const toggle = one(dialogParts(modA.doc).pop, 'ad-grant-cmdtoggle')
+    assert.ok(toggle, '折叠时必须给出展开入口（不能把完整命令藏死）')
+    assert.match(toggle.textContent, /^展开完整命令（\d+ 字符）$/)
+    toggle.click()
+    assert.doesNotMatch(preA.className, /collapsed/, '点一次应展开')
+    assert.match(toggle.textContent, /^收起命令$/)
+    toggle.click()
+    assert.match(preA.className, /collapsed/, '再点一次应收起')
+    btnCancelAndResolve(modA.mod, pA, modA.doc)
+
+    const modB = buildGrantModule()
+    const pB = modB.mod.openGrantDialog({ toolName: 'Bash', suggestedDirs: ['/tmp/a'], commandText: 'ls -la' })
+    const preB = one(dialogParts(modB.doc).pop, 'ad-grant-cmd')
+    assert.doesNotMatch(preB.className, /collapsed/, '短命令不折叠')
+    assert.equal(byClass(dialogParts(modB.doc).pop, 'ad-grant-cmdtoggle').length, 0, '短命令不该有折叠按钮')
+    btnCancelAndResolve(modB.mod, pB, modB.doc)
+  })
+
+  it('③ 拦截原因：askReason 映射成中文短标签（danger 带具体命令名）', () => {
+    const { mod } = buildGrantModule()
+    assert.equal(mod.askReasonLabel('shape:multi-command', null, null), '命令形状无法静态判定：多命令拼接')
+    assert.equal(mod.askReasonLabel('shape:relative-traversal', null, null), '命令形状无法静态判定：相对路径越界')
+    assert.equal(mod.askReasonLabel('danger', null, 'rm -rf'), '危险命令（rm -rf）')
+    assert.equal(mod.askReasonLabel('danger', null, null), '危险命令')
+    assert.equal(mod.askReasonLabel('no-command-text', null, null), '无法解析命令正文')
+    assert.equal(mod.askReasonLabel('paths-partial', null, null), '路径部分覆盖（另一部分在工作区外）')
+    // shape 的 id 只在本字段里给（老服务端）：仍要能出标签
+    assert.equal(mod.askReasonLabel('shape:', 'pipe-to-interpreter', null), '命令形状无法静态判定：管道到解释器')
+    // 认不出的值照原样显示，绝不吞成「没有原因」
+    assert.equal(mod.askReasonLabel('custom-reason-x', null, null), 'custom-reason-x')
+    assert.equal(mod.askReasonLabel(null, null, null), '')
+  })
+
+  it('④ 没有命令也没有原因 ⇒ 不渲染只读区（老载荷形状不变）', async () => {
+    const { mod, doc } = buildGrantModule()
+    const p = mod.openGrantDialog({ toolName: 'Edit', suggestedDirs: ['/tmp/a'] })
+    const { pop } = dialogParts(doc)
+    assert.equal(byClass(pop, 'ad-grant-ask').length, 0, '无归因、无命令时不得凭空多出一块')
+    btnCancelAndResolve(mod, p, doc)
+  })
+
+  // v1.12.26（bug 修复）：只读区的两个数据源（原因 / 正文）来自两条独立通道，
+  // 任一缺失都不许让**整块**消失。现场正是「原因没了 ⇒ 连正文一起没渲染」：
+  // 琥珀通道的记账层丢字段后，命令原文明明有、面板却一个字都不显示。
+  it('④b 有正文没原因 ⇒ 仍渲染正文，原因降级为「未标注」（绝不整块消失）', async () => {
+    const { mod, doc } = buildGrantModule()
+    const cmd = 'cat package.json ../../package.json'
+    const p = mod.openGrantDialog({ toolName: 'Bash', suggestedDirs: ['/tmp/a'], commandText: cmd })
+    const { pop } = dialogParts(doc)
+    assert.equal(byClass(pop, 'ad-grant-ask').length, 1, '有命令正文就必须渲染只读区')
+    assert.equal(one(pop, 'ad-grant-cmd').textContent, cmd, '正文必须逐字显示')
+    assert.equal(one(pop, 'ad-grant-why').textContent, '拦截原因：未标注',
+      '原因缺失时如实说「未标注」，不能少一行让用户以为没有原因')
+    btnCancelAndResolve(mod, p, doc)
+  })
+
+  it('④c 只有原因没正文 ⇒ 只渲染原因行；正文块不凭空出现', async () => {
+    const { mod, doc } = buildGrantModule()
+    const p = mod.openGrantDialog({ toolName: 'Bash', suggestedDirs: ['/tmp/a'], askReason: 'no-command-text' })
+    const { pop } = dialogParts(doc)
+    assert.match(one(pop, 'ad-grant-why').textContent, /^拦截原因：无法解析命令正文$/)
+    assert.equal(byClass(pop, 'ad-grant-cmd').length, 0, '没有正文就不该出现空的「将要执行的命令」块')
+    btnCancelAndResolve(mod, p, doc)
+  })
+
+  // v1.12.26（第二条现场）：`node -e "console.log(1)"` —— 一个路径都没有，
+  // 两个目录区**都**是占位行。此时面板的全部信息量只能靠只读区，它还必须在最上面，
+  // 并且「+ 添加目录」不能被挤掉（用户可能就想为这类命令授权工作区目录）。
+  it('④d 两区都空（`node -e` 现场）⇒ 命令原文 + 原因仍在首块，「+ 添加目录」仍可见', async () => {
+    const { mod, doc } = buildGrantModule()
+    const cmd = 'node -e "console.log(1)"'
+    const p = mod.openGrantDialog({
+      toolName: 'Bash', commandText: cmd, askReason: 'shape:inline-code', shapeRule: 'inline-code',
+    })
+    const { pop, groups, add } = dialogParts(doc)
+    const body = one(pop, 'ad-grant-body')
+    assert.equal(body.childNodes[0].className.includes('ad-grant-ask'), true,
+      '两区都空时，命令原文与原因必须是最上面的一块（否则用户只剩"给整个工具放行"这一个可选项）')
+    assert.match(one(pop, 'ad-grant-why').textContent, /^拦截原因：命令形状无法静态判定：内联代码执行$/,
+      '内联代码执行要说得出来，不能退回「未能解析出任何路径」')
+    assert.equal(one(pop, 'ad-grant-cmd').textContent, cmd, '命令原文逐字')
+    assert.equal(groups.length, 2, '两个目录区都要保留（占位行说明"没有可预填"，不是"没有这一区"）')
+    assert.equal(byClass(pop, 'ad-grant-gempty').length, 2, '两区都应显示占位行')
+    assert.ok(add, '「+ 添加目录」必须还在（不能因为两区都空就消失）')
+    assert.ok(walk(body).indexOf(add) > walk(body).indexOf(one(pop, 'ad-grant-ask')),
+      '添加按钮仍排在只读区之后（只读区在最上面，顺序不变）')
+    btnCancelAndResolve(mod, p, doc)
+  })
+
+  it('⑤ 只读区排在目录组之前（用户先看到「要执行什么」再决定记住哪个目录）', async () => {
+    const { mod, doc } = buildGrantModule()
+    const p = mod.openGrantDialog({ toolName: 'Bash', suggestedDirs: ['/tmp/a'], commandText: 'ls', askReason: 'tier-miss' })
+    const { pop } = dialogParts(doc)
+    const body = one(pop, 'ad-grant-body')
+    assert.equal(body.childNodes[0].className.includes('ad-grant-ask'), true, '只读区必须是内容区第一块')
+    assert.match(one(pop, 'ad-grant-why').textContent, /^拦截原因：未命中任何已记住的授权规则$/)
+    btnCancelAndResolve(mod, p, doc)
+  })
+})
+
 describe('U2 宿主通道（蓝球）：grantViaDialog 行为——取消零 POST，确认才带 paths', () => {
   const code = grabExpr('const grantViaDialog = (scope) => async () => {', '\n          };')
   // 目录化用**真**的 dirsOfPaths（同一份源码编译出来的），桩只做"用户改了什么"这一件事
@@ -1327,7 +1460,9 @@ describe('U2 琥珀通道：sendDecision 按契约透传 paths（不传＝产品
     const amberBtns = src.slice(from, src.indexOf('mkBtn("拒绝", "deny", "danger"'))
     assert.equal((amberBtns.match(/\{ projectTier: (?:false|true) \}/g) || []).length, 2,
       '只有两个「记住类」按钮挂 grant，允许一次/拒绝不弹框')
-    assert.match(amberBtns, /openGrantDialog\(\{[\s\S]{0,900}\}\)\.then\(\(d\) => \{\s*if \(!d\) return;[\s\S]{0,700}sendDecision\(a, answer, label, d\.paths\);/,
+    // v1.12.25：`openGrantDialog({…})` 的载荷新增了命令原文/归因三项（面板只读区），
+    // 两个窗口都相应放宽（900→1400 / 700→1000）——只是**距离**变长，接线语义未变。
+    assert.match(amberBtns, /openGrantDialog\(\{[\s\S]{0,1400}\}\)\.then\(\(d\) => \{\s*if \(!d\) return;[\s\S]{0,1000}sendDecision\(a, answer, label, d\.paths\);/,
       '确认后才 sendDecision，且带用户声明的 paths')
     // v1.12.7（用户裁定）：二级选择「仅本次放行」必须回 allow-once 且**不带 paths**。
     assert.match(amberBtns, /if \(d\.mode === "once"\) \{ sendDecision\(a, "allow-once", "仅本次放行"\); return; \}/,
@@ -1491,5 +1626,305 @@ describe('U5 确认按钮配色：不得只依赖裸 var(--ad-accent)', () => {
     const classes = (sel.match(/\./g) || []).length
     assert.ok(classes >= 2,
       `.ad-grant-ok 的选择器只带 ${classes} 个类（"${sel.trim()}"）——压不过 .ad-btn.primary（2 个类）就会退回白底白字`)
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// v1.12.25（追加 A）：**未能自动解析的路径候选**并入第二组（默认不选、可编辑）。
+//
+// 现场：`PATH_RE` 是前缀白名单 + `~`，`../../package.json`、`cat 一句话/x.txt`
+// 这类操作数一个都提取不到 ⇒ 面板上完全看不见，用户即使读了命令原文也不知道该把
+// 哪个目录填进「要记住的目录」。这一块把它们摊开：`原文 → 归一化落点`，默认不勾，
+// 目录框可改；勾选后走**同一条** collect() → planGrantWrites 落规则（不新增写通道）。
+// ────────────────────────────────────────────────────────────────────────────
+describe('v1.12.25 追加 A：未解析路径候选的渲染与提交', () => {
+  const CAND = [
+    { raw: '../../package.json', resolved: '/Users/dev/develop/package.json', kind: 'relative-traversal', insideWorkspace: false },
+    { raw: '${HOME}/.ssh/id_rsa', resolved: null, kind: 'variable', insideWorkspace: false },
+  ]
+
+  it('① 每行显示「原文 → 落点」，工作区外带警告标记', async () => {
+    const { mod, doc } = buildGrantModule()
+    const p = mod.openGrantDialog({ toolName: 'Bash', suggestedDirs: [], unextracted: CAND })
+    const { pop } = dialogParts(doc)
+    const lines = byClass(pop, 'ad-grant-cand')
+    assert.equal(lines.length, 2, '每条候选都要有一行说明')
+    assert.match(lines[0].textContent, /\.\.\/\.\.\/package\.json/)
+    assert.match(lines[0].textContent, /\/Users\/dev\/develop\/package\.json/)
+    assert.match(lines[0].textContent, /工作区外/)
+    assert.match(lines[0].className, /ad-grant-cand-out/, '工作区外必须沿用警告色')
+    // 变量类解析不出 ⇒ 明说「无法解析」，不编一个落点
+    assert.match(lines[1].textContent, /\$\{HOME\}\/\.ssh\/id_rsa/)
+    assert.match(lines[1].textContent, /无法解析/)
+    btnCancelAndResolve(mod, p, doc)
+  })
+
+  it('② 默认不勾；目录框预填落点父目录；解析不出的行留空等用户填', async () => {
+    const { mod, doc } = buildGrantModule()
+    const p = mod.openGrantDialog({ toolName: 'Bash', suggestedDirs: [], unextracted: CAND })
+    const { groups, rows } = dialogParts(doc)
+    assert.equal(groups.length, 2, '候选并入第二组（不新增第三块"推测区"）')
+    assert.equal(rows.length, 2)
+    assert.deepEqual(rows.map((r) => r.chk.checked), [false, false], '候选默认一律不勾')
+    assert.deepEqual(rows.map((r) => r.dir.value), ['/Users/dev/develop', ''], '落点父目录 / 解析不出留空')
+    btnCancelAndResolve(mod, p, doc)
+  })
+
+  it('③ 勾选并确认 ⇒ 该目录进 paths（走既有 collect，不新增写通道）', async () => {
+    const { mod, doc } = buildGrantModule()
+    const p = mod.openGrantDialog({ toolName: 'Bash', suggestedDirs: [], unextracted: CAND })
+    const { rows, btnOk } = dialogParts(doc)
+    rows[0].chk.checked = true
+    rows[0].chk.fire('change')
+    btnOk.click()
+    const d = await p
+    assert.deepEqual(d, { paths: ['/Users/dev/develop'], mode: 'paths' },
+      '勾选的候选目录必须原样进 paths，未勾的一条都不能带出去')
+  })
+
+  it('④ 与「文本推测目录」同落点 ⇒ 合并成一行（不出现两个一样的行）', async () => {
+    const { mod, doc } = buildGrantModule()
+    const p = mod.openGrantDialog({
+      toolName: 'Bash', suggestedDirs: [],
+      inferredDirs: ['/Users/dev/develop'],
+      unextracted: CAND,
+    })
+    const { rows, pop } = dialogParts(doc)
+    assert.equal(rows.length, 2, '同目录的两条来源必须合并成一行（1 条目录 + 1 条解析不出）')
+    assert.deepEqual(rows.map((r) => r.dir.value), ['/Users/dev/develop', ''])
+    assert.equal(byClass(pop, 'ad-grant-cand').length, 2, '合并成一行后两条候选说明都保留')
+    btnCancelAndResolve(mod, p, doc)
+  })
+})
+
+// ── v1.12.27（用户裁定「命令原文也加到浮球面板上」）：待授权行的两行小字 ──
+// 现场：点蓝色/琥珀色浮球打开的面板，每条待授权只有一行描述（如 `Bash | A6-write`），
+// 要执行什么、为什么被拦只有**点「允许」之后的弹框**里才看得到 ⇒ 面板这一层仍是盲批。
+// 两条通道（琥珀 = ACP 权限 / 蓝球 = 宿主审批）共用模块作用域的
+// `appendPendingAskLines`：判据与文案各写一遍必然漂移。
+describe('v1.12.27 面板待授权行：命令原文 + 拦截原因', () => {
+  const CMD = 'cd /ws && node --test /ws/test/a.test.js'
+
+  /** 造一条面板行并跑装配件（cls 传蓝球那组类名即模拟宿主通道） */
+  function rowOf(doc, mod, pending, cls) {
+    const row = doc.createElement('div')
+    mod.appendPendingAskLines(row, pending, cls || { why: 'p-why', cmd: 'p-cmd' })
+    return row
+  }
+
+  it('① 带 commandText + askReason ⇒ 两行都在，命令逐字进 DOM（textContent）', () => {
+    const { mod, doc } = buildGrantModule()
+    const row = rowOf(doc, mod, { commandText: CMD, askReason: 'shape:multi-command' })
+    const why = one(row, 'p-why')
+    const cmd = one(row, 'p-cmd')
+    assert.equal(why.textContent, '拦截原因：命令形状无法静态判定：多命令拼接', '原因必须用 askReasonLabel 的中文短标签')
+    assert.equal(cmd.textContent, CMD, '命令原文必须逐字进 DOM')
+    assert.equal(cmd.title, CMD, '面板只给单行预览，全文靠 title 悬停查看')
+    assert.deepEqual(row.childNodes.map((c) => c.className), ['p-why', 'p-cmd'], '顺序固定：原因在前、命令在后')
+  })
+
+  it('② 命令里的 HTML 一律当文本（面板不拼 innerHTML）', () => {
+    const { mod, doc } = buildGrantModule()
+    const evil = 'echo "<img src=x onerror=alert(1)>" > a.txt'
+    const row = rowOf(doc, mod, { commandText: evil, askReason: 'shape:multi-command' })
+    const cmd = one(row, 'p-cmd')
+    assert.equal(cmd.textContent, evil)
+    assert.equal(cmd.childNodes.length, 0, '命令不得被解析成 DOM 节点')
+    assert.equal(cmd.getAttribute('innerHTML'), null)
+  })
+
+  it('③ 无 commandText（非执行类请求）⇒ 命令行整行不渲染，不留空行', () => {
+    const { mod, doc } = buildGrantModule()
+    const row = rowOf(doc, mod, { askReason: 'tier-miss', toolName: 'web_search' })
+    assert.equal(byClass(row, 'p-cmd').length, 0, '没有命令正文时不得出现空的命令行')
+    assert.equal(row.childNodes.length, 1, '只剩原因一行（不留空行/占位）')
+    assert.equal(one(row, 'p-why').textContent, '拦截原因：未命中任何已记住的授权规则')
+  })
+
+  it('④ 原因缺失 ⇒ 照实写「未标注」（不省略、不假装没原因）', () => {
+    const { mod, doc } = buildGrantModule()
+    const row = rowOf(doc, mod, { commandText: CMD })
+    assert.equal(one(row, 'p-why').textContent, '拦截原因：未标注')
+    assert.equal(one(row, 'p-cmd').textContent, CMD, '原因缺失不得连带命令一起消失')
+  })
+
+  it('⑤ 长命令单行截断（120 字符 + …），title 仍是全文', () => {
+    const { mod, doc } = buildGrantModule()
+    const long = 'echo ' + 'x'.repeat(200)
+    const row = rowOf(doc, mod, { commandText: long, askReason: 'no-paths' })
+    const cmd = one(row, 'p-cmd')
+    assert.equal(cmd.textContent, long.slice(0, mod.PENDING_CMD_PREVIEW_CHARS) + '…')
+    assert.equal(cmd.textContent.length, mod.PENDING_CMD_PREVIEW_CHARS + 1)
+    assert.equal(cmd.title, long, 'title 必须是未被截断的全文')
+
+    const exact = 'y'.repeat(mod.PENDING_CMD_PREVIEW_CHARS)
+    const row2 = rowOf(doc, mod, { commandText: exact, askReason: 'no-paths' })
+    assert.equal(one(row2, 'p-cmd').textContent, exact, '恰好 120 字符不截断、不加省略号')
+  })
+
+  it('⑥ 蓝球（宿主审批通道）用同一装配件、换一组类名即可', () => {
+    const { mod, doc } = buildGrantModule()
+    const row = rowOf(doc, mod, { commandText: CMD, askReason: 'no-workspace-cover' }, { why: 'ha-why', cmd: 'ha-cmd' })
+    assert.equal(one(row, 'ha-why').textContent, '拦截原因：请求路径不在工作区内')
+    assert.equal(one(row, 'ha-cmd').textContent, CMD)
+    assert.equal(byClass(row, 'p-cmd').length, 0, '不得串用另一条通道的类名')
+  })
+
+  it('⑦ 两条通道的调用点都在源码里（只改一条 = 断一半）', () => {
+    assert.match(src, /appendPendingAskLines\(row, a\.permissionPending, \{ why: "p-why", cmd: "p-cmd" \}\)/,
+      '琥珀球面板行必须走 appendPendingAskLines')
+    assert.match(src, /appendPendingAskLines\(row, item, \{ why: "ha-why", cmd: "ha-cmd" \}\)/,
+      '蓝球面板行必须走 appendPendingAskLines')
+  })
+})
+
+// ── v1.12.27（同一轮的第二个显示位）：运行卡片 `RunCard` 的待授权清单 ──
+// 用户澄清：「点击浮球后出来的面板」＝总览里的运行卡片列表，待授权只是卡片右侧的
+// `ad-pending-badge` 徽标，**过去只把 description 塞进 title 提示**，正文里看不到命令。
+// 本轮在卡片里逐条列出（最多 2 条 + 「…还有 N 条」），文案与浮球面板共用
+// `pendingAskLinesOf` —— 截断长度、「未标注」口径都只有一份。
+//
+// RunCard 是 React 组件（依赖 window/document，无法 import），沿用本文件的做法：
+// 把源码那块抠出来、注入**假 React** 后真的执行，再走一遍假 vnode 树做断言。
+const FakeReact = {
+  createElement: (type, props, ...children) => ({
+    type,
+    props: props || {},
+    children: children.flat(Infinity).filter((c) => c !== null && c !== undefined && c !== false && c !== true),
+  }),
+}
+
+function vwalk(node, out = []) {
+  if (!node || typeof node !== 'object') return out
+  out.push(node)
+  for (const c of node.children || []) vwalk(c, out)
+  return out
+}
+
+function vclass(node) {
+  return String((node && node.props && node.props.className) || '')
+}
+
+function vByClass(root, cls) {
+  return vwalk(root).filter((n) => vclass(n).split(/\s+/).includes(cls))
+}
+
+/** 节点树的可读文本（等同浏览器里的 textContent） */
+function vText(node) {
+  if (typeof node === 'string') return node
+  if (!node || typeof node !== 'object') return ''
+  return (node.children || []).map(vText).join('')
+}
+
+/** 从源码抠出一段顶层函数（endMarker 传闭合那一行的缩进 + }） */
+function grabFn(startMarker, endMarker) {
+  const at = src.indexOf(startMarker)
+  assert.ok(at >= 0, `client.js 找不到 "${startMarker}"（被改名或删除？）`)
+  const close = src.indexOf(endMarker, at)
+  assert.ok(close > at, `"${startMarker}" 之后找不到闭合锚点`)
+  return src.slice(at, close + endMarker.length)
+}
+
+const REAL_PERM_ROWS_OF = new Function(grabFn('function permRowsOf(arr) {', '\n    }') + '\nreturn permRowsOf;')()
+const REAL_FMT_DUR = new Function(grabFn('function fmtDur(startedAt, now) {', '\n    }') + '\nreturn fmtDur;')()
+
+/** 编译生产版 RunCard：inject 假 React + 真实 permRowsOf/fmtDur + 共用的文案生产端 */
+function buildRunCard(mod) {
+  const body = grabFn('function RunCard({ a, now, onCancel, cancelling }) {', '\n    }')
+  assert.match(body, /pendingAskLinesOf\(/, 'RunCard 必须复用 pendingAskLinesOf（不许另写一份文案/截断）')
+  const factory = new Function(
+    'React', 'openAgentSession', 'permCountOf', 'permRowsOf', 'pendingAskLinesOf', 'fmtDur', 'DSHLogo',
+    body + '\nreturn RunCard;',
+  )
+  return (a) => factory(
+    FakeReact,
+    null, // canOpen=false：不挂点击handler，避免测试里真的去开会话
+    (entry) => REAL_PERM_ROWS_OF([entry]).length,
+    REAL_PERM_ROWS_OF,
+    mod.pendingAskLinesOf,
+    REAL_FMT_DUR,
+    () => null,
+  )({ a, now: Date.now(), onCancel: null, cancelling: null })
+}
+
+function pendingEntry(list) {
+  return { childId: 'child-1', agentId: 'a1', agentName: 'A6-write', startedAt: Date.now() - 8000, permissionPendingList: list }
+}
+
+describe('v1.12.27 运行卡片 RunCard：待授权逐条列出命令原文 + 拦截原因', () => {
+  it('① 单条：工具名 · 拦截原因 + 命令原文都在卡片里', () => {
+    const { mod } = buildGrantModule()
+    const card = buildRunCard(mod)(pendingEntry([
+      { toolName: 'Bash', askReason: 'shape:relative-traversal', shapeRule: 'relative-traversal', commandText: 'cat package.json ../../package.json' },
+    ]))
+    const text = vText(card)
+    assert.match(text, /⏳ 待授权/, '徽标文案保持原样')
+    assert.equal(vByClass(card, 'ad-run-pending-item').length, 1)
+    assert.equal(vByClass(card, 'pr-why')[0].children.join(''), 'Bash · 拦截原因：命令形状无法静态判定：相对路径越界')
+    assert.equal(vByClass(card, 'pr-cmd')[0].children.join(''), 'cat package.json ../../package.json')
+    assert.equal(vByClass(card, 'pr-more').length, 0, '只有 1 条时不该出现「还有」')
+  })
+
+  it('② 两条：逐条列出（徽标显示 ×2）', () => {
+    const { mod } = buildGrantModule()
+    const card = buildRunCard(mod)(pendingEntry([
+      { toolName: 'Bash', askReason: 'shape:relative-traversal', shapeRule: 'relative-traversal', commandText: 'cat package.json ../../package.json' },
+      { toolName: 'Bash', askReason: 'shape:inline-code', shapeRule: 'inline-code', commandText: 'node -e "console.log(1)"' },
+    ]))
+    assert.match(vText(card), /待授权 ×2/)
+    const whys = vByClass(card, 'pr-why').map((n) => n.children.join(''))
+    const cmds = vByClass(card, 'pr-cmd').map((n) => n.children.join(''))
+    assert.deepEqual(whys, [
+      'Bash · 拦截原因：命令形状无法静态判定：相对路径越界',
+      'Bash · 拦截原因：命令形状无法静态判定：内联代码执行',
+    ])
+    assert.deepEqual(cmds, ['cat package.json ../../package.json', 'node -e "console.log(1)"'])
+    assert.equal(vByClass(card, 'pr-more').length, 0)
+  })
+
+  it('③ 超过 2 条：只列 2 条，其余折成「…还有 N 条」（卡片不许被撑爆）', () => {
+    const { mod } = buildGrantModule()
+    const p = (t) => ({ toolName: 'Bash', askReason: 'tier-miss', commandText: t })
+    const card = buildRunCard(mod)(pendingEntry([p('one'), p('two'), p('three'), p('four')]))
+    assert.equal(vByClass(card, 'ad-run-pending-item').length, 2, '最多渲染 2 条')
+    assert.deepEqual(vByClass(card, 'pr-cmd').map((n) => n.children.join('')), ['one', 'two'])
+    assert.equal(vByClass(card, 'pr-more')[0].children.join(''), '…还有 2 条（点浮球看全部）')
+    assert.match(vText(card), /待授权 ×4/, '徽标上的总数仍是真实条数')
+  })
+
+  it('④ 无 commandText（非执行类请求）⇒ 只出原因行，不留空行', () => {
+    const { mod } = buildGrantModule()
+    const card = buildRunCard(mod)(pendingEntry([{ toolName: 'web_search', askReason: 'tier-miss' }]))
+    assert.equal(vByClass(card, 'pr-cmd').length, 0)
+    assert.equal(vByClass(card, 'pr-why')[0].children.join(''), 'web_search · 拦截原因：未命中任何已记住的授权规则')
+  })
+
+  it('⑤ 原因缺失 ⇒ 「未标注」；长命令截断 + title 全文', () => {
+    const { mod } = buildGrantModule()
+    const long = 'echo ' + 'x'.repeat(200)
+    const card = buildRunCard(mod)(pendingEntry([{ toolName: 'Bash', commandText: long }]))
+    assert.equal(vByClass(card, 'pr-why')[0].children.join(''), 'Bash · 拦截原因：未标注')
+    const cmd = vByClass(card, 'pr-cmd')[0]
+    assert.equal(cmd.children.join(''), long.slice(0, mod.PENDING_CMD_PREVIEW_CHARS) + '…')
+    assert.equal(cmd.props.title, long, 'title 必须是全文（悬停可看）')
+    assert.equal(mod.PENDING_CMD_PREVIEW_CHARS <= 120, true, '单行预览上限不得超过 120 字符')
+  })
+
+  it('⑥ 命令里的 HTML 只当文本：不做 dangerouslySetInnerHTML', () => {
+    const { mod } = buildGrantModule()
+    const evil = '<img src=x onerror=alert(1)>'
+    const card = buildRunCard(mod)(pendingEntry([{ toolName: 'Bash', askReason: 'tier-miss', commandText: evil }]))
+    const cmd = vByClass(card, 'pr-cmd')[0]
+    assert.deepEqual(cmd.children, [evil], '命令必须是纯文本子节点')
+    assert.equal(vwalk(card).filter((n) => n.type === 'img').length, 0)
+    assert.equal(vwalk(card).some((n) => n.props && 'dangerouslySetInnerHTML' in n.props), false)
+    assert.doesNotMatch(src, /dangerouslySetInnerHTML/, '整个 client.js 都不许用 dangerouslySetInnerHTML')
+  })
+
+  it('⑦ 无待授权 ⇒ 不渲染清单块（只有「运行中」徽标）', () => {
+    const { mod } = buildGrantModule()
+    const card = buildRunCard(mod)({ childId: 'child-2', agentName: 'A1', startedAt: Date.now() })
+    assert.equal(vByClass(card, 'ad-run-pending').length, 0)
+    assert.match(vText(card), /运行中/)
   })
 })

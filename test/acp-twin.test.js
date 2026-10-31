@@ -258,3 +258,32 @@ describe('A + B 串联：摊平结果驱动琥珀覆盖，决议一条不误提�
     assert.deepEqual(blue.added, [])
   })
 })
+
+describe('H1（v1.12.21）：孪生条目不得给出写不下去的「记住类」按钮', () => {
+  // 读侧事实：孪生在 approval/request 监听器的早退门（index.js 的
+  // `if (isAcpTwinApproval(...)) return next()`）处就交回宿主，本插件的
+  // #sessionRules / #toolGrants 永远不被 ACP 请求读到 ⇒ 蓝球上的「本会话总是允许」
+  // 写下去是死规则（用户现场："记住还重复弹"）。写侧端点另有同源闸门（见
+  // test/host-approval-endpoint.test.js 的 rule-session-skipped-twin）。
+  const sliceFrom = (marker) => {
+    const i = src.indexOf(marker)
+    assert.ok(i >= 0, `client.js 中找不到 "${marker}"`)
+    return i
+  }
+
+  it('条目上带 acpTwin（判据与 held 同源）', () => {
+    assert.match(src, /item\.acpTwin = isAcpTwin/, '孪生身份没挂到条目上 ⇒ 渲染侧无从区分')
+  })
+
+  it('rendered 分支：孪生只给「允许一次 / 拒绝」，且不走 grantViaDialog', () => {
+    const start = sliceFrom('if (item.acpTwin === true) {')
+    const end = sliceFrom('const danger = dangerAskOf(item);')
+    assert.ok(start < end, '孪生分支必须排在普通行之前（否则会先渲染出记住类按钮）')
+    const block = src.slice(start, end)
+    assert.match(block, /twinBtn\("允许一次"/, '孪生行没有「允许一次」')
+    assert.match(block, /twinBtn\("拒绝"/, '孪生行没有「拒绝」')
+    assert.match(block, /continue;/, '孪生分支必须短路掉普通行')
+    assert.equal(/grantViaDialog/.test(block), false, '孪生行仍在走 grantViaDialog ⇒ 会话档又被写了一遍')
+    assert.match(block, /琥珀球/, '没有告诉用户真正的记忆入口（琥珀球）')
+  })
+})

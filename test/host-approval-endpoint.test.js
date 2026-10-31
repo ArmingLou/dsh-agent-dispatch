@@ -9,10 +9,11 @@
 //
 // 运行：node --test test/host-approval-endpoint.test.js
 
-import { describe, it } from 'node:test'
+import { after, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync, existsSync } from 'node:fs'
+import { readFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
+import os from 'node:os'
 import path from 'node:path'
 import { boot, mkSession } from './agent-api-harness.js'
 
@@ -1082,4 +1083,317 @@ describe('v1.12.7 终审 M1：paths:null ⇒ 不写任何档（与「未给 path
       assert.equal(sib.nextCalled, false)
     } finally { await b.close() }
   })
+})
+
+describe('H1（v1.12.21）：ACP 孪生请求的**会话档**写下去没有任何判定侧会读到 ⇒ 拒收', () => {
+  // 现场：用户在小面板点「本会话内记住」，下次同类请求照样弹。
+  // 读侧事实（同仓）：approval/request 监听器对 ACP 孪生在
+  // `if (isAcpTwinApproval(...)) return next()`（index.js:395）处早退，永远到不了
+  // hostApproval.decide() ⇒ #sessionRules / #toolGrants / 落盘工具档都不参与 ACP 判定；
+  // ACP 的判定在 product-subagents 内部（它自己的会话档 + 共用 allowlist.json）。
+  // 两份 store 只在**落盘**那一档重合（所以 scope=project 仍然有效，见上一个 describe）。
+  // 本组用例钉死：孪生 + scope=session ⇒ 不写、如实回 written:false、留痕可查。
+  const allowlist = (home) => path.join(home, 'data', 'dsh-plugin-product-subagents', 'allowlist.json')
+  const ACP_REASON = '[ACP qoder] 请求权限：执行 ls'
+
+  it('孪生 + scope=session ⇒ written:false、不落盘、留痕 rule-session-skipped-twin', async () => {
+    const b = await boot()
+    try {
+      const acp = mkSession({
+        id: 'child-acp',
+        parentSession: 'R',
+        toolCalls: [{ callId: 'ca', name: 'product_submit', arguments: { task: '列一下目录' } }],
+      })
+      const first = await approve(b, acp, { callId: 'ca', toolName: 'product_submit', reason: ACP_REASON })
+      assert.equal(first.nextCalled, true, '读取侧不变量：孪生必须交回宿主（本插件一档都不判）')
+      assert.equal(first.res, 'NEXT')
+
+      // 客户端要靠上下文里的 acpTwin 决定不渲染「记住类」按钮 ⇒ 这个字段必须有
+      const ctxRes = await b.req('GET', '/agent-api/host-approval-context?callId=ca&sessionId=child-acp')
+      assert.equal(ctxRes.status, 200)
+      assert.equal(ctxRes.json.acpTwin, true, '暂存上下文没标出 acpTwin（客户端仍会给出写不下去的会话档按钮）')
+
+      const { status, json } = await postRule(b, {
+        scope: 'session', sessionId: 'child-acp', callId: 'ca', toolName: 'product_submit', paths: [],
+      })
+      assert.equal(status, 200, '孪生的会话档不该以 400 报错（客户端会弹红字）')
+      assert.equal(json.written, false, '孪生会话档被写下了（判定侧读不到 ⇒ 死规则）')
+      assert.equal(json.scope, 'session')
+      assert.match(String(json.reason || ''), /ACP/, '响应没说清为什么没写（用户会以为记住了）')
+      assert.equal(existsSync(allowlist(b.home)), false, '会话档却落盘了（档位被静默升级成项目档）')
+      assert.equal(grantRows(b.home, 'rule-session-skipped-twin').length, 1, '拒收没留痕（现场排不出"为什么没记住"）')
+    } finally { await b.close() }
+  })
+
+  it('对照：非孪生的会话档仍照写并**被判定侧读到**（不许被这条改动波及）', async () => {
+    const b = await boot()
+    try {
+      const s1 = mkSession({ id: 'child-1', parentSession: 'R', toolCalls: [{ callId: 'n1', name: 'write', arguments: { file_path: '/proj/a.txt' } }] })
+      await approve(b, s1, { callId: 'n1', toolName: 'write' })
+      const post = await postRule(b, { scope: 'session', sessionId: 'child-1', callId: 'n1', toolName: 'write' })
+      assert.equal(post.status, 200)
+      assert.equal(post.json.written, true, '普通请求的会话档被误判成孪生拒收了')
+
+      const s2 = mkSession({ id: 'child-2', parentSession: 'R', toolCalls: [{ callId: 'n2', name: 'write', arguments: { file_path: '/elsewhere/b.txt' } }] })
+      const sib = await approve(b, s2, { callId: 'n2', toolName: 'write' })
+      assert.equal(sib.res, 'allowed-once', '普通请求的会话档写下去却没被读到（写读键不一致）')
+      assert.equal(grantRows(b.home, 'rule-session-skipped-twin').length, 0, '普通请求被误留了孪生拒收痕迹')
+    } finally { await b.close() }
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// v1.12.25（用户裁定「面板显示命令原文 + 拦截原因」）
+//
+// 现场问题：授权面板只渲染「工具：Bash」+ 目录列表 —— 用户看不到要执行什么，也看不到
+// 为什么被拦，点「允许」等于盲批。本组钉住**数据侧**：暂存上下文（= GET
+// /agent-api/host-approval-context 的返回值，也是客户端只读区的唯一数据源）在每一条
+// 落到人工审批的分支上都带 `askReason`，并且带 `commandText`。
+//
+// 归因必须**因分支而异**（下面逐条对照）：全写同一个值等于没归因。
+// ────────────────────────────────────────────────────────────────────────────
+describe('v1.12.25 面板只读区：pending 上下文带 commandText + askReason（逐分支）', () => {
+  const WS = '/tmp/dsh-ask-reason-ws'
+  const ctxOf = async (b, callId, sessionId) => {
+    const { status, json } = await b.req('GET', '/agent-api/host-approval-context?callId=' + callId + '&sessionId=' + sessionId)
+    assert.equal(status, 200)
+    return json
+  }
+
+  it('工作区档被形状闸门拦下 ⇒ askReason=shape:<id> + shapeRule + commandText', async () => {
+    const b = await boot()
+    try {
+      const cmd = `cd ${WS} && node --test ${WS}/test/a.test.js`
+      const s = mkSession({ id: 'child-1', parentSession: 'R', cwd: WS, toolCalls: bashCall('s1', cmd) })
+      const r = await approve(b, s, { callId: 's1', toolName: 'bash' })
+      assert.equal(r.nextCalled, true, '前置：这条必须落到人工审批')
+      const ctx = await ctxOf(b, 's1', 'child-1')
+      assert.equal(ctx.askReason, 'shape:multi-command', '面板要说得出「多命令拼接」才不是盲批')
+      assert.equal(ctx.shapeRule, 'multi-command', '命中的形状规则 id 也要一并下发')
+      assert.equal(ctx.commandText, cmd, '面板必须拿到命令原文')
+    } finally { await b.close() }
+  })
+
+  it('危险命令门 ⇒ askReason=danger + dangerRule（命令正文仍在）', async () => {
+    const b = await boot()
+    try {
+      const cmd = `rm -rf ${WS}/scratch`
+      const s = mkSession({ id: 'child-1', parentSession: 'R', cwd: WS, toolCalls: bashCall('d1', cmd) })
+      await approve(b, s, { callId: 'd1', toolName: 'bash' })
+      const ctx = await ctxOf(b, 'd1', 'child-1')
+      assert.equal(ctx.askReason, 'danger')
+      assert.equal(ctx.dangerRule, 'rm -rf', '危险门名要能在面板上点名')
+      assert.equal(ctx.commandText, cmd)
+    } finally { await b.close() }
+  })
+
+  it('路径全在工作区外 ⇒ askReason=no-workspace-cover；半覆盖 ⇒ paths-partial', async () => {
+    const b = await boot()
+    try {
+      const s1 = mkSession({ id: 'child-1', parentSession: 'R', cwd: WS, toolCalls: bashCall('o1', 'cat /etc/hosts') })
+      await approve(b, s1, { callId: 'o1', toolName: 'bash' })
+      assert.equal((await ctxOf(b, 'o1', 'child-1')).askReason, 'no-workspace-cover')
+
+      const s2 = mkSession({ id: 'child-2', parentSession: 'R2', cwd: WS, toolCalls: bashCall('o2', `cat ${WS}/a.txt /etc/hosts`) })
+      await approve(b, s2, { callId: 'o2', toolName: 'bash' })
+      const half = await ctxOf(b, 'o2', 'child-2')
+      assert.equal(half.askReason, 'paths-partial',
+        '一半在工作区内、一半在外必须区别于「全在外」——半覆盖绝不放行，但原因不同')
+      // v1.12.26：半覆盖这条也要**逐字**带命令原文（面板只读区的正文来源），
+      // 不能只有归因没有正文 —— 现场缺的正是这一块。
+      assert.equal(half.commandText, `cat ${WS}/a.txt /etc/hosts`, '半覆盖请求必须带命令原文')
+    } finally { await b.close() }
+  })
+
+  it('一个路径都没解析出来 ⇒ askReason=no-paths（面板不能只给一张空表）', async () => {
+    const b = await boot()
+    try {
+      const s = mkSession({ id: 'child-1', parentSession: 'R', cwd: WS, toolCalls: bashCall('p1', 'npm test') })
+      await approve(b, s, { callId: 'p1', toolName: 'bash' })
+      const ctx = await ctxOf(b, 'p1', 'child-1')
+      assert.equal(ctx.askReason, 'no-paths')
+      assert.equal(ctx.commandText, 'npm test')
+    } finally { await b.close() }
+  })
+
+  // ── v1.12.26（第二条现场）：`node -e "console.log(1)"` ──
+  // 内联代码执行**本来就不碰文件** ⇒ paths 必空 ⇒ 过去一律归因 `no-paths`
+  // （「未能解析出任何路径」）。真机上这条的面板是最糟形态：两个目录区全空 +
+  // 「要不要给整个工具放行任意路径」，用户完全不知道要执行什么。
+  // 归因取值：`shape:inline-code`（复用既有 `shape:<id>` 枚举与客户端标签
+  // 「命令形状无法静态判定：内联代码执行」）。理由：真正让它不可判的是**形状**
+  // （代码正文在参数里），不是"没解析出路径"——后者只是前者的后果。
+  it('内联代码执行（无路径）⇒ commandText 原文 + askReason=shape:inline-code，候选不为噪声', async () => {
+    const b = await boot()
+    try {
+      const cmd = 'node -e "console.log(1)"'
+      const s = mkSession({ id: 'child-1', parentSession: 'R', cwd: WS, toolCalls: bashCall('e1', cmd) })
+      const r = await approve(b, s, { callId: 'e1', toolName: 'bash' })
+      assert.equal(r.nextCalled, true, '前置：内联代码执行必须落到人工审批')
+      const ctx = await ctxOf(b, 'e1', 'child-1')
+      assert.deepEqual(ctx.paths, [], '前置：这条命令本就解析不出路径（面板两区都空是合理的）')
+      assert.equal(ctx.commandText, cmd, '唯一能让用户判断的信息就是命令原文，必须逐字下发')
+      assert.equal(ctx.askReason, 'shape:inline-code', '归因必须是内联代码执行，不能只说「未能解析出任何路径」')
+      assert.equal(ctx.shapeRule, 'inline-code')
+      assert.deepEqual(ctx.unextracted, [],
+        '代码正文不是路径清单：`console.log` 之类不得被当成"未解析的路径"塞进面板候选')
+    } finally { await b.close() }
+  })
+
+  it('内联代码执行的反向边界：脚本文件 / 选项在文件名之后 / shell -c 都不算', async () => {
+    const b = await boot()
+    try {
+      // `node --test <file>`：普通脚本执行（有路径），不得被 inline-code 误伤
+      const s1 = mkSession({ id: 'child-1', parentSession: 'R', cwd: WS, toolCalls: bashCall('n1', `node --test ${WS}/test/a.test.js`) })
+      assert.equal((await approve(b, s1, { callId: 'n1', toolName: 'bash' })).nextCalled, false,
+        '`node --test <file>` 被 inline-code 误判成内联代码（日常形态不该变永久转人工）')
+
+      // `node app.js -e`：`-e` 在脚本文件名之后，是脚本自己的参数
+      const s2 = mkSession({ id: 'child-2', parentSession: 'R', cwd: WS, toolCalls: bashCall('n2', `node ${WS}/app.js -e`) })
+      assert.equal((await approve(b, s2, { callId: 'n2', toolName: 'bash' })).nextCalled, false,
+        '脚本文件名之后的 -e 不归解释器解释')
+
+      // `bash -c 'git status'`：shell 的 -c 是剥壳，正文可判（刻意不纳入 inline-code）
+      const s3 = mkSession({ id: 'child-3', parentSession: 'R', cwd: WS, toolCalls: bashCall('n3', `bash -c 'git status'`) })
+      const r3 = await approve(b, s3, { callId: 'n3', toolName: 'bash' })
+      const ctx3 = await ctxOf(b, 'n3', 'child-3')
+      assert.notEqual(ctx3.askReason, 'shape:inline-code', 'shell -c 不是内联代码执行（会把日常形态变成永久转人工）')
+      assert.ok(r3, '反向对照只需要归因结论，不锁定是否放行')
+    } finally { await b.close() }
+  })
+
+  it('无暂存上下文的兜底响应：三个新字段形状稳定（null / 空串，不是 undefined）', async () => {
+    const b = await boot()
+    try {
+      const ctx = await ctxOf(b, 'nope', 'nope')
+      assert.equal(ctx.askReason, null)
+      assert.equal(ctx.shapeRule, null)
+      assert.equal(ctx.commandText, '')
+      assert.equal(ctx.argsText, '')
+    } finally { await b.close() }
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// v1.12.25（追加 A）：pending 上下文要带「`PATH_RE` 提取不到的路径候选」
+//
+// 面板不仅要显示命令原文，还要把**提取不到的路径片段**摊开，并允许用户手动改成
+// 要授权的目录（`../../package.json` → `…/develop`）。数据来自
+// `unextractedPathCandidates`：`raw` 原文、`resolved` 按生效目录归一化、
+// `insideWorkspace` 与放行判定**同源**（同一个 `workspaceCovers`）。
+// ────────────────────────────────────────────────────────────────────────────
+describe('v1.12.25 追加 A：pending 上下文带 unextracted（raw/resolved/insideWorkspace）', () => {
+  const WS = '/tmp/dsh-unextracted-ws'
+
+  it('`cat package.json ../../package.json` ⇒ 越界操作数落点在工作区外且 insideWorkspace=false', async () => {
+    const b = await boot()
+    try {
+      const cmd = 'cat package.json ../../package.json'
+      const s = mkSession({ id: 'child-1', parentSession: 'R', cwd: WS, toolCalls: bashCall('u1', cmd) })
+      await approve(b, s, { callId: 'u1', toolName: 'bash' })
+      const { status, json } = await b.req('GET', '/agent-api/host-approval-context?callId=u1&sessionId=child-1')
+      assert.equal(status, 200)
+      assert.ok(Array.isArray(json.unextracted), 'unextracted 必须是数组（面板据此渲染合并组）')
+      const hit = json.unextracted.find((c) => c.raw === '../../package.json')
+      assert.ok(hit, `候选里没有 ../../package.json（实际 ${JSON.stringify(json.unextracted)}）`)
+      assert.equal(hit.resolved, path.resolve(WS, '../../package.json'), '归一化落点不对（按生效目录 resolve）')
+      assert.equal(hit.insideWorkspace, false, '越界操作数必须标成工作区外（与 workspaceCovers 同源）')
+      assert.equal(hit.kind, 'relative-traversal')
+      // 对照：工作区内的相对操作数也在候选里，但 insideWorkspace=true
+      const inside = json.unextracted.find((c) => c.raw === 'package.json')
+      assert.equal(inside && inside.insideWorkspace, true, '工作区内的候选要标成工作区内')
+    } finally { await b.close() }
+  })
+
+  it('已能被 PATH_RE 命中的绝对路径不重复列；变量类 resolved=null', async () => {
+    const b = await boot()
+    try {
+      const cmd = 'cat /etc/hosts ${HOME}/.ssh/id_rsa'
+      const s = mkSession({ id: 'child-2', parentSession: 'R2', cwd: WS, toolCalls: bashCall('u2', cmd) })
+      await approve(b, s, { callId: 'u2', toolName: 'bash' })
+      const { json } = await b.req('GET', '/agent-api/host-approval-context?callId=u2&sessionId=child-2')
+      assert.equal(json.unextracted.some((c) => c.raw === '/etc/hosts'), false,
+        '/etc/hosts 已进 paths（PATH_RE 命中），不得重复列')
+      const v = json.unextracted.find((c) => c.kind === 'variable')
+      assert.ok(v, '变量类候选必须列出来（用户才知道它无法自动解析）')
+      assert.equal(v.raw, '${HOME}/.ssh/id_rsa')
+      assert.equal(v.resolved, null, '变量无法静态求值 ⇒ resolved 必须是 null')
+      assert.equal(v.insideWorkspace, false)
+    } finally { await b.close() }
+  })
+
+  it('候选只做展示：不进 paths、不改变「该不该弹」的结论', async () => {
+    const b = await boot()
+    try {
+      const cmd = 'cat package.json ../../package.json'
+      const s = mkSession({ id: 'child-3', parentSession: 'R3', cwd: WS, toolCalls: bashCall('u3', cmd) })
+      const r = await approve(b, s, { callId: 'u3', toolName: 'bash' })
+      assert.equal(r.nextCalled, true, '仍必须交人工（候选不参与判定）')
+      const { json } = await b.req('GET', '/agent-api/host-approval-context?callId=u3&sessionId=child-3')
+      assert.ok(Array.isArray(json.paths), 'paths 仍是提取层的结果')
+      for (const c of json.unextracted) {
+        assert.equal(json.paths.includes(c.raw), false, `候选 ${c.raw} 不得混进 paths`)
+      }
+    } finally { await b.close() }
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// v1.12.25（追加 B·宿主侧）：**手动登记的目录要能覆盖相对路径目标**
+//
+// 用户场景（同一件事在宿主通道上）：面板里把 `../../package.json` 改成目录
+// `…/develop` 并「记住会话内允许」；之后同样的命令应当命中该规则、不再弹。
+// 前提是越界操作数**能进 `paths`**（`commandRelativePaths`），否则 `decide` 连
+// `paths.length > 0` 都不成立，规则永远匹配不到。
+// ────────────────────────────────────────────────────────────────────────────
+describe('v1.12.25 追加 B（宿主侧）：登记的目录覆盖相对越界操作数', () => {
+  const NEST = mkdtempSync(path.join(os.tmpdir(), 'dsh-manual-'))
+  const WS = path.join(NEST, 'mid', 'proj')
+  mkdirSync(WS, { recursive: true })
+  writeFileSync(path.join(NEST, 'package.json'), '{}\n')
+  writeFileSync(path.join(WS, 'package.json'), '{}\n')
+  const teardown = () => rmSync(NEST, { recursive: true, force: true })
+  const CMD = 'cat package.json ../../package.json'
+
+  it('登记上级目录 ⇒ allowed-once（不再弹）', async () => {
+    const b = await boot()
+    try {
+      const s1 = mkSession({ id: 'child-1', parentSession: 'R', cwd: WS, toolCalls: bashCall('m1', CMD) })
+      assert.equal((await approve(b, s1, { callId: 'm1', toolName: 'bash' })).nextCalled, true, '前置：首次必须问')
+      const post = await postRule(b, { scope: 'session', sessionId: 'child-1', callId: 'm1', toolName: 'bash', paths: [NEST] })
+      assert.equal(post.status, 200)
+      assert.equal(post.json.written, true, '用户的目录声明必须写下去（否则这条用例测不到判定侧）')
+
+      const s2 = mkSession({ id: 'child-2', parentSession: 'R', cwd: WS, toolCalls: bashCall('m2', CMD) })
+      const r = await approve(b, s2, { callId: 'm2', toolName: 'bash' })
+      assert.equal(r.nextCalled, false, '登记的目录没有覆盖相对越界目标（越界操作数没进 paths？）')
+      assert.equal(r.res, 'allowed-once')
+    } finally { await b.close() }
+  })
+
+  it('对照：没登记 ⇒ 仍然弹；只登记工作区内目录 ⇒ 仍然弹（半覆盖不放行）', async () => {
+    const b = await boot()
+    try {
+      const s1 = mkSession({ id: 'child-3', parentSession: 'R3', cwd: WS, toolCalls: bashCall('m3', CMD) })
+      assert.equal((await approve(b, s1, { callId: 'm3', toolName: 'bash' })).nextCalled, true)
+      await postRule(b, { scope: 'session', sessionId: 'child-3', callId: 'm3', toolName: 'bash', paths: [WS] })
+      const s2 = mkSession({ id: 'child-4', parentSession: 'R3', cwd: WS, toolCalls: bashCall('m4', CMD) })
+      assert.equal((await approve(b, s2, { callId: 'm4', toolName: 'bash' })).nextCalled, true,
+        '只登记工作区内目录不得放行越界操作数')
+    } finally { await b.close() }
+  })
+
+  it('相对 token 只进判定集，不进弹框预填（结构化路径）', async () => {
+    const b = await boot()
+    try {
+      const s = mkSession({ id: 'child-5', parentSession: 'R5', cwd: WS, toolCalls: bashCall('m5', CMD) })
+      await approve(b, s, { callId: 'm5', toolName: 'bash' })
+      const { json } = await b.req('GET', '/agent-api/host-approval-context?callId=m5&sessionId=child-5')
+      assert.ok(json.paths.includes(path.join(NEST, 'package.json')), '判定集里必须有越界落点')
+      assert.equal(json.structuredPaths.includes(path.join(NEST, 'package.json')), false,
+        '越界落点不得进 structuredPaths（那是默认勾选的预填）')
+    } finally { await b.close() }
+  })
+
+  after(teardown)
 })

@@ -23,3 +23,6 @@ data/
 
 # CLI 本地权限/会话产物
 .qoder/
+
+# 权限探针残留（ACP 工作区档回归测试产物）
+.probe-acp/

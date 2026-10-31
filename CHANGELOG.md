@@ -1,3 +1,343 @@
+## 1.12.27（2026-11-01）
+
+> 一句话：**浮球面板显示命令原文与拦截原因** —— 1.12.25/1.12.26 只把「要执行什么 + 为什么被拦」
+> 放进了点「允许」之后的授权弹框，而用户第一眼看到的是点浮球打开的那张**待授权列表**，
+> 那里每条仍只有一行描述（如 `Bash | A6-write`）⇒ 面板这一层依旧是盲批。
+
+### 改动
+
+| 位置 | 改动 |
+| --- | --- |
+| `lib/client.js`（模块作用域 `appendPendingAskLines`） | 新增两条通道**共用**的行装配件：`拦截原因：<中文标签>`（`askReasonLabel`，空 ⇒ `未标注`）+ 命令原文（单行预览，默认 120 字符截断 + `…`，`title` 给全文）。一律 `textContent`；无 `commandText`（`web_search` 这类非执行请求）⇒ 命令**整行不渲染**，不留空行 |
+| `lib/client.js`（琥珀球面板 `renderPop`） | 普通待授权行在描述之后、四个决策按钮之前追加这两行（数据 = `a.permissionPending` 上的 `commandText`/`askReason`/`shapeRule`/`dangerRule`） |
+| `lib/client.js`（蓝球面板 `renderPop`） | 宿主审批行在 `ha-reason` 之后追加同一对行（数据 = `host-approval-context` 回填的 `item.commandText`/`item.askReason`），类名 `ha-why` / `ha-cmd` |
+| `lib/client.js`（模块作用域 `pendingAskLinesOf`） | 文案**生产端**：一条待授权载荷 ⇒ `{why, cmd, cmdTitle}`（中文标签 + 120 字符截断 + 全文）。`appendPendingAskLines`（面板，DOM）与 `RunCard`（运行卡片，React）都只从这里取文案——截断长度与「未标注」口径各写一份必然漂移 |
+| `lib/client.js`（`RunCard`） | 运行卡片（「点击浮球后出来的面板」按用户澄清＝总览里的运行卡片列表）在任务行下逐条列出待授权：`<工具> · 拦截原因：…` + 命令单行预览（`title` 全文），**最多 2 条**，超出折成 `…还有 N 条（点浮球看全部）`；数据 = `permRowsOf([a])` 的 `row.permissionPending`。徽标（`ad-pending-badge`）文案与 title 保持原样 |
+| CSS | 新增 `.p-why` / `.p-cmd` / `.ha-why` / `.ha-cmd` / `.ad-run-pending*` 规则，只加字号/行高与截断（`nowrap` + `text-overflow:ellipsis`）；颜色全部复用既有值（`#8a6a2e` / `--dsw-alias-label-secondary` / `--dsw-alias-label-tertiary` / `--ad-muted` / `--ad-faint`），**未引入新色值** |
+
+面板行长这样：
+
+```
+Bash · 6f3a91c2 · 4b7e21
+请求执行命令（本会话将记住：product:bash）
+拦截原因：命令形状无法静态判定：多命令拼接
+cd /ws && node --test /ws/test/a.test.js
+[允许一次] [本会话总是允许该工具] [总是允许(项目)] [拒绝]
+```
+
+```
+web_search · 6f3a91c2 · 9c1d02
+请求权限
+拦截原因：未命中任何已记住的授权规则
+[允许一次] [本会话总是允许该工具] [总是允许(项目)] [拒绝]
+```
+
+运行卡片（单条 / 两条）：
+
+```
+[A6-write · 6f3a91c2]  任务：修复 A6 的写权限
+                       Bash · 拦截原因：命令形状无法静态判定：相对路径越界
+                       cat package.json ../../package.json        [⏳ 待授权 8s] [中止]
+```
+
+```
+[A6-write · 6f3a91c2]  任务：修复 A6 的写权限
+                       Bash · 拦截原因：命令形状无法静态判定：相对路径越界
+                       cat package.json ../../package.json
+                       Bash · 拦截原因：命令形状无法静态判定：内联代码执行
+                       node -e "console.log(1)"                   [⏳ 待授权 ×2 8s] [中止]
+```
+
+### 未改
+
+- 高危（`askReason=danger`）行仍是 1.12.15 的专用形态：本来就带命中规则 + 触发片段 + 命令原文，不叠加。
+- 蓝球上的 **ACP 孪生**行不动：该条目在建条目时就走提前返回、**不发起** `host-approval-context`，拿不到 `commandText`/`askReason`（加了只会永远显示「未标注」）；它的决策与记忆入口本来就指回琥珀球。
+- 蓝球（宿主审批通道）**没有** `RunCard` 形态：它的条目来自 `approval/request` 事件、只存在于蓝球弹出面板（上一轮已覆盖），`RunCard` 的输入是 `/agent-api/active`（ACP 条目）。故本轮卡片改动只落在琥珀通道，蓝通道仍是面板那两行。
+- 判定侧零变更：这些行只渲染既有字段，不参与任何档位/放行判定。
+
+### 测试
+
+- `test/grant-dialog.test.js` 新增 7 条（`v1.12.27 面板待授权行`）：带命令 ⇒ 原因 + 命令两行齐全且逐字；HTML 不当 DOM；无命令 ⇒ 命令整行不渲染；原因缺失 ⇒ `未标注` 且不连带命令消失；120 字符截断规则（含恰好 120 不截断）；蓝球换类名同一装配件；**两条通道的调用点都在源码里**（结构断言）。
+- `test/grant-dialog.test.js` 新增 7 条（`v1.12.27 运行卡片 RunCard`）：把生产版 `RunCard` 抠出来注入**假 React** 真跑一遍 vnode 树——单条两行齐全；两条各一对；4 条只列 2 条 + `…还有 2 条`（徽标仍 ×4）；无命令只出原因行；原因缺失 ⇒ `未标注` 且长命令 120 截断 + `title` 全文；HTML 只当文本且全仓无 `dangerouslySetInnerHTML`；无待授权不渲染清单块。
+
+## 1.12.25（2026-10-31）
+
+> 一句话：**授权面板不再"盲批"** —— 顶部只读区显示**完整命令原文** + 一行**拦截原因**；
+> 兄弟仓 `dsh-plugin-product-subagents` 0.7.28 把工作区档的形状闸门换成**分段静态判定**。
+
+### 一、面板显示命令 / 原因（本仓）
+
+现场问题：授权弹框只渲染「工具：Bash」+ 目录列表。用户看不到**要执行什么**，也看不到
+**为什么被拦** ⇒ 点「允许」等于盲批。
+
+| 层 | 改动 |
+| --- | --- |
+| 数据侧 `index.js` | 新增 `markAsk(reason, extra)`：每一次落到人工审批的分支都把 `askReason`（+ `shapeRule`）写进暂存上下文。枚举：`danger` / `shape:<id>` / `no-command-text` / `no-workspace-cover` / `no-paths` / `paths-partial` / `tier-miss`。**先到先得**（`askReasonLocked`）：越靠前的门越能解释原因，后写的弱原因不得覆盖 `shape:<id>` |
+| 序列化侧 `lib/dispatch.js` | `serializePermissionPending` 的 `askReason` 从「只认 danger」放开成**白名单枚举**（`shape:<id>` 前缀也认），并新增 `commandText`（上限 8KB）与 `shapeRule`。认不出的值一律 `null`，绝不把产品侧任意字符串塞进面板 |
+| REST `index.js` | `/agent-api/host-approval-context` 的兜底响应补齐 `askReason/shapeRule/commandText/argsText`（形状稳定，客户端不必判 undefined） |
+| 渲染侧 `lib/client.js` | `openGrantDialog` 内容区**首块**新增只读区：`拦截原因：…`（中文短标签）+ `将要执行的命令（原文）：`（`<pre>`，>200 字符折叠、可展开）。**一律 `textContent`**，样式沿用 `.ad-grant-*`，未引入依赖 |
+
+弹框长这样（文字描述）：
+
+```
+确认要记住的目录
+拦截原因：命令形状无法静态判定：多命令拼接
+将要执行的命令（原文）：
+    cd /ws && node --test /ws/test/a.test.js
+    [展开完整命令（58 字符）]
+──────────────────────────────
+☑ /ws                      （目录行，可编辑/可删）
+工具：Bash（只读）
+```
+
+### 二、分段静态判定（兄弟仓 0.7.28，本仓需同步认知）
+
+工作区内 `ls` / `git status --short` / `cat package.json` / `grep … | head` /
+`echo hi > a.a && cat a.a` / `mkdir -p subdir` / `cd test && ls` 这类**日常命令**不再弹窗：
+按 `&&` `||` `;` `|` 换行切段，逐段用**该段生效目录**（含 `cd` 链）归一化每个路径 token，
+**全部落在工作区子树内**才放行。判不出的仍转人工（变量展开、`../`、`~`、管道到解释器、
+**内联代码执行** `node -e` / `python -c`、通配符越界的 token）。
+
+判定顺序**不变**：危险门 → 形状/分段闸门 → 工作区档 → 原四档。本仓的
+`WORKSPACE_TIER_UNSAFE_RULES`（`multi-command` / `pipe-to-interpreter` /
+`interpreter-stdin`）本轮**未改**——宿主通道的多命令拼接仍转人工（见「剩余风险」）。
+
+### 一·补（追加 A）：面板显示「未能自动解析的路径」，并可手动改成要授权的目录
+
+`PATH_RE` 是**前缀白名单** + `~`，`../../package.json`、`cat 一句话/x.txt`、
+`${HOME}/.ssh/id_rsa` 这类操作数**一个都提取不到** ⇒ 面板上看不见，用户即使读了命令原文
+也不知道该把哪个目录填进「要记住的目录」。
+
+- `lib/host-approval.js:558-640` 新增 `unextractedPathCandidates(commandText, cwd, {extracted})`：
+  逐 token 给出 `{raw, resolved, kind, insideWorkspace}`。
+  `kind ∈ relative | relative-traversal | tilde | variable | glob | absolute`；
+  `resolved` 按**生效目录**（宿主侧 = session cwd）`path.resolve`，变量展开无法静态求值 ⇒ `null`；
+  `insideWorkspace` 用的就是 `workspaceCovers`（与放行判定**同源**，面板与判定不会打架）；
+  已进 `paths` 的 token **不重复列**（按原文去重）。
+- `lib/host-approval.js:780-800`（`resolveApprovalContext`）把结果作为 `unextracted` 下发；
+  REST `/agent-api/host-approval-context` 自动透传（兜底响应给 `[]`）。
+- `lib/dispatch.js:485-512` 序列化层做形态/长度清洗（raw 512 / resolved 1024 / ≤24 条）后透传，
+  供琥珀通道复用。
+- `lib/client.js:1470-1540`（`openGrantDialog`）**合并**原来的「从正文推测的目录」与新的候选块
+  为**一块**：标题「来自命令文本、未能自动解析的路径（默认不选，可编辑）」，每行先显示
+  `<raw> → <落点 or 无法解析>（工作区内/外）`，再是该目录的可编辑行（预填落点的父目录，
+  默认**不勾**）。勾选后走**同一条** `collect() → planGrantWrites`，**没有新增写规则通道**。
+- 判定零变更：候选只做展示/预填，不进 `paths`、不参与覆盖判定（有用例钉住）。
+
+### 一·补（追加 B·宿主侧）：相对 token 进判定集，登记的目录能覆盖 `../../x`
+
+宿主侧同样的问题：`extractToolPaths` 只认绝对路径 ⇒ `paths=[]` ⇒ `decide()` 的
+`paths.length > 0` 不成立 ⇒ 用户登记的目录永远匹配不到 `../../package.json`。
+
+- `lib/host-approval.js:641-684` 新增 `commandRelativePaths(commandText, cwd)`：
+  **只收结构化相对路径**（含分隔符；`path.resolve` 对它是确定性的），**不收**裸文件名 /
+  变量 / 通配符（与 product-subagents 0.7.28 的 `scanExecuteCommandPaths` 同一条边界）。
+- `lib/host-approval.js:800-806` 并入 `paths`（判定集），**不进** `structuredPaths`
+  （后者是弹框「实际触达」的默认勾选预填 —— 把越界目标塞进去等于让用户一次确认就授权出去）。
+- 危险门 / 超长门 / 无正文门仍在最前，与档位无关，顺序一字未动。
+
+### 测试
+
+- `test/host-approval-endpoint.test.js`：新增「面板只读区：pending 上下文带
+  commandText + askReason（逐分支）」5 条（shape/danger/no-workspace-cover/
+  paths-partial/no-paths + 兜底响应形状）。
+- `test/grant-dialog.test.js`：新增「弹框只读区」5 条（textContent 不解析 HTML、
+  >200 折叠与展开、原因标签映射、无归因不渲染、只读区排首位）。
+- `test/permission-pending.test.js`：新增序列化白名单 4 条。
+- `test/tool-grant-session.test.js`：闭包漂移守卫登记 handler 内局部名字 `markAsk`。
+- 全量：`node --test`（见交付说明）。
+
+## 1.12.26（2026-11-01）
+
+> 一句话：**1.12.25 的「命令原文 + 拦截原因」在真机面板上整块没出现** —— 因为字段
+> 在**琥珀通道的记账层**就被丢了，而上一版只改了序列化层并只测了序列化层。
+
+现场：ACP 子代理（codebuddy）跑 `cat package.json ../../package.json`，宿主授权面板只有
+「工具：Bash」+ 两行目录，`拦截原因：…` 与 `将要执行的命令（原文）` 一个字都没有。
+
+| 层 | 改动 |
+| --- | --- |
+| 记账 `lib/dispatch.js:1792`（`markPermissionPending`） | ① `askReason` 从硬写 `info.askReason === 'danger' ? 'danger' : null` 改为**与出参同一个** `askReasonOf()` —— v1.12.25 只放开了 `serializePermissionPending` 那一侧，记账侧漏改 ⇒ `paths-partial` / `no-workspace-cover` / `shape:<id>` / `tier-miss` 全被洗成 `null`；② 补记 `commandText`（8KB 上限，与出参同一个常量 `MAX_PENDING_COMMAND_TEXT_CHARS`）/ `shapeRule` / `unextracted` —— 这三个键过去**根本没进 record**，出参侧的白名单于是在读一个不存在的字段 |
+| 渲染 `lib/client.js:1361`（`openGrantDialog`） | 降级契约：**有正文就必须显示正文**；`askReason` 缺失时原因行显示「未标注」，不再让整块只读区消失（过去只要一侧为空就可能只剩目录表） |
+| 通道结论 | 这条请求由**琥珀通道**渲染（产品侧 `permission-pending` → `markPermissionPending` → `/agent-api/active` → 弹框），不是宿主通道 —— 宿主通道的暂存上下文一直是完整的（`/agent-api/host-approval-context` 复现即带 `commandText` + `askReason`），且面板文案是「会话档」而非「沙箱越权」，另 `unextracted` 为空而宿主通道必有候选 |
+| 不变 | `askReason` 的中文展示文案仍只在客户端 `askReasonLabel` 映射，服务端不下发展示文案；判定侧零变更 |
+
+### 一·补：`node -e` 那条——无路径请求也必须说得出命令与原因
+
+第二条现场（同一 bug 的更糟形态）：ACP 子代理跑 `node -e "console.log(1)"`，两个目录区
+**都**是「（本条没有可预填的目录）」，面板只剩「工具：Bash」+「要不要给整个工具放行任意
+路径」。这类命令本来就不碰文件 ⇒ `paths` 恒空 ⇒ 归因过去只能落到 `no-paths`
+（「未能解析出任何路径」），而用户真正需要知道的是**这是内联代码执行**。
+
+| 层 | 改动 |
+| --- | --- |
+| 形状闸门 `lib/host-approval.js:687` | 新增规则 **`inline-code`**（`hasInlineCodeExecution`）：段首解释器 + 代码正文就在参数里（`node -e/--eval/-p/--print`、`python -c`、`perl -e/-E`、`ruby -e`、`php -r`，含 `-ep` 这类合并短选项）。名单取自 `WORKSPACE_TIER_INTERPRETERS` 但**刻意排除 sh/bash/zsh/dash/ksh/fish** —— shell 的 `-c` 是剥壳、正文可判，纳入会把 `bash -c "git status"` 变成永久转人工 |
+| 归因 `index.js:619` | `paths.length === 0` 时**先跑形状闸门**再归因：命中 ⇒ `shape:<id>`（`markAsk` 先到先得，下面那行的 `no-paths` 不再覆盖）。位置在早退行之前且不改早退行的单行形状（不变量③的守卫仍锚定它） |
+| 展示 `lib/host-approval.js`（`resolveApprovalContext`） | 内联代码执行的正文**不是路径清单** ⇒ `unextracted` 直接给 `[]`。否则 `node -e "console.log(1)"` 会把 `console.log` 当"未解析的路径"填进候选行、并预填一个并不存在的目录 |
+| 归因取值 | 选 **`shape:inline-code`**（复用既有 `shape:<id>` 枚举，客户端标签「命令形状无法静态判定：内联代码执行」）：真正让它不可判的是**形状**，不是"没解析出路径"——后者只是前者的后果 |
+
+面板布局（用户第二条的硬要求）：两区都空时只读区仍是内容区**第一块**，「+ 添加目录」
+保持在只读区之后可见 —— 有用例钉住顺序与占位行。
+
+用例（累计新增 13 条）：
+
+- `test/permission-pending.test.js`：新增「记账侧回归」5 条（现场原样 paths-partial + 原文、
+  全量枚举穿记账层、shapeRule/unextracted、externalPending 分支、记账/出参同一上限）
+  与「白名单覆盖」3 条（**静态扫 `index.js`** 的 `markAsk(...)` 实参与 `askReason: '…'`
+  字面量，逐个断言被白名单接受；模板串 `shape:${id}` 单独钉住）。
+- `test/grant-dialog.test.js`：新增 3 条（有正文没原因 ⇒ 显示「拦截原因：未标注」；
+  只有原因没正文 ⇒ 不出现空的命令块；两区都空 + `node -e` ⇒ 只读区仍在首块、
+  原因说得出「内联代码执行」、「+ 添加目录」仍可见）。
+- `test/host-approval-endpoint.test.js`：`paths-partial` 那条补 `commandText` **逐字**断言；
+  新增「内联代码执行（无路径）」1 条（`paths=[]` + `commandText` 原文 +
+  `askReason=shape:inline-code` + `unextracted=[]`）与「反向边界」1 条
+  （`node --test <file>` / `node app.js -e` / `bash -c 'git status'` 都不得被 `inline-code` 误伤）。
+
+## 1.12.24（2026-10-31）
+
+> 一句话：**前置字符类补上 `<` / `>`，收口 `<` 重定向操作数的 fail-open**。
+
+### 取证（B3 第四轮，父级实测）
+
+| 命令 | 修前 | 修后 |
+| --- | --- | --- |
+| `cat <ws>/x.txt<../../.ssh/id_rsa` | **ALLOW(paths)** ❌ | ASK ✅ |
+| `cat <ws>/x.txt>../../.ssh/id_rsa` | ASK ✅ | ASK ✅（钉住） |
+
+根因：`relative-traversal` / `variable-expansion` 的前置分隔字符类 `(^|[\s=:'"(\[{])`
+不含 `<` / `>`，`<` 重定向的操作数紧跟 `<` 后的 `../` 不被闸门匹配 ⇒ fail-open。
+`>` 侧本就被 `PATH_RE` 提取到（路径档判越界），但闸门也应挡住，保持一致。
+
+### 改动
+
+1. `lib/host-approval.js:591,598`：字符类扩为 `(^|[\s=:'"(\[{<>])`（上轮已改，本轮补测）。
+2. `test/workspace-approval-tier.test.js`：新增 W7c/W7d（`<` / `>` 重定向越界 ⇒ ASK）、
+   W7e/W7f（对照组：普通命令仍 allowed-once）。
+
+### 兄弟仓同步
+
+`dsh-plugin-product-subagents/lib/permission-rules.js:176,179` 需同步补 `<>`
+（本次沙箱写权限不足，未写入，补丁附后）。
+
+## 1.12.23（2026-10-31）
+
+> 一句话：**工作区默认档（1.12.22 新增）放行了两条"路径集合看不见"的越界命令** ——
+> 相对越界与变量展开。已用真实链路（`resolveApprovalContext → workspaceCovers →
+> unsafeCommandShape`）复现并收口。
+
+### 取证（B3，离线可复现）
+
+`lib/host-approval.js` 的 `PATH_RE`（:330）只匹配**绝对**路径前缀，而 `workspaceCovers`
+只看**已提取**路径。于是下面两条命令的第二个操作数**从未进入 `paths`**，路径集只剩
+工作区内那一条 ⇒ 全部 covered ⇒ 工作区档命中 ⇒ `allowed-once`：
+
+| 命令 | 提取到的 paths | 修前 |
+| --- | --- | --- |
+| `cat <ws>/package.json ../../.ssh/id_rsa` | `['<ws>/package.json']` | **AUTO-ALLOW** |
+| `cat <ws>/x.txt ${HOME}/.ssh/id_rsa` | `['<ws>/x.txt']` | **AUTO-ALLOW** |
+
+### 改动
+
+1. `lib/host-approval.js`：`WORKSPACE_TIER_UNSAFE_RULES` 追加两条**形状闸门**
+   （与既有 `command-substitution` / `multi-command` **同机制**：命中即跳过工作区档、
+   转人工；**不是判危险**，是"判不了就不猜"）：
+   - `relative-traversal`：正文出现 `(^|[\s=:'"([{])\.\.\/` ⇒ 相对越界操作数不被
+     `PATH_RE` 看见，"全在路径内"不成立；
+   - `variable-expansion`：正文出现 `$VAR` / `${VAR}` ⇒ 字面量不是真身，落点判不出
+     （`$(…)` 已由 `command-substitution` 覆盖）。
+2. 为什么不改 `PATH_RE`：它也喂「面板预填 / 落盘规则」的写入侧口径，改它会连带改变
+   授权集的写法，风险面远大于收益（用户已裁定走闸门）。
+3. `test/workspace-approval-tier.test.js`：`WS` 由硬编码 `/Users/arming/...` 改为
+   `mkdtempSync`（Minor 1）；新增 W7a/W7b/W7c。
+
+### 边界（不变）
+
+- 工作区内单路径（`cat <ws>/package.json`）⇒ 仍 `allowed-once`（W7c 钉住）；
+- 工作区外路径 / 高危 ⇒ 仍交交互；
+- 含 `../` 或 `$VAR` 的命令一律交互（含工作区内的：判不了就不猜，方向 fail-closed）。
+
+## 1.12.22（2026-10-31）
+
+> 一句话：**宿主审批补上「工作区默认档」** —— 现场三条路径全部落在会话工作区内仍然弹窗，
+> 因为本插件的四档判决里根本没有工作区档（product-subagents 侧从 v0.7.9 起就有）。
+
+### 取证（离线可复现）
+
+测试脚手架直接驱动真实 `approval/request` 监听器：`toolName='Bash'`、路径全在
+`session.header.cwd` 子树内、非高危 ⇒ **`nextCalled=true`**（交宿主面板）。
+即：这类请求进的是本插件的判定链（不是 ACP 孪生），而 `HostApprovalRules.decide()`
+只有 session-tool / project-tool / session / project 四档 ⇒ 无手工规则时必弹。
+同一份现场里 `toolName` 显示为 `Bash`（真实工具名）也印证了这一点：ACP 孪生的
+宿主 approval 是 `product_submit` + `[ACP …`，会被更早的早退门拦下（`index.js` 的
+`isAcpTwinApproval` 分支），根本到不了四档判决。
+
+### 改动
+
+1. `lib/host-approval.js`：新增导出 `workspaceCovers(cwd, paths)` —— 语义与
+   product-subagents 的 `workspaceRuleOf` **逐字对齐**：全部路径在 `cwd` 子树内才命中，
+   目录边界匹配（`/a/b` 不命中 `/a/bc`），工作区根是 `/` 时直接 false。
+2. `index.js`：在「解析不出路径 ⇒ next()」之后、四档判决之前插入工作区档
+   （`scope='workspace'`，留痕 `auto-grant`）。**位置在危险命令门/超长门/执行类无正文门
+   之后** ⇒ `rm -rf` / `git push` / `npm publish` 在工作区内也永远走交互。
+3. `test/tool-grant-session.test.js`：把 `workspaceCovers` 登记进 handler 切片的注入表
+   （否则 ReferenceError 会被 try/catch 吞成 next() ⇒ 该文件里「本该放行」的用例假红，
+   这正是本轮实测到的 ⑧/⑬ 转红原因）。
+
+### 边界
+
+- 工作区外路径 ⇒ 仍交交互（不半覆盖放行）；
+- 高危 ⇒ 仍交交互；
+- **工作区内的假路径**（`<ws>/{`、`<ws>/undefined`）不再单独把请求顶成弹窗 ——
+  `workspace-write` 的语义是目录子树，不是"磁盘上已有的文件"；
+- ACP 孪生仍走早退门（本插件一档都不判），行为不变。
+
+## 1.12.21（2026-10-31）
+
+> 一句话：**ACP 孪生请求上的「本会话总是允许 / 记住目录」是死规则** —— 写进了本插件的
+> `#sessionRules` / `#toolGrants`，而 ACP 请求的判定根本不读这两份 store（孪生在
+> `approval/request` 监听器的早退门就交回宿主）。用户现场表现：面板点了「会话内记住」，
+> 下一轮同类请求照样弹。
+
+### 读侧事实（先钉死后才能谈修法）
+
+`lib/index.js:395` 的 `if (isAcpTwinApproval(ctxInfo.toolName, ctxInfo.reason)) return next()`
+排在**所有档位判定之前**（工具名短路在 `:508`、`decide()` 在 `:526`）。也就是说 ACP 孪生
+请求永远到不了 `HostApprovalRules.decide()`，`#sessionRules`（内存会话档）与
+`#toolGrants`（内存工具档）对它们一条都不参与。ACP 侧真正的判定发生在
+`dsh-plugin-product-subagents/lib/index.js` 的 `evaluateRuleSources`（它自己的
+`createSessionRules` + `lib/user-allowlist.js`），两份 store **只在落盘那一档重合**
+（`$DSH_HOME/data/dsh-plugin-product-subagents/allowlist.json`，本仓
+`lib/host-approval.js:2277-2284` 的 `getSharedDir()` 与产品侧是同一个文件）。
+
+所以：**会话档写 = 死规则；项目档写 = 有效**（产品侧 `readUserAllowlist()` 读得到）。
+
+### 改动
+
+1. **`index.js`：暂存上下文多带 `acpTwin`**（`pushPendingContext`，判据复用
+   `isAcpTwinApproval`，与早退门同源）。客户端据此不再渲染写不下去的按钮。
+2. **`index.js`：写侧端点收口** —— `/agent-api/host-approval-rule` 在
+   `scope === 'session'` 且上下文 `acpTwin === true` 时**一条规则都不写**，回
+   `200 {written:false, reason:'ACP 孪生请求的会话档由产品侧维护…'}` 并留痕
+   `rule-session-skipped-twin`。老客户端（没有新分支）也不会再制造死规则；`scope='project'`
+   一字未动（它写的正是 ACP 侧读得到的共用 allowlist.json）。
+3. **`lib/client.js`：蓝球行按孪生分流** —— `item.acpTwin` 为真时只给「允许一次 / 拒绝」，
+   并明确告诉用户真正的记忆入口是**琥珀球**（「本会话总是允许该工具 / 总是允许(项目)」）
+   或该 provider 的 `allowWritePaths`；不再弹一张「记住目录」的空表（孪生通道的路径预填
+   来自 `product_submit` 的参数，本来就没有路径）。
+
+### 没动的部分
+
+- 读取侧孪生「一档都不判、直接交回宿主」的早退门（用户既有裁定）**未改**。
+- 危险命令门/超长门/执行类无正文门的位置与判据未改。
+- 普通（非孪生）请求的会话档/项目档写读链路逐字不变（新增对照用例钉住）。
+
+### 测试
+
+- `test/host-approval-endpoint.test.js`：孪生 + `scope=session` ⇒ `written:false`、不落盘、
+  留痕可查；GET 上下文回带 `acpTwin`；**对照**用例确保普通请求仍照写且被判定侧读到。
+- `test/acp-twin.test.js`：源码不变量 —— 孪生分支必须排在普通行之前、不得走
+  `grantViaDialog`、必须给出琥珀球指引。
+
 ## 1.12.20（2026-10-16）
 
 > 一句话：**修 v1.12.18 relay 闸的 fail-open（Blocker A/B）** —— 登记原来只有「首建」一条

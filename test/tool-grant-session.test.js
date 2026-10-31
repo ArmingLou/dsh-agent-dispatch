@@ -31,6 +31,9 @@ import {
   MAX_DANGER_TEXT_CHARS,
   // v1.12.6 第六轮（终审 Minor 3）：`commandText` 超限的门名（handler 新增的闭包引用）
   COMMAND_TOO_LONG_RULE,
+  // v1.12.22（H6）：工作区默认档 + 形状闸门（handler 新增的闭包引用）
+  workspaceCovers,
+  unsafeCommandShape,
 } from '../lib/host-approval.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -741,6 +744,12 @@ describe('真实审批监听器集成判定（index.js 的 ctx.on("approval/requ
     // 不登记就会被 try/catch 吞成 next()，于是「本该 allowed-once」的越权用例集体假红
     // —— 本轮实测正是这个症状（②⑧⑨⑫ 一起红，看着像判定逻辑坏了）。
     'isSandboxEscalation',
+    // v1.12.22（H6）：handler 体新增 `workspaceCovers(...)` 调用点。不登记就会被
+    // try/catch 吞成 next()，于是「工作区内应放行」的用例集体假红。
+    'workspaceCovers',
+    // v1.12.22（用户裁定「不确定即拒」）：形状闸门 —— 命令替换 / 管道到解释器 /
+    // 多命令拼接 / 裸解释器读 stdin 一律不放行（工作区档专用）。
+    'unsafeCommandShape',
   ]
 
   /** 从 handler 体扒出「被当函数调用」的标识符，返回不在注入表里的那些 */
@@ -749,7 +758,11 @@ describe('真实审批监听器集成判定（index.js 的 ctx.on("approval/requ
     const called = new Set(
       [...handlerBody.matchAll(/(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(/g)].map((m) => m[1]),
     )
-    const known = new Set([...CLOSURE_NAMES, 'req', 'next', 'hostApproval', 'dispatcher', 'logApproval'])
+    // 注入表与 handler 体的闭包引用必须对齐（漏项会被 try/catch 吞成 next()，静默假红/假绿）
+    // handler **体内自己定义**的局部名字（不是闭包引用）也在这里登记：
+    // `markAsk` = v1.12.25 的归因写入器（`const markAsk = (reason, extra) => …`，
+    // 每次询问把 askReason 写进暂存上下文，供面板显示「为什么弹」）。
+    const known = new Set([...CLOSURE_NAMES, 'req', 'next', 'hostApproval', 'dispatcher', 'logApproval', 'markAsk'])
     // 语法关键字（不是闭包引用）
     for (const skip of ['if', 'for', 'while', 'switch', 'catch', 'return', 'typeof', 'new', 'function', 'await']) known.add(skip)
     return [...called].filter((name) => !known.has(name))
@@ -770,6 +783,8 @@ describe('真实审批监听器集成判定（index.js 的 ctx.on("approval/requ
       boundDangerText, MAX_DANGER_TEXT_CHARS,
       COMMAND_TOO_LONG_RULE,
       isSandboxEscalation,
+      workspaceCovers,
+      unsafeCommandShape,
       hostApproval, dispatcher, () => {},
     )
   }

@@ -32,7 +32,7 @@ import { SquadRegistry } from './lib/squad-registry.js'
 import { listSkills, skillToAgent, defaultSkillsRoot } from './lib/skill-import.js'
 import { readFabConfig, mergeFabConfig } from './lib/fab-config.js'
 import { renderRoster } from './lib/roster.js'
-import { HostApprovalRules, resolveApprovalContext, resolveRootSessionId, isDisallowedAutoGrant, isSandboxEscalation, isAcpTwinApproval, isDelegatedSession, validateDeclaredPaths, dangerousCommandMatch, boundDangerText, MAX_DANGER_TEXT_CHARS, COMMAND_TOO_LONG_RULE } from './lib/host-approval.js'
+import { HostApprovalRules, resolveApprovalContext, resolveRootSessionId, isDisallowedAutoGrant, isSandboxEscalation, isAcpTwinApproval, isDelegatedSession, validateDeclaredPaths, dangerousCommandMatch, boundDangerText, MAX_DANGER_TEXT_CHARS, COMMAND_TOO_LONG_RULE, workspaceCovers, unsafeCommandShape } from './lib/host-approval.js'
 import { jsonSafe } from './lib/json-safe.js'
 // v1.12.18：ACP 中继子代理的执行期工具闸（机制结论与局限见模块头注释）。
 // 登记侧（relayChildren.add）在 lib/dispatch.js，两侧 import 同一模块实例共享状态。
@@ -370,9 +370,49 @@ export function apply(ctx, config = {}) {
         // 登记进 #sessionRoots，fork 派出的子代理会经链式上溯回到源会话——
         // 阻断 1 换个入口重新打开，且源会话 dispose 后再写下的键再无 purge 路径。
         if (isDelegatedSession(session)) hostApproval.registerSessionRoot(sessionId, rootSessionId)
+        /**
+         * v1.12.25（用户裁定「面板显示命令原文 + 拦截原因」）：把**这一次询问的原因**
+         * 写进暂存上下文，客户端随 GET /agent-api/host-approval-context 拿到并渲染成
+         * 一行中文短标签。面板过去只显示「工具：Bash」+ 目录列表 —— 用户看不到要执行
+         * 什么，也看不到为什么被拦，点「允许」等于盲批。
+         *
+         * 归因**只做渲染**，不参与任何判定：下面每一道门/档位调它一次，位置就是
+         * 「这一次为什么落到人工审批」的真实来源。枚举（与产品侧 product-subagents
+         * 的 permission-pending `askReason` 同构，改动需两边同步）：
+         *   `danger`            危险命令门（另有 dangerRule / dangerSegment / 命令正文）
+         *   `shape:<id>`        工作区档的形状闸门未通过（id 见 WORKSPACE_TIER_UNSAFE_RULES）
+         *   `no-command-text`   执行类调用但命令正文解析不出
+         *   `no-workspace-cover`请求路径不在会话工作区子树内（工作区档不参与）
+         *   `no-paths`          一个路径都没解析出来，四档无从判定
+         *   `paths-partial`     部分路径在工作区内、部分越界（半覆盖绝不放行）
+         *   `tier-miss`         没命中任何授权档
+         * 每次调用都**整份覆盖**暂存上下文（spread 自 `ctxInfo`），与危险门既有的
+         * 覆盖写法一致 —— 不覆盖就会留下上一次（更早的门）写的原因。
+         *
+         * **先到先得**（`askReasonLocked`）：越靠前的门越能解释「为什么弹」，后面更弱的
+         * 原因不得覆盖它。反例（不锁会踩到）：形状闸门判 `shape:multi-command`，四档接着
+         * 也落空 ⇒ 后写的 `tier-miss` 把真正的原因盖掉，面板又说不出所以然。
+         * @param {string} reason 上面的枚举值
+         * @param {object} [extra] 附加上下文（如 shapeRule）
+         */
+        let askReasonLocked = false
+        const markAsk = (reason, extra = {}) => {
+          if (!req.callId || !ctxInfo || askReasonLocked) return
+          askReasonLocked = true
+          hostApproval.pushPendingContext(req.callId, {
+            ...ctxInfo, sessionId, rootSessionId, askReason: reason, ...extra,
+          })
+        }
         // 暂存上下文供 REST 端点查询/写规则（服务端重取路径，不信任客户端）
         if (req.callId && ctxInfo) {
-          hostApproval.pushPendingContext(req.callId, { ...ctxInfo, sessionId, rootSessionId })
+          // v1.12.21：把「这是 ACP 孪生请求」一并暂存。客户端据此**不再提供**写不下去的
+          // 会话档按钮（见 lib/client.js 蓝球行的 acpTwin 分支），写侧端点也据此拒绝
+          // 会话档写入（见 /agent-api/host-approval-rule 的 acpTwin 门）——
+          // 两处判据同源，都用 lib/host-approval.js 的 isAcpTwinApproval。
+          hostApproval.pushPendingContext(req.callId, {
+            ...ctxInfo, sessionId, rootSessionId,
+            acpTwin: isAcpTwinApproval(ctxInfo.toolName, ctxInfo.reason),
+          })
         }
         // 排除门按档位拆分（v1.12.5 用户裁定 + 二次裁定；v1.12.7 第三次裁定收窄）：
         //   ACP 孪生 → 本插件一档都不判，直接交回宿主与琥珀球（v1.11.4 语义完全不变）；
@@ -485,6 +525,8 @@ export function apply(ctx, config = {}) {
         // 保守策略（用户裁决）：执行类调用**命令文本解析不出来**时也不自动放行——
         // 解析不出就无法断言它不是 `rm -rf`，宁可交互。非执行类不受此条影响。
         if (ctxInfo.execLikely && !ctxInfo.commandText.trim()) {
+          // v1.12.25：归因随上下文下发（面板显示「无法解析命令正文」）
+          markAsk('no-command-text', { execLikely: true, callFound: ctxInfo.callFound })
           logApproval(
             `宿主审批不自动放行（执行类调用但命令文本解析不出）: ` +
             `tool=${ctxInfo.toolName ?? '?'} session=${sessionId} root=${rootSessionId} callFound=${ctxInfo.callFound}`,
@@ -495,6 +537,60 @@ export function apply(ctx, config = {}) {
           )
           return next()
         }
+        // v1.12.22【H6】：**工作区默认档**（排在四档之前、危险门之后）。
+        // 现场决定性反例：三条路径全部落在会话工作区，按 workspace-write 语义应放行，
+        // 实际弹了 —— 因为本插件的四档判决（session-tool / project-tool / session /
+        // project）里没有工作区档（product-subagents 侧从 v0.7.9 起就有 workspaceRuleOf）。
+        // 语义严格对齐那一侧：**全部**路径在 `ctxInfo.cwd` 子树内才命中，非高危，
+        // 根/盘根不算工作区（见 workspaceCovers 的实现）。
+        // 门序（用户裁定）：超长门 → 危险命令门 → 执行类无正文门 → **工作区档** →
+        // 工具名短路 → 其余四档。即本档**永远在危险门之后**：`rm -rf` / `git push` /
+        // `npm publish` / `sudo bash -c …` / `shell-nesting` 在工作区内也永远走交互；
+        // 同时**早于**所有手工规则档，便于日志归因（谁放行的看得清）。
+        // v1.12.25：工作区档的**落空**也要归因——面板必须说得清「为什么弹」，否则用户
+        // 只看到一张只有工具名和目录表的卡片，点「允许」等于盲批。
+        // 两种落空分开报：全部路径都在工作区外 = `no-workspace-cover`；
+        // 一部分在内、一部分在外 = `paths-partial`（半覆盖绝不放行）。
+        const workspaceHit = workspaceCovers(ctxInfo.cwd, ctxInfo.paths)
+        if (!workspaceHit && ctxInfo.paths.length > 0) {
+          const inside = ctxInfo.paths.filter((p) => workspaceCovers(ctxInfo.cwd, [p])).length
+          markAsk(inside > 0 ? 'paths-partial' : 'no-workspace-cover', {
+            pathCount: ctxInfo.paths.length, workspacePathCount: inside,
+          })
+        }
+        if (workspaceHit) {
+          // 用户裁定「不确定即拒」：路径全在子树内只是**必要条件**，命令形状还得可判定。
+          // 四条形状（命令替换 / 管道到解释器 / 多命令拼接 / 裸解释器读 stdin）命中时
+          // 一律不放行 —— 它们让"路径集合代表这条命令"这个前提失效。
+          const unsafeShape = unsafeCommandShape(ctxInfo.commandText)
+          if (unsafeShape) {
+            // v1.12.25：形状闸门命中就是本次询问的**原因**，随上下文下发（面板显示中文短标签）。
+            // `shape:<id>` 与产品侧 product-subagents 的 askReason 枚举同构（改动需两边同步）。
+            markAsk(`shape:${unsafeShape}`, { shapeRule: unsafeShape })
+            logApproval(
+              `宿主审批不自动放行（工作区档跳过：命令形状可疑 ${unsafeShape}）: ` +
+              `tool=${ctxInfo.toolName ?? '?'} session=${sessionId} root=${rootSessionId} ` +
+              `cwd=${ctxInfo.cwd} pathCount=${ctxInfo.paths.length}`,
+              {
+                action: 'workspace-tier-block', rule: unsafeShape, tool: ctxInfo.toolName ?? null,
+                rootSessionId, sessionId, cwd: ctxInfo.cwd, pathCount: ctxInfo.paths.length,
+              },
+            )
+            // 注意：**不 return next()** —— 后面四档是用户手工记住的规则，仍应参与判定。
+          } else {
+            logApproval(
+              `宿主审批自动放行（工作区默认档命中，全部路径在会话工作区子树内）: ` +
+              `tool=${ctxInfo.toolName ?? '?'} scope=workspace session=${sessionId} ` +
+              `root=${rootSessionId} cwd=${ctxInfo.cwd} pathCount=${ctxInfo.paths.length}`,
+              {
+                action: 'auto-grant', scope: 'workspace', tool: ctxInfo.toolName ?? null,
+                rootSessionId, sessionId, cwd: ctxInfo.cwd, pathCount: ctxInfo.paths.length,
+              },
+            )
+            return Promise.resolve('allowed-once')
+          }
+        }
+
         const disallowToolGrant = isDisallowedAutoGrant(ctxInfo.toolName, ctxInfo.reason)
         // v1.12.7（用户裁定：**工具档不受越权限制**，语义 `{cwd: 工作区, tools:['bash']}`）：
         // 上面那条判据已拆开——沙箱越权**不再**算「不得用工具档」，只剩 ACP 孪生一种来源，
@@ -514,6 +610,20 @@ export function apply(ctx, config = {}) {
           return Promise.resolve('allowed-once')
         }
         // 路径规则：解析不出路径的请求不参与路径规则匹配，直接放行到交互层
+        // v1.12.25：归因写成**早退之前独立的一行**（不把早退包成块）——不变量③的守卫
+        // 锚定的是单行 `if (…) return next()` 的形状，包成块会让「门只许这三道」失明。
+        // 归因内容：面板要说清「这条命令一个路径都没解析出来」，
+        // 否则用户只看到一张空目录表，不知道在授权什么。
+        // v1.12.26（第二条现场：`node -e "console.log(1)"`）：**无路径请求先跑形状闸门**。
+        // 内联代码执行本来就不碰文件 ⇒ paths 必空 ⇒ 过去一律归因 `no-paths`
+        // （「未能解析出任何路径」），用户真正需要知道的是「这是内联代码执行，判不出它碰什么」。
+        // 形状命中就按形状归因；`markAsk` 先到先得 ⇒ 下面那行的 `no-paths` 不会覆盖。
+        // 位置在早退行**之前**、且不改变早退行的单行形状（不变量③的守卫锚定那一行）。
+        if (ctxInfo.paths.length === 0) {
+          const emptyShape = unsafeCommandShape(ctxInfo.commandText)
+          if (emptyShape) markAsk(`shape:${emptyShape}`, { shapeRule: emptyShape })
+        }
+        if (ctxInfo.paths.length === 0) markAsk('no-paths', { pathCount: 0 })
         if (ctxInfo.paths.length === 0) return next()
         // 两个开关**各管一档，判据同源但不再焊死**（v1.12.7 的关键解耦）：
         //   disallowToolGrant = isDisallowedAutoGrant（拆开后只剩 ACP 孪生 ⇒ 生产路径恒 false）
@@ -541,6 +651,9 @@ export function apply(ctx, config = {}) {
           )
           return Promise.resolve('allowed-once')
         }
+        // v1.12.25：四档全落空 —— 归因 `tier-miss`（更早的门若已归因，markAsk 不覆盖）。
+        // 面板据此显示「未命中任何授权规则」，用户才知道该点「记住目录」。
+        markAsk('tier-miss', { pathCount: ctxInfo.paths.length })
       } catch (err) {
         // 判定内部异常一律委托（fail-open 到交互层，宿主兜底 fail-closed）
         console.error('[dsh-agent-dispatch] 宿主审批规则判定异常（改为交互审批）:', err.message)
@@ -2166,6 +2279,34 @@ export function apply(ctx, config = {}) {
               rootSessionId = resolveRootSessionId(lookupSession, dispatcher, (s) => hostApproval.sessionRootOf(s))
             }
             const toolName = body?.toolName || approvalCtx?.toolName || null
+            // v1.12.21【H1 修复·写侧收口】：**ACP 孪生请求的会话档写下去不会被任何判定读到**。
+            // 读侧事实（同仓）：approval/request 监听器对孪生在 index.js 的
+            // `if (isAcpTwinApproval(...)) return next()` 处就早退了，永远走不到
+            // `hostApproval 的 decide` ⇒ #sessionRules / #toolGrants / 落盘工具档一条都不参与
+            // ACP 子代理的判定；ACP 侧判定发生在 product-subagents 内部
+            // （lib/index.js 的 evaluateRuleSources ← 它自己的 createSessionRules +
+            //  lib/user-allowlist.js 的 allowlist.json）。两份 store 只在**落盘**那一档重合。
+            // 故：scope==='session' + 孪生 ⇒ 不写、如实回 written:false（不静默扩张成落盘档）。
+            // scope==='project' 不受影响 —— 它写的正是共用 allowlist.json，ACP 侧读得到。
+            // 老客户端（没有 acpTwin 分支）也不会再制造"看着记住了、其实永不命中"的死规则。
+            if (scope === 'session' && approvalCtx && approvalCtx.acpTwin === true) {
+              logApproval(
+                `宿主审批规则：ACP 孪生请求的会话档不被判定侧消费 ⇒ 不写任何规则（如实用 written:false 回）: ` +
+                `tool=${toolName ?? '未解析出'} session=${sid} callId=${callId ?? '无'} requestedPaths=${Array.isArray(body && body.paths) ? body.paths.length : 0}`,
+                {
+                  action: 'rule-session-skipped-twin', scope, tool: toolName ?? null,
+                  sessionId: sid, rootSessionId, callId: callId ?? null,
+                },
+              )
+              return send(res, 200, {
+                ok: true,
+                written: false,
+                scope,
+                toolName,
+                rootSessionId,
+                reason: 'ACP 孪生请求的会话档由产品侧（product-subagents）自己维护，本插件的会话档不会被读取 ⇒ 一条规则都没写；要记住请用「总是允许(项目)」（写共用 allowlist.json）',
+              })
+            }
             // v1.12.6 U2：客户端声明的目录（逐条服务端校验，非法丢弃；未给 = 自动分析）
             const declared = validateDeclaredPaths(body && body.paths)
             const useDeclared = declared.given
@@ -2543,6 +2684,11 @@ export function apply(ctx, config = {}) {
             // v1.12.7：`~` 展开基准照常下发——没有暂存上下文时客户端仍可能拿到
             // `~/.ssh/id_rsa` 这类候选路径，缺了它整行会退回「不勾选 + 警示」。
             home: os.homedir(),
+            // v1.12.25：面板只读区的三个字段形状稳定（客户端不必判 undefined）。
+            // 没有暂存上下文 = 没走到本插件的判定 ⇒ 没有归因可说，如实给 null/空串。
+            askReason: null, shapeRule: null, commandText: '', argsText: '',
+            // v1.12.25（追加 A）：没有暂存上下文 = 没解析过正文 ⇒ 没有候选
+            unextracted: [],
           }
         }
         return send(res, 200, { ok: true, ...approvalCtx })

@@ -9,7 +9,7 @@ import assert from 'node:assert/strict'
 import { existsSync, mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Dispatcher, serializePermissionPending } from '../lib/dispatch.js'
+import { Dispatcher, serializePermissionPending, MAX_PENDING_COMMAND_TEXT_CHARS } from '../lib/dispatch.js'
 
 const registry = { get: (id) => ({ id, name: '资深开发（中坚）' }) }
 
@@ -418,5 +418,198 @@ describe('v1.12.15 高危归因透传：danger 询问带四件套，其余一律
     assert.equal(pe.permissionPending[0].askReason, null)
     assert.equal(pe.permissionPending[0].dangerRule, null)
     assert.equal(serializePermissionPending(pe.permissionPending, null).permissionPending.dangerCommandOmitted, 0)
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// v1.12.25（用户裁定「面板显示命令原文 + 拦截原因」）：序列化层要**原样**下发
+// `askReason` / `commandText` / `shapeRule`——琥珀球的授权弹框只能从这里拿到它们。
+//
+// 为什么要有白名单：`askReason` 是从产品侧事件来的字符串，直接透传等于让外部载荷
+// 决定弹框上显示什么；这里只认已知枚举 + `shape:<id>`，其余一律 null（面板按
+// "无归因"渲染原有卡片，绝不显示半截脏值）。
+// ────────────────────────────────────────────────────────────────────────────
+describe('v1.12.25 askReason / commandText / shapeRule 的序列化（白名单 + 长度）', () => {
+  const one = (row) => serializePermissionPending([row]).permissionPending
+
+  it('白名单枚举全部透传，shape:<id> 也认', () => {
+    for (const reason of ['danger', 'no-command-text', 'no-workspace-cover', 'no-paths', 'paths-partial', 'tier-miss']) {
+      assert.equal(one({ askReason: reason }).askReason, reason, `${reason} 被吞了`)
+    }
+    assert.equal(one({ askReason: 'shape:multi-command' }).askReason, 'shape:multi-command')
+    assert.equal(one({ shapeRule: 'pipe-to-interpreter' }).shapeRule, 'pipe-to-interpreter')
+  })
+
+  it('认不出的值 ⇒ null（不把产品侧任意字符串塞进面板）', () => {
+    assert.equal(one({ askReason: 'something-else' }).askReason, null)
+    assert.equal(one({ askReason: 'shape:' }).askReason, null)
+    assert.equal(one({ askReason: 42 }).askReason, null)
+    assert.equal(one({ askReason: '' }).askReason, null)
+  })
+
+  it('commandText 原样透传（连续空白/大小写都保留），超长按 8KB 截断', () => {
+    const cmd = 'echo   "A"  &&  ls'
+    assert.equal(one({ commandText: cmd }).commandText, cmd, '命令原文必须逐字下发（面板按 pre 渲染）')
+    const long = 'x'.repeat(9000)
+    assert.equal(one({ commandText: long }).commandText.length, 8192, '超长命令按上限截断（不把几 MB 塞进 REST）')
+    assert.equal(one({ commandText: null }).commandText, null)
+  })
+
+  it('unextracted 原样透传（形态+长度校验），不认识的行丢弃', () => {
+    const row = one({
+      unextracted: [
+        { raw: '../../package.json', resolved: '/Users/dev/develop/package.json', kind: 'relative-traversal', insideWorkspace: false },
+        { raw: '', resolved: '/x', kind: 'relative', insideWorkspace: true }, // 空 raw ⇒ 丢
+        null, // 非对象 ⇒ 丢
+        { raw: 'a/*.js', resolved: null, kind: 'glob', insideWorkspace: false },
+      ],
+    })
+    assert.equal(row.unextracted.length, 2, '渲染不了的条目必须丢掉（面板不许多出空行）')
+    assert.deepEqual(row.unextracted[0], {
+      raw: '../../package.json',
+      resolved: '/Users/dev/develop/package.json',
+      kind: 'relative-traversal',
+      insideWorkspace: false,
+    })
+    assert.equal(row.unextracted[1].resolved, null)
+    assert.deepEqual(one({}).unextracted, [], '没有该字段 ⇒ 空数组（客户端不必判 undefined）')
+  })
+
+  it('带 askReason 的行仍保留既有字段（加法，不是替换）', () => {
+    const row = one({ permId: 'a#1', product: 'qoder', description: 'R', paths: ['/x'], toolName: 'Bash', askReason: 'no-paths' })
+    for (const key of ['permId', 'product', 'description', 'paths', 'toolName', 'suggestedDirs', 'inferredDirs', 'home', 'at']) {
+      assert.ok(key in row, `老字段 ${key} 不得消失`)
+    }
+    assert.equal(row.askReason, 'no-paths')
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// v1.12.26（bug 修复）：上面那组只测**序列化侧**（手工造行喂给 serializePermissionPending），
+// 于是漏掉了真正的丢字段点是**记账侧** `markPermissionPending`：
+//   · `askReason` 被硬写成 `=== 'danger' ? 'danger' : null`；
+//   · `commandText` / `shapeRule` / `unextracted` 三个键**根本没进 record**。
+// 现场（ACP 子代理跑 `cat package.json ../../package.json`）：琥珀通道的授权弹框
+// 只剩「工具：Bash」+ 目录表，「拦截原因」与「将要执行的命令（原文）」整块不渲染 ——
+// 客户端拿到的就是 null + 空串。本组钉住记账侧，别再"测了序列化就以为通了"。
+// ────────────────────────────────────────────────────────────────────────────
+describe('v1.12.26 记账侧回归：markPermissionPending 必须存下只读区的四个字段', () => {
+  const amberRow = (d, entry) => serializePermissionPending(entry.permissionPending, null).permissionPending
+
+  it('现场原样：paths-partial + 命令原文 ⇒ 出参两项都在（改前分别是 null / null）', () => {
+    const d = boot()
+    const entry = activeEntry('child-A')
+    d.activeChildren.set('child-A', entry)
+    const cmd = 'cat package.json ../../package.json'
+    d.markPermissionPending({
+      childId: 'child-A', permId: 'tc#1', product: 'codebuddy', description: 'Allow Bash?',
+      toolName: 'Bash', paths: ['/ws/develop/package.json'],
+      suggestedDirs: ['/ws/dsh-agent-dispatch', '/ws/develop'],
+      askReason: 'paths-partial', commandText: cmd,
+    })
+    const row = amberRow(d, entry)
+    assert.equal(row.commandText, cmd, '命令原文在记账层就丢了 —— 面板只会剩一张目录表')
+    assert.equal(row.askReason, 'paths-partial', 'paths-partial 被记账层的旧白名单洗成 null 了')
+  })
+
+  it('全量枚举穿过记账层也原样出参（不止 danger）', () => {
+    for (const reason of ['danger', 'no-command-text', 'no-workspace-cover', 'no-paths', 'paths-partial', 'tier-miss', 'shape:multi-command']) {
+      const d = boot()
+      const entry = activeEntry('child-A')
+      d.activeChildren.set('child-A', entry)
+      d.markPermissionPending({ childId: 'child-A', permId: 'tc#1', description: 'R', askReason: reason })
+      assert.equal(amberRow(d, entry).askReason, reason, `${reason} 在记账层被吞了（面板说不出为什么弹）`)
+    }
+  })
+
+  it('shapeRule / unextracted 一并记账并原样出参（面板的形状标签与候选行都靠它们）', () => {
+    const d = boot()
+    const entry = activeEntry('child-A')
+    d.activeChildren.set('child-A', entry)
+    d.markPermissionPending({
+      childId: 'child-A', permId: 'tc#1', description: 'R', askReason: 'shape:relative-traversal',
+      shapeRule: 'relative-traversal',
+      unextracted: [{ raw: '../../package.json', resolved: '/ws/develop/package.json', kind: 'relative-traversal', insideWorkspace: false }],
+    })
+    const row = amberRow(d, entry)
+    assert.equal(row.shapeRule, 'relative-traversal')
+    assert.deepEqual(row.unextracted, [
+      { raw: '../../package.json', resolved: '/ws/develop/package.json', kind: 'relative-traversal', insideWorkspace: false },
+    ])
+  })
+
+  it('外部子代理（externalPending 分支）同样带这四个字段', () => {
+    const d = boot()
+    d.markPermissionPending({
+      childId: 'ext-1', permId: 'e#1', description: 'E',
+      askReason: 'no-workspace-cover', commandText: 'cat /etc/hosts', shapeRule: null,
+    })
+    const row = serializePermissionPending(d.externalPending.get('ext-1'), null).permissionPending
+    assert.equal(row.askReason, 'no-workspace-cover')
+    assert.equal(row.commandText, 'cat /etc/hosts')
+  })
+
+  it('记账层与出参层同一个上限（8KB），不出现两套口径', () => {
+    const d = boot()
+    const entry = activeEntry('child-A')
+    d.activeChildren.set('child-A', entry)
+    d.markPermissionPending({ childId: 'child-A', permId: 'tc#1', description: 'R', commandText: 'x'.repeat(9000) })
+    assert.equal(entry.permissionPending[0].commandText.length, MAX_PENDING_COMMAND_TEXT_CHARS)
+    assert.equal(amberRow(d, entry).commandText.length, MAX_PENDING_COMMAND_TEXT_CHARS)
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// v1.12.26：白名单必须 ⊇ `index.js` 里出现的**每一个** askReason 字面量。
+//
+// 本轮 bug 的根就是"两处白名单各写一份"：v1.12.25 只把新枚举加进了出参侧
+// （`askReasonOf`），记账侧还留着 `=== 'danger'` 的旧写法，两边漂移且没有任何断言。
+// 这里**静态扫源码**：`markAsk(...)` 的实参与 `askReason: '...'` 的对象字面量，
+// 每一份都必须被白名单接受。新加枚举却忘了改白名单 ⇒ 立刻转红。
+// ────────────────────────────────────────────────────────────────────────────
+describe('v1.12.26 白名单覆盖：index.js 的每个 askReason 字面量都必须被接受', () => {
+  const indexSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+
+  /** 抠出 `name(` 之后按括号配平的实参文本（跳过多行与嵌套括号） */
+  function callArgs(text, name) {
+    const out = []
+    const head = name + '('
+    for (let at = text.indexOf(head); at >= 0; at = text.indexOf(head, at + head.length)) {
+      let depth = 0
+      let i = at + head.length - 1
+      for (; i < text.length; i += 1) {
+        if (text[i] === '(') depth += 1
+        else if (text[i] === ')') { depth -= 1; if (depth === 0) break }
+      }
+      out.push(text.slice(at + head.length, i))
+    }
+    return out
+  }
+
+  const strLiterals = (s) => [...s.matchAll(/'([^'\\]+)'/g)].map((m) => m[1])
+
+  const accepted = (reason) => serializePermissionPending([{ askReason: reason }]).permissionPending.askReason
+
+  it('markAsk 的字面量全部在名单里（含三元分支两侧）', () => {
+    const argsList = callArgs(indexSrc, 'markAsk')
+    assert.ok(argsList.length >= 5, `只扫到 ${argsList.length} 处 markAsk —— 扫描锚点失效，断言会变成空转`)
+    const found = new Set()
+    for (const args of argsList) for (const lit of strLiterals(args)) found.add(lit)
+    assert.ok(found.size >= 4, `markAsk 实参里只扫到 ${found.size} 个字面量，扫描口径可能失效`)
+    for (const lit of found) {
+      assert.equal(accepted(lit), lit, `askReason "${lit}" 在 markAsk 里写着，却被白名单吞成 null（面板会说不出原因）`)
+    }
+  })
+
+  it('pushPendingContext 里直接写的 askReason 字面量（危险门两支）也在名单里', () => {
+    const found = new Set([...indexSrc.matchAll(/askReason:\s*'([^'\\]+)'/g)].map((m) => m[1]))
+    assert.ok(found.size >= 1, 'index.js 里一个 askReason 字面量都没扫到 —— 扫描锚点失效')
+    for (const lit of found) assert.equal(accepted(lit), lit, `askReason "${lit}" 被白名单吞成 null`)
+  })
+
+  it('`shape:<id>` 模板写法也要被接受（模板串扫不到，单独钉住）', () => {
+    assert.match(indexSrc, /markAsk\(`shape:\$\{/, 'markAsk 的 shape 归因被改名了？本用例的「模板串单独钉住」需要同步')
+    assert.equal(accepted('shape:multi-command'), 'shape:multi-command')
+    assert.equal(accepted('shape:'), null, '空 id 的 shape: 仍要拒收（脏载荷不进面板）')
   })
 })
