@@ -1094,7 +1094,7 @@ describe('v1.12.25 弹框只读区：命令原文 + 拦截原因', () => {
   it('③ 拦截原因：askReason 映射成中文短标签（danger 带具体命令名）', () => {
     const { mod } = buildGrantModule()
     assert.equal(mod.askReasonLabel('shape:multi-command', null, null), '命令形状无法静态判定：多命令拼接')
-    assert.equal(mod.askReasonLabel('shape:relative-traversal', null, null), '命令形状无法静态判定：相对路径越界')
+    assert.equal(mod.askReasonLabel('shape:relative-traversal', null, null), '相对路径越界（../）')
     assert.equal(mod.askReasonLabel('danger', null, 'rm -rf'), '危险命令（rm -rf）')
     assert.equal(mod.askReasonLabel('danger', null, null), '危险命令')
     assert.equal(mod.askReasonLabel('no-command-text', null, null), '无法解析命令正文')
@@ -1778,6 +1778,98 @@ describe('v1.12.27 面板待授权行：命令原文 + 拦截原因', () => {
   })
 })
 
+// ── v1.12.31（用户真机现场：`cat /etc/hosts` 的面板写着「命令形状无法静态判定：path-outside」）──
+// 两处错：① 路径类 id 没有中文标签 ⇒ 裸 id 直接上屏；② 被套上「命令形状」前缀 ⇒ 把用户
+// 引去看命令原文找管道/替换，而这条拦的是**路径**（`/etc/hosts` 在工作区外）。
+// 修法只在展示层：`shape:` 前缀的语义、白名单、判定链一字不动，只是拆成「形状」「路径」两张表。
+describe('v1.12.31 授权面板：路径类拦截原因单独措辞，不再暴露内部 id', () => {
+  const PATH_CASES = [
+    ['path-outside', '请求路径在工作区外'],
+    ['relative-traversal', '相对路径越界（../）'],
+    ['glob-outside', '通配符匹配到工作区外'],
+    ['glob-unresolved', '通配符路径无法静态解析'],
+    ['path-unresolved', '路径无法静态解析'],
+  ]
+  const SHAPE_CASES = [
+    ['command-substitution', '命令形状无法静态判定：命令替换 $(…) / 反引号'],
+    ['pipe-to-interpreter', '命令形状无法静态判定：管道到解释器'],
+    ['multi-command', '命令形状无法静态判定：多命令拼接'],
+    ['interpreter-stdin', '命令形状无法静态判定：解释器读 stdin'],
+    ['variable-expansion', '命令形状无法静态判定：变量展开'],
+    ['inline-code', '命令形状无法静态判定：内联代码执行'],
+  ]
+
+  /** 造一条面板行并取「拦截原因」那一行的文字（与两条通道同一个装配件） */
+  function whyOf(mod, doc, pending) {
+    const row = doc.createElement('div')
+    mod.appendPendingAskLines(row, pending, { why: 'p-why', cmd: 'p-cmd' })
+    return one(row, 'p-why').textContent
+  }
+
+  it('① 五种路径类 id 都有专属中文标签，且不带「命令形状」前缀、不露裸 id', () => {
+    const { mod } = buildGrantModule()
+    for (const [id, text] of PATH_CASES) {
+      const label = mod.askReasonLabel('shape:' + id, null, null)
+      assert.equal(label, text, `shape:${id} 必须有专属文案`)
+      assert.doesNotMatch(label, /命令形状/, `shape:${id} 属路径类，不得套用命令形状前缀`)
+      assert.doesNotMatch(label, new RegExp(id), `shape:${id} 的中文标签里不得再出现内部 id`)
+    }
+  })
+
+  it('② 现场复现：shape:path-outside（冗余字段同值）⇒「请求路径在工作区外」', () => {
+    const { mod } = buildGrantModule()
+    const label = mod.askReasonLabel('shape:path-outside', 'path-outside', null)
+    assert.equal(label, '请求路径在工作区外')
+    assert.doesNotMatch(label, /path-outside|命令形状/)
+  })
+
+  it('③ 形状类六个 id 的旧措辞一字不变（前缀必须还在）', () => {
+    const { mod } = buildGrantModule()
+    for (const [id, text] of SHAPE_CASES) {
+      assert.equal(mod.askReasonLabel('shape:' + id, null, null), text, `shape:${id} 的措辞被改动了`)
+    }
+  })
+
+  it('④ 未知 id：可读、保留 id、不贴「命令形状」前缀', () => {
+    const { mod } = buildGrantModule()
+    assert.equal(mod.askReasonLabel('shape:bogus', null, null), '未识别的原因（bogus）')
+    assert.doesNotMatch(mod.askReasonLabel('shape:bogus', null, null), /命令形状/,
+      '未知 id 可能是将来新增的路径类 id，不能替服务端下「形状」这个结论')
+    // 老服务端只给冗余字段（`shape:` 后面为空）也走同一条兜底
+    assert.equal(mod.askReasonLabel('shape:', 'bogus', null), '未识别的原因（bogus）')
+    // `shape:` 后为空且冗余字段也空 ⇒ 仍然是旧的「未知形状」（没有 id 可报）
+    assert.equal(mod.askReasonLabel('shape:', null, null), '命令形状无法静态判定：未知形状')
+  })
+
+  it('⑤ 面板行逐字：四种情况（含现场那条 cat /etc/hosts 的形状）', () => {
+    const { mod, doc } = buildGrantModule()
+    const CMD = 'cat /etc/hosts'
+    assert.equal(whyOf(mod, doc, { commandText: CMD, askReason: 'shape:path-outside', shapeRule: 'path-outside' }),
+      '拦截原因：请求路径在工作区外')
+    assert.equal(whyOf(mod, doc, { commandText: 'cat /ws/*.json', askReason: 'shape:glob-unresolved' }),
+      '拦截原因：通配符路径无法静态解析')
+    assert.equal(whyOf(mod, doc, { commandText: 'cat ../../a', askReason: 'shape:relative-traversal' }),
+      '拦截原因：相对路径越界（../）')
+    assert.equal(whyOf(mod, doc, { commandText: CMD, askReason: 'shape:bogus' }),
+      '拦截原因：未识别的原因（bogus）', '未知 id 也不许裸奔、不许贴错前缀')
+    // 形状类在面板上仍带前缀（回归）
+    assert.equal(whyOf(mod, doc, { commandText: CMD, askReason: 'shape:multi-command' }),
+      '拦截原因：命令形状无法静态判定：多命令拼接')
+  })
+
+  it('⑥ 源码结构：两张表分开，形状表里不许再混路径类 id', () => {
+    assert.match(src, /const ASK_PATH_LABELS = \{/, '路径类必须有自己的标签表')
+    const at = src.indexOf('const ASK_SHAPE_LABELS = {')
+    assert.ok(at >= 0, 'client.js 找不到 ASK_SHAPE_LABELS')
+    const shapeTable = src.slice(at, src.indexOf('};', at))
+    for (const id of ['path-outside', 'relative-traversal', 'glob-outside', 'glob-unresolved', 'path-unresolved']) {
+      assert.ok(!shapeTable.includes(id), `${id} 属路径类，不该留在形状表里（否则又被套上命令形状前缀）`)
+    }
+    // 判定链未动：仍只认 `shape:` 前缀这一种形状
+    assert.match(src, /if \(r\.indexOf\("shape:"\) === 0\) \{/, 'shape: 分支的判据不得改动')
+  })
+})
+
 // ── v1.12.27（同一轮的第二个显示位）：运行卡片 `RunCard` 的待授权清单 ──
 // 用户澄清：「点击浮球后出来的面板」＝总览里的运行卡片列表，待授权只是卡片右侧的
 // `ad-pending-badge` 徽标，**过去只把 description 塞进 title 提示**，正文里看不到命令。
@@ -1860,7 +1952,7 @@ describe('v1.12.27 运行卡片 RunCard：待授权逐条列出命令原文 + �
     const text = vText(card)
     assert.match(text, /⏳ 待授权/, '徽标文案保持原样')
     assert.equal(vByClass(card, 'ad-run-pending-item').length, 1)
-    assert.equal(vByClass(card, 'pr-why')[0].children.join(''), 'Bash · 拦截原因：命令形状无法静态判定：相对路径越界')
+    assert.equal(vByClass(card, 'pr-why')[0].children.join(''), 'Bash · 拦截原因：相对路径越界（../）')
     assert.equal(vByClass(card, 'pr-cmd')[0].children.join(''), 'cat package.json ../../package.json')
     assert.equal(vByClass(card, 'pr-more').length, 0, '只有 1 条时不该出现「还有」')
   })
@@ -1875,7 +1967,7 @@ describe('v1.12.27 运行卡片 RunCard：待授权逐条列出命令原文 + �
     const whys = vByClass(card, 'pr-why').map((n) => n.children.join(''))
     const cmds = vByClass(card, 'pr-cmd').map((n) => n.children.join(''))
     assert.deepEqual(whys, [
-      'Bash · 拦截原因：命令形状无法静态判定：相对路径越界',
+      'Bash · 拦截原因：相对路径越界（../）',
       'Bash · 拦截原因：命令形状无法静态判定：内联代码执行',
     ])
     assert.deepEqual(cmds, ['cat package.json ../../package.json', 'node -e "console.log(1)"'])

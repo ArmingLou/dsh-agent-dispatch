@@ -1,3 +1,61 @@
+## 1.12.31（2026-11-01）
+
+> 一句话：**授权面板的路径类原因标签补全** —— 不再把内部 id 直接印到面板上（`shape:path-outside`
+> 曾显示成「命令形状无法静态判定：path-outside」），也不再给路径问题套「命令形状」前缀。
+> 只改客户端展示层，判定链与 `shape:` 白名单一字未动。
+
+### 现场
+
+用户真机面板：codebuddy 子代理跑 `cat /etc/hosts`，面板写的是
+
+```
+Bash | CMD-show | 📁 /etc/hosts（本会话将记住：codebuddy:bash）
+拦截原因：命令形状无法静态判定：path-outside
+cat /etc/hosts
+```
+
+两处错：`path-outside` 没有中文标签（裸 id 上屏）；「路径在工作区外」被套上了「命令形状无法静态判定」。
+
+### 改动
+
+| 位置 | 改动 |
+| --- | --- |
+| `lib/client.js`（`ASK_SHAPE_LABELS`） | 只留**命令形状类** 6 项：`command-substitution` / `pipe-to-interpreter` / `multi-command` / `interpreter-stdin` / `variable-expansion` / `inline-code`，措辞与旧版逐字一致 |
+| 同上（新增 `ASK_PATH_LABELS`） | **路径类** 5 项：`path-outside` / `relative-traversal` / `glob-outside` / `glob-unresolved` / `path-unresolved`，文案只说路径事实、**不带**前缀（`relative-traversal` / `glob-outside` 从形状表迁出） |
+| 同上（`askReasonLabel` 的 `shape:` 分支） | 判定顺序：路径表 → 形状表 → 未知兜底；未知 id 输出「未识别的原因（xxx）」（不预设类别、保留 id、不再重复「拦截原因」四字） |
+
+### 文案表
+
+| `askReason` | 面板文字 |
+| --- | --- |
+| `shape:path-outside` | 请求路径在工作区外 |
+| `shape:relative-traversal` | 相对路径越界（../） |
+| `shape:glob-outside` | 通配符匹配到工作区外 |
+| `shape:glob-unresolved` | 通配符路径无法静态解析 |
+| `shape:path-unresolved` | 路径无法静态解析 |
+| `shape:command-substitution` | 命令形状无法静态判定：命令替换 $(…) / 反引号 |
+| `shape:pipe-to-interpreter` | 命令形状无法静态判定：管道到解释器 |
+| `shape:multi-command` | 命令形状无法静态判定：多命令拼接 |
+| `shape:interpreter-stdin` | 命令形状无法静态判定：解释器读 stdin |
+| `shape:variable-expansion` | 命令形状无法静态判定：变量展开 |
+| `shape:inline-code` | 命令形状无法静态判定：内联代码执行 |
+| `shape:<其它>` | 未识别的原因（`<id>`） |
+
+### 兼容性
+
+- `shape:` 前缀的语义、`lib/dispatch.js` 的白名单（`askReasonOf`）、兄弟仓
+  product-subagents 的 id 产出**均未改动**——本轮只对齐展示；兄弟仓升级先于本仓时，
+  新 id 会落到「未识别的原因（xxx）」，不会误挂到形状措辞上；
+- 非 `shape:` 的未知 `askReason` 仍照原样显示（既有行为，不吞原因）。
+
+### 测试
+
+`test/grant-dialog.test.js` 新增 `v1.12.31 授权面板：路径类拦截原因单独措辞，不再暴露内部 id`
+（6 例）：五种路径 id 的标签与「不含内部 id / 不含命令形状前缀」、现场 `shape:path-outside` 复现、
+形状类六项旧措辞回归、未知 `shape:bogus` 与空 id 兜底、面板行逐字的四种情况、源码结构（两张表分离 +
+`shape:` 判据未动）。`node --test test/grant-dialog.test.js test/host-approval-endpoint.test.js`：
+177 通过 / 0 失败；全量 `npm test`：884 通过 / 0 失败。
+
 ## 1.12.30（2026-11-01）
 
 > 一句话：**落盘规则 `tools` 支持尾部 `*` 前缀匹配** —— 宿主把执行类工具报成 `execute (cat)` /
