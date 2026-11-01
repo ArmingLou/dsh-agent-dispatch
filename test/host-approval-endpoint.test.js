@@ -1482,3 +1482,102 @@ describe('v1.12.25 追加 B（宿主侧）：登记的目录覆盖相对越界�
 
   after(teardown)
 })
+
+// ─────────────────────────────────────────────────────────────────
+describe('v1.12.30 落盘规则 tools 支持尾部 `*` 前缀匹配', () => {
+  // 动机（实测）：宿主把执行类工具名报成 `execute (cat)` / `execute (ls)`（带参数后缀），
+  // 规则里写裸 `main:execute` 命中不了任何一个（精确比较），用户只能逐个工具名授权。
+  // 本轮只给**显式尾部通配**开口：`main:execute*` ⇒ 前缀 `main:execute`；
+  // `*` 只认末尾这一处，中间/开头带 `*` 一律丢弃（脏数据不许放宽成「匹配所有」）。
+  const allowlistFile = (home) => path.join(home, 'data', 'dsh-plugin-product-subagents', 'allowlist.json')
+
+  /** 直接铺一条落盘规则（等价于 product-subagents 侧写入的条目形状） */
+  const seedToolRule = (home, tools, { cwd = '/home/test', product = 'main', paths = [] } = {}) => {
+    mkdirSync(path.dirname(allowlistFile(home)), { recursive: true })
+    const rule = { cwd, paths, tools, grantedAt: new Date().toISOString(), note: 'v1.12.30 fixture' }
+    if (product) rule.product = product
+    writeFileSync(allowlistFile(home), JSON.stringify({ version: 3, rules: [rule] }, null, 2), 'utf8')
+  }
+
+  // 工具名与调用记录自洽：`execute` 在 EXECUTE_TOOL_SLUGS 里，参数带 command 正文。
+  // 路径**必须在工作区之外**（`/home/test` 之外）：工作区默认档排在工具档之前，
+  // 路径在区内时任何用例都会被那一档放行，测的就不是落盘规则了。
+  const execCall = (callId, command = 'cat /tmp/dad-prefix/a.txt') => [{ callId, name: 'execute', arguments: { command } }]
+
+  it('语法：`main:execute*` ⇒ 前缀键；`main:*` ⇒ `main:`；中间/开头 * 与非末尾 * 一律丢弃', async () => {
+    const ha = await import('../lib/host-approval.js')
+    assert.equal(typeof ha.compileRuleToolMatchers, 'function', '缺少 compileRuleToolMatchers')
+    assert.deepEqual(ha.compileRuleToolMatchers(['main:execute*'], null), { exact: [], prefixes: ['main:execute'] })
+    assert.deepEqual(ha.compileRuleToolMatchers(['main:*'], null), { exact: [], prefixes: ['main:'] })
+    assert.deepEqual(ha.compileRuleToolMatchers(['execute*'], 'main'), { exact: [], prefixes: ['main:execute'] },
+      '裸名 + 规则 product 的前缀项仍要补产品前缀')
+    // 脏数据：* 不在末尾 / 剥掉尾部 * 后仍含 * / 裸 *（无产品维度）⇒ 丢弃，且不得退化成「匹配所有」
+    assert.deepEqual(ha.compileRuleToolMatchers(['*exec', 'ma*in:x', 'main:a*b', 'a*b*', '*'], 'main'), { exact: [], prefixes: [] })
+    // 向后兼容：精确写法的返回结构一字不变；前缀项不进 exact
+    assert.deepEqual(ha.compileRuleTools(['main:Bash'], null), ['main:bash'])
+    assert.deepEqual(ha.compileRuleTools(['Bash'], null), [], '裸名 + 无 product ⇒ 丢弃')
+    assert.deepEqual(ha.compileRuleTools([':x', 'x:', 'a:b:c', '', 42, 'main:execute*'], 'main'), [],
+      'compileRuleTools 只给精确键（前缀项不在其中，也不该被当成精确键）')
+  })
+
+  it('`main:execute*` 命中 `execute (cat)` / `execute (ls)`（端点级：真 decide 链路）', async () => {
+    const b = await boot()
+    try {
+      seedToolRule(b.home, ['main:execute*'])
+      for (const [sid, tool, cmd] of [['c1', 'execute (cat)', 'cat /tmp/dad-prefix/a.txt'], ['c2', 'execute (ls)', 'ls /tmp/dad-prefix']]) {
+        const s = mkSession({ id: sid, parentSession: 'R', toolCalls: execCall(sid, cmd) })
+        const out = await approve(b, s, { callId: sid, toolName: tool })
+        assert.equal(out.res, 'allowed-once', `${tool} 没吃到 main:execute* 前缀规则`)
+        assert.equal(out.nextCalled, false)
+      }
+    } finally { await b.close() }
+  })
+
+  it('`main:execute*` 不跨产品命中（codebuddy:execute (cat) 不中）', async () => {
+    const b = await boot()
+    try {
+      seedToolRule(b.home, ['main:execute*'])
+      const { HostApprovalRules } = await import('../lib/host-approval.js')
+      const rules = new HostApprovalRules()
+      assert.equal(rules.projectToolRulesCover('/home/test', 'execute (cat)'), true)
+      assert.equal(rules.projectToolRulesCover('/home/test', 'execute (cat)', 'codebuddy'), false,
+        '前缀规则跨产品命中了（产品隔离被破）')
+      assert.equal(rules.projectToolRulesCover('/home/test', 'write', 'main'), false,
+        '前缀规则放行了同产品的**别的**工具名（前缀被当成了通配）')
+      // 端点侧：主代理链路的工具键恒为 main ⇒ 仍命中；ACP 侧键为 <provider>:… ⇒ 不可能相等
+      const s = mkSession({ id: 'c1', parentSession: 'R', toolCalls: execCall('c1') })
+      assert.equal((await approve(b, s, { callId: 'c1', toolName: 'execute (cat)' })).res, 'allowed-once')
+    } finally { await b.close() }
+  })
+
+  it('`main:execute (cat)` 仍只命中 cat（旧精确写法零回归）', async () => {
+    const b = await boot()
+    try {
+      seedToolRule(b.home, ['main:execute (cat)'])
+      const cat = mkSession({ id: 'c1', parentSession: 'R', toolCalls: execCall('c1') })
+      assert.equal((await approve(b, cat, { callId: 'c1', toolName: 'execute (cat)' })).res, 'allowed-once')
+      const ls = mkSession({ id: 'c2', parentSession: 'R2', toolCalls: execCall('c2', 'ls /tmp/dad-prefix') })
+      const out = await approve(b, ls, { callId: 'c2', toolName: 'execute (ls)' })
+      assert.equal(out.nextCalled, true, '精确规则把 execute (ls) 也放行了（精确写法被放宽）')
+      assert.notEqual(out.res, 'allowed-once')
+    } finally { await b.close() }
+  })
+
+  it('脏数据规则项不放宽：`*exec` / `ma*in:x` / `main:a*b` 铺进文件也不命中', async () => {
+    const b = await boot()
+    try {
+      seedToolRule(b.home, ['*exec', 'ma*in:x', 'main:a*b'])
+      const s = mkSession({ id: 'c1', parentSession: 'R', toolCalls: execCall('c1') })
+      const out = await approve(b, s, { callId: 'c1', toolName: 'execute (cat)' })
+      assert.equal(out.nextCalled, true, '含中间/开头 * 的脏项被当成了通配')
+      assert.notEqual(out.res, 'allowed-once')
+      // `main:*` 是唯一的「该产品全部工具」写法，且只覆盖 main
+      const { HostApprovalRules } = await import('../lib/host-approval.js')
+      seedToolRule(b.home, ['main:*'])
+      const rules = new HostApprovalRules()
+      assert.equal(rules.projectToolRulesCover('/home/test', 'execute (cat)'), true)
+      assert.equal(rules.projectToolRulesCover('/home/test', 'anything at all'), true)
+      assert.equal(rules.projectToolRulesCover('/home/test', 'execute (cat)', 'qoder'), false)
+    } finally { await b.close() }
+  })
+})

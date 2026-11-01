@@ -1,3 +1,39 @@
+## 1.12.30（2026-11-01）
+
+> 一句话：**落盘规则 `tools` 支持尾部 `*` 前缀匹配** —— 宿主把执行类工具报成 `execute (cat)` /
+> `execute (ls)`（带参数后缀），规则里写裸 `main:execute` 是精确比较、一个都命中不了，用户只能
+> 逐个工具名授权；现在写 `main:execute*` 即可覆盖该产品下这一族工具名。
+
+### 改动
+
+| 位置 | 改动 |
+| --- | --- |
+| `lib/host-approval.js`（新增 `compileRuleToolMatchers`） | `tools` 归一化结果从 `string[]` 升级为 `{ exact, prefixes }`。规则项**以 `*` 结尾** ⇒ 前缀项（剥掉 `*` 再按原规则拼键，`main:execute*` ⇒ 前缀 `main:execute`；`main:*` ⇒ 前缀 `main:` = 该产品全部工具）；其余项仍走精确归一化 |
+| 同上（`compileExactToolKey` / `compilePrefixToolKey`） | `product:name` 前缀校验逐字沿用（`:` 后不得再含 `:`、head 不得为空）；前缀项额外允许 name 段为空（只对 `main:*` 有意义） |
+| 同上（`compileRuleTools`） | 退化为 `compileRuleToolMatchers(...).exact` 薄壳——**旧精确写法行为一字不变**，既有调用方拿到的东西与 1.12.29 相同 |
+| 同上（`projectToolRulesCover`） | 判据改为「精确键命中 **或** 前缀键 `startsWith` 命中」 |
+| 同上（`appendProjectToolRule` 幂等去重） | 同一判据：已有规则（含前缀规则）覆盖该键时只更新时间，不再重复追加条目 |
+
+### 语法与丢弃规则
+
+- `*` **只能出现在末尾且只有这一处**：`main:execute*`、`main:*`、`execute*`（配规则 `product` 时）合法；
+- `*exec`、`ma*in:x`、`main:a*b`、`a*b*`、裸 `*`（无产品维度）⇒ **该项丢弃**，不放宽成「匹配所有」；
+- 空串、`:x`、`x:`、`a:b:c` ⇒ 丢弃（与 1.12.29 一致）；
+- 前缀键以 `product:` 打头 ⇒ 天然不跨产品：`main:execute*` 匹配不到 `codebuddy:execute (cat)`。
+
+### 兼容性
+
+- 会话内存档（`#toolGrants`）本轮不动，只有落盘规则（`allowlist.json` 的 `rules[].tools`）认新语法；
+- 兄弟仓 product-subagents 读同一份文件时，`main:execute*` 会被它当成**字面工具名**（`toolGrantKey`
+  只小写化），既不会报错也不会误放（永不等于请求键），只是该前缀在那里不生效——无害。
+
+### 测试
+
+`test/host-approval-endpoint.test.js` 新增 `v1.12.30 落盘规则 tools 支持尾部 * 前缀匹配`（5 例）：
+语法/归一化与丢弃（含 `compileRuleTools` 向后兼容）、`main:execute*` 端点级命中 `execute (cat)` /
+`execute (ls)`、前缀不跨产品（`codebuddy:execute (cat)` 不中）、`main:execute (cat)` 仍只命中 cat、
+脏项铺进文件也不命中。全量 `npm test`：878 通过 / 0 失败；`npm run verify` OK。
+
 ## 1.12.29（2026-11-01）
 
 > 一句话：**蓝球（宿主 `approval/request` 通道）每条待授权行新增「打开会话」入口** —— 琥珀球的行
