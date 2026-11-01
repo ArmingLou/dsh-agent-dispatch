@@ -93,6 +93,14 @@ class FakeEl {
   setAttribute(k, v) { this.attrs[k] = String(v) }
   getAttribute(k) { return k in this.attrs ? this.attrs[k] : null }
   appendChild(c) { this.childNodes.push(c); c.parentNode = this; return c }
+  /** v1.12.29：蓝球高危行的「打开会话」入口要插在决策按钮行之前（sticky 行之前） */
+  insertBefore(c, ref) {
+    const i = ref ? this.childNodes.indexOf(ref) : -1
+    if (i < 0) this.childNodes.push(c)
+    else this.childNodes.splice(i, 0, c)
+    c.parentNode = this
+    return c
+  }
   contains(n) { for (let x = n; x; x = x.parentNode) if (x === this) return true; return false }
   remove() {
     if (!this.parentNode) return
@@ -137,10 +145,24 @@ function byClass(root, cls) {
   return walk(root).filter((n) => String(n.className || '').split(/\s+/).includes(cls))
 }
 
-/** 面板内所有真按钮（`ad-btn` 类）的文案，顺序 = 渲染顺序 */
+/**
+ * 面板内所有**决策按钮**（`ad-btn`）的文案，顺序 = 渲染顺序。
+ * v1.12.29：改为按「决策操作行容器」取。蓝球待授权行这一版新增了「打开会话」
+ * 跳转入口，它同样是 `.ad-btn mini`（用户裁定沿用既有样式）却**不 answer 任何请求**——
+ * 若混进这个集合，「高危行按钮集合恰好 = {允许一次, 拒绝}」这条不变量就失去意义了。
+ * 容器 class 见 CSS：ad-perm-actions / ad-ha-actions / ad-danger-actions。
+ */
+const DECISION_BOXES = ['ad-perm-actions', 'ad-ha-actions', 'ad-danger-actions']
 function buttonLabels(root) {
-  return byClass(root, 'ad-btn').map((b) => b.textContent)
+  const has = (n, c) => String(n.className || '').split(/\s+/).includes(c)
+  return walk(root)
+    .filter((n) => DECISION_BOXES.some((c) => has(n, c)))
+    .flatMap((box) => byClass(box, 'ad-btn'))
+    .map((b) => b.textContent)
 }
+
+/** v1.12.29：蓝球行的「打开会话」导航入口（按 title 认，不看文案——文案可能微调） */
+const hostJumpBtn = (root) => byClass(root, 'ad-btn').find((b) => b.title === '打开该子代理会话') || null
 
 const flush = async (n = 30) => { for (let i = 0; i < n; i += 1) await Promise.resolve() }
 
@@ -189,7 +211,7 @@ function compileHostFab(opts) {
   // hold/decided 是 Map、lastAmberKeys 是 Set、blueOps 由本面板自己赋值（初值 null）。
   // 类型错了不会让用例立刻红，但会把"面板真跑到了孪生分支"这件事糊掉。
   const names = [
-    'document', 'console', 'setTimeout', 'clearTimeout', 'apiGet', 'apiPost',
+    'document', 'console', 'setTimeout', 'clearTimeout', 'apiGet', 'apiPost', 'openAgentSession',
     'isEscalationReason', 'dirsOfPaths', 'openGrantDialog',
     'acpTwinHold', 'acpTwinHolds', 'acpTwinSeq', 'acpTwinLastAmberKeys', 'acpTwinPromote', 'acpTwinDrop',
     'acpTwinMarkDecided', 'acpTwinDecided', 'acpTwinBlueOps',
@@ -203,6 +225,9 @@ function compileHostFab(opts) {
     () => {},
     opts.apiGet,
     opts.apiPost,
+    // v1.12.29：蓝球行的「打开会话」入口要调它（生产里 apply 时绑定的 openAgentSession，
+    // 未绑定为 null；这里默认给一个成功的替身，需要钉条件的用例自己传）
+    opts.openAgentSession || (() => Promise.resolve(true)),
     () => false,
     (v) => v,
     opts.openGrantDialog,
@@ -250,7 +275,7 @@ async function mountAmberRow(permissionPending, extra = {}) {
 }
 
 /** 蓝球：注册 approval/request → 服务端上下文回传 → 点球展开列表 */
-async function mountHostRow(ctxFromServer, request = {}) {
+async function mountHostRow(ctxFromServer, request = {}, extra = {}) {
   const doc = fakeDocument()
   const sp = spies()
   const posts = []
@@ -264,6 +289,7 @@ async function mountHostRow(ctxFromServer, request = {}) {
   const mount = compileHostFab({
     document: doc,
     openGrantDialog: sp.openGrantDialog,
+    openAgentSession: extra.openAgentSession,
     timers: [],
     apiGet: () => Promise.resolve({ ok: true, ...ctxFromServer }),
     apiPost: (route, body) => { posts.push([route, body]); return Promise.resolve({ ok: true }) },
@@ -272,7 +298,8 @@ async function mountHostRow(ctxFromServer, request = {}) {
     remote: {
       $on: (name, fn) => { if (name === 'approval/request') handler = fn; return () => {} },
     },
-    sessions: { scopeOf: () => 'session-1' },
+    // `sessionId: null` 是显式用例（宿主没给出 agent scope ⇒ 蓝球条目没有可跳的会话）
+    sessions: { scopeOf: () => ('sessionId' in extra ? extra.sessionId : 'session-1') },
   })
   assert.ok(handler, 'approval/request 监听器应已注册')
   // 监听器返回的就是 answerPromise——用户点哪个按钮，它的兑现值就是哪个 outcome
@@ -606,17 +633,43 @@ describe('v1.12.16 高危行的跳转子代理会话入口：与普通行同一�
     assert.deepEqual(spy.seen, [['child-A', 'parent-1']])
   })
 
-  it('蓝球高危行**不**渲染跳转入口：蓝球普通行本来就没有跳转（不为对称发明新功能）', async () => {
+  // v1.12.29（用户裁定，取代 v1.12.16 的「蓝球不加跳转入口」）：蓝球条目本来就带
+  // sessionId（订阅 approval/request 时 sessions.scopeOf(this) 取的 agent scope），
+  // 所以高危行也要给入口——但入口是**导航**，不是决策按钮，且只按 sessionId 单参跳。
+  it('蓝球行有 sessionId ⇒ 渲染「打开会话」入口；它不进决策按钮集合、不投递任何决策', async () => {
     const nativeCtx = {
       toolName: 'Bash', paths: ['/tmp/a'], cwd: '/proj', rootSessionId: 'root-1', callId: 'call-1',
       askReason: 'danger', dangerRule: 'rm -rf', dangerSegment: 'rm -rf /tmp/a', commandText: 'rm -rf /tmp/a',
     }
-    const d = await mountHostRow(nativeCtx)
+    const seen = []
+    const openAgentSession = (id) => { seen.push(id); return Promise.resolve(true) }
+    const d = await mountHostRow(nativeCtx, {}, { openAgentSession })
     assertDangerRow(d.row)
-    assert.equal(byClass(d.row, 'ad-danger-jump').length, 0, '蓝球通道没有子代理会话可跳，不得凭空加入口')
-    const n = await mountHostRow({ ...nativeCtx, askReason: null, dangerRule: null, dangerSegment: null, commandText: '' })
-    assert.equal(byClass(n.row, 'ad-danger-jump').length, 0)
+    assert.deepEqual(buttonLabels(d.row), ['允许一次', '拒绝'], '决策按钮集合不因入口而变')
+    const jump = hostJumpBtn(d.row)
+    assert.ok(jump, '有 sessionId 就必须有跳转入口')
+    assert.equal(jump.textContent, '打开会话')
+    assert.equal(byClass(d.row, 'ad-danger-jump').length, 0, '统一用 ad-btn mini，不是高危行的文字链接形态')
+    jump.click()
+    await flush()
+    assert.deepEqual(seen, ['session-1'], '单参跳条目自己的 sessionId（不是 childId）')
+    assert.equal(d.posts.length, 0, '入口不 answer、不写规则')
+
+    // 普通行同样有这个入口（两条渲染分支共用同一个装配件）
+    const n = await mountHostRow({ ...nativeCtx, askReason: null, dangerRule: null, dangerSegment: null, commandText: '' }, {}, { openAgentSession })
+    assert.ok(hostJumpBtn(n.row), '普通行也要有入口')
+    assert.deepEqual(buttonLabels(n.row), ['允许一次', '本会话总是允许该工具', '总是允许(项目)', '拒绝'])
     assert.equal(byClass(n.row, 'ad-ha-item')[0].getAttribute('role') || null, null, '蓝球普通行连整行点击都不是按钮形态')
+  })
+
+  it('蓝球行缺 sessionId（scopeOf 返回 null）⇒ 不渲染入口，也不报错', async () => {
+    const ctx = { toolName: 'Bash', paths: ['/tmp/a'], callId: 'call-1', askReason: 'danger', dangerRule: 'rm -rf', dangerSegment: 'rm -rf /tmp/a' }
+    const d = await mountHostRow(ctx, {}, { sessionId: null })
+    assertDangerRow(d.row)
+    assert.equal(hostJumpBtn(d.row), null, '没绑到会话就给死按钮，不如不给')
+    const n = await mountHostRow(ctx, {}, { sessionId: null })
+    assert.equal(hostJumpBtn(n.row), null)
+    assert.equal(d.posts.length + n.posts.length, 0)
   })
 })
 
@@ -668,13 +721,18 @@ describe('v1.12.16 蓝球高危行的上下文三行：与普通行同口径，�
     assert.ok(d.row.textContent.includes('cd /proj && rm -rf /tmp/out'), '命令正文仍完整可见（没被信息行挤掉）')
   })
 
-  it('三行是信息行：不进操作行容器、不是 .ad-btn，按钮集合仍恰好 {允许一次, 拒绝}，跳转入口仍为 0', async () => {
+  it('三行是信息行：不进操作行容器、不是 .ad-btn，按钮集合仍恰好 {允许一次, 拒绝}', async () => {
     const { row } = await mountHostRow(ctxOf())
     assert.deepEqual(buttonLabels(row), ['允许一次', '拒绝'],
       `补信息行不得动决策按钮集合，实际：${buttonLabels(row).join(' / ')}`)
-    assert.equal(byClass(row, 'ad-danger-jump').length, 0, '用户已裁定：蓝球不加跳转入口')
+    // v1.12.29：跳转入口是**导航**（`.ad-actions` 里的 ad-btn mini），不属于决策按钮集合，
+    // 也不许落进 `.ad-danger-actions`（否则会跟「允许一次 / 拒绝」挤成一排、混淆语义）
+    const jump = hostJumpBtn(row)
+    assert.ok(jump, '蓝球行带 sessionId ⇒ 必须有入口')
+    assert.equal(byClass(row, 'ad-btn').filter((b) => b.title === '打开该子代理会话').length, 1, '入口只有一个，不重复渲染')
     const actions = byClass(row, 'ad-danger-actions')
     assert.equal(actions.length, 1)
+    assert.equal(actions[0].contains(jump), false, '入口不得渲染进决策操作行容器')
     for (const [cls] of infoLines(row)) {
       for (const el of byClass(row, cls)) {
         assert.equal(actions[0].contains(el), false, `${cls} 不得渲染进操作行容器`)

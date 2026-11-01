@@ -1,3 +1,31 @@
+## 1.12.29（2026-11-01）
+
+> 一句话：**蓝球（宿主 `approval/request` 通道）每条待授权行新增「打开会话」入口** —— 琥珀球的行
+> 点一下就跳子代理会话，蓝球的行过去没有任何入口，用户只能自己到侧边栏里翻；而条目里本来就有
+> `sessionId`（订阅时 `sessions.scopeOf(this)` 取的 agent scope）。
+
+### 改动
+
+| 位置 | 改动 |
+| --- | --- |
+| `lib/client.js`（模块作用域 `buildHostApprovalJumpRow`） | 新增**唯一**入口装配件：`ad-actions`（右对齐）+ `ad-btn mini` 的「打开会话」按钮，`title = 打开该子代理会话`，`textContent` 写入（不用 `innerHTML`）。渲染条件 = `item.sessionId` 有值 **且** `openAgentSession` 是函数（未绑定为 `null` ⇒ 不渲染）；点击走**单参** `openAgentSession(item.sessionId)`（与 `:3015` 主会话按钮同一形态），包 `try/catch` 且对返回的 Promise 挂空 `catch` ⇒ 宿主导航失败一律静默，不牵连同行的审批按钮 |
+| `lib/client.js`（蓝球 `renderPop` 普通行） | 在决策按钮行**之前**渲染入口（按钮行 `sticky bottom`，排在它后面在长内容下会被滚出视口） |
+| `lib/client.js`（蓝球 `renderPop` 高危行） | `buildDangerAskRow` 返回后用 `insertBefore` 插到 `.ad-danger-actions` 之前。**没有**沿用它的 `jump` 参数：那是琥珀球的文字链接形态，本轮统一成按钮 |
+| `lib/client.js`（蓝球 `renderPop` ACP 孪生行） | 孪生行同样给入口（孪生的 `sessionId` 就是子代理会话），插在它的两个按钮之前 |
+| CSS | **零新增**：复用既有 `.ad-actions`（`display:flex;justify-content:flex-end`）与 `.ad-btn.mini`，未引入任何色值 |
+
+琥珀球一个字没动（它本来就靠整行点击 / `.ad-danger-jump` 跳转）；`RunCard` 也没动。
+
+### 测试
+
+`test/grant-dialog.test.js` 新增 `v1.12.29 蓝球待授权行：打开会话入口`（5 例：渲染 + 单参跳转、
+`sessionId` 缺失 / 空串 / 条目为 null、导航桥为 null、同步抛错与 Promise reject 都不冒泡、
+三条渲染分支各接一处且除定义外没有别的调用点）。
+`test/danger-permission-dialog.test.js` 的旧契约（v1.12.16「蓝球不加跳转入口」）按本轮裁定改写：
+决策按钮集合改为按**决策操作行容器**取（`ad-perm-actions` / `ad-ha-actions` / `ad-danger-actions`），
+入口是导航不是决策按钮 ⇒ 「高危行按钮恰好 = {允许一次, 拒绝}」这条不变量继续成立；
+该文件假 DOM 补 `insertBefore`（生产插入位置所需）。
+
 ## 1.12.28（2026-11-01）
 
 > 一句话：**宿主审批命令正文新增第二来源（commandLine / toolArgs）**，修复 ACP 适配器转发来的

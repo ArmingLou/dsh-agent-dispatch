@@ -137,7 +137,7 @@ function buildGrantModule(inputDoc) {
   const doc = inputDoc || fakeDocument()
   const pending = []
   const factory = new Function('document', 'setTimeout',
-    helpersSrc + '\nreturn { isEscalationReason, toolGrantKeyOf, parentDirOf, resolveAgainstCwd, dirsOfPaths, absolutizeDirs, linesToPaths, permGrantTip, openGrantDialog, askReasonLabel, buildGrantAskBlock, appendPendingAskLines, pendingAskLinesOf, PENDING_CMD_PREVIEW_CHARS };')
+    helpersSrc + '\nreturn { isEscalationReason, toolGrantKeyOf, parentDirOf, resolveAgainstCwd, dirsOfPaths, absolutizeDirs, linesToPaths, permGrantTip, openGrantDialog, askReasonLabel, buildGrantAskBlock, appendPendingAskLines, pendingAskLinesOf, buildHostApprovalJumpRow, PENDING_CMD_PREVIEW_CHARS };')
   const mod = factory(doc, (fn) => { pending.push(fn); return pending.length })
   return { mod, doc, flushTimeouts: () => pending.splice(0).forEach((f) => f()) }
 }
@@ -1926,5 +1926,62 @@ describe('v1.12.27 运行卡片 RunCard：待授权逐条列出命令原文 + �
     const card = buildRunCard(mod)({ childId: 'child-2', agentName: 'A1', startedAt: Date.now() })
     assert.equal(vByClass(card, 'ad-run-pending').length, 0)
     assert.match(vText(card), /运行中/)
+  })
+})
+
+// ── v1.12.29：蓝球（宿主 approval/request 通道）每条待授权行的「打开会话」入口 ──
+// 现场缺口：琥珀球的行点一下就跳子代理会话，蓝球的行没有任何跳转入口——
+// 明明 item.sessionId 就在条目里（订阅时 sessions.scopeOf(this) 取的 agent scope）。
+// 这里钉三件事：渲染条件（sessionId + 导航桥都就位）、点击语义（单参、失败静默）、
+// 以及三条蓝球渲染分支（普通 / 高危 / ACP 孪生）都接上了这个入口。
+describe('v1.12.29 蓝球待授权行：打开会话入口', () => {
+  const mkItem = (extra = {}) => Object.assign({ toolName: 'Bash', sessionId: 'sess-1' }, extra)
+
+  it('① 有 sessionId 且有导航桥 ⇒ 渲染「打开会话」按钮（ad-btn mini，title 写明子代理会话）', () => {
+    const { mod } = buildGrantModule()
+    const seen = []
+    const row = mod.buildHostApprovalJumpRow(mkItem(), (id) => { seen.push(id); return Promise.resolve(true) })
+    assert.ok(row, '有 sessionId 必须渲染入口')
+    const btns = byClass(row, 'ad-btn')
+    assert.equal(btns.length, 1, '入口恰好一个按钮，不多不少')
+    const btn = btns[0]
+    assert.equal(btn.textContent, '打开会话')
+    assert.equal(btn.title, '打开该子代理会话')
+    assert.ok(String(btn.className).split(/\s+/).includes('mini'), '样式沿用既有 ad-btn mini，不新增色值')
+    btn.click()
+    assert.deepEqual(seen, ['sess-1'], '单参调用：跳的就是该条目自己的 sessionId')
+  })
+
+  it('② 缺 sessionId ⇒ 不渲染（没绑到会话就无处可跳，不给死按钮）', () => {
+    const { mod } = buildGrantModule()
+    const open = () => { throw new Error('不该被调用') }
+    assert.equal(mod.buildHostApprovalJumpRow(mkItem({ sessionId: null }), open), null)
+    assert.equal(mod.buildHostApprovalJumpRow(mkItem({ sessionId: '' }), open), null)
+    assert.equal(mod.buildHostApprovalJumpRow({ toolName: 'Bash' }, open), null)
+    assert.equal(mod.buildHostApprovalJumpRow(null, open), null)
+  })
+
+  it('③ 导航桥为 null（openAgentSession 未绑定）⇒ 不渲染且不报错', () => {
+    const { mod } = buildGrantModule()
+    assert.equal(mod.buildHostApprovalJumpRow(mkItem(), null), null)
+    assert.equal(mod.buildHostApprovalJumpRow(mkItem(), undefined), null)
+  })
+
+  it('④ 点击同步抛错 / 异步失败 ⇒ 都不冒泡（入口只是导航，不参与审批决策）', async () => {
+    const { mod } = buildGrantModule()
+    const syncRow = mod.buildHostApprovalJumpRow(mkItem({ sessionId: 'sess-sync' }), () => { throw new Error('nav refused') })
+    assert.doesNotThrow(() => byClass(syncRow, 'ad-btn')[0].click(), '同步抛错必须被吞掉')
+    const asyncRow = mod.buildHostApprovalJumpRow(mkItem({ sessionId: 'sess-async' }), () => Promise.reject(new Error('nav refused')))
+    assert.doesNotThrow(() => byClass(asyncRow, 'ad-btn')[0].click(), '异步失败也必须被吞掉（否则 unhandled rejection）')
+    await Promise.resolve()
+    await Promise.resolve()
+  })
+
+  it('⑤ 三条蓝球渲染分支（普通 / 高危 / ACP 孪生）都接上了入口，琥珀球没被顺手改', () => {
+    const calls = src.split('buildHostApprovalJumpRow(item, openAgentSession)').length - 1
+    assert.equal(calls, 3, `蓝球的普通行、高危行、孪生行各一处，实际 ${calls} 处`)
+    assert.equal(src.split('buildHostApprovalJumpRow(').length - 1, calls + 1, '除定义外不得有别的调用点（琥珀球不该被改）')
+    assert.match(src, /function buildHostApprovalJumpRow\(item, openSession\)/, '实现保持可被单测抠出执行')
+    assert.doesNotMatch(src.slice(src.indexOf('function buildHostApprovalJumpRow('), src.indexOf('function buildHostApprovalJumpRow(') + 1200), /innerHTML/, '不许用 innerHTML 拼按钮')
   })
 })
