@@ -1,3 +1,22 @@
+## 1.12.28（2026-11-01）
+
+> 一句话：**宿主审批命令正文新增第二来源（commandLine / toolArgs）**，修复 ACP 适配器转发来的
+> 请求在蓝球面板上显示「无法解析命令正文」——命令原文其实一直随请求传来，只是宿主过去只从
+> **本会话的 tool/call 记录**取正文，而 ACP 请求没有这条记录。
+
+### 改动
+
+| 位置 | 改动 |
+| --- | --- |
+| `lib/host-approval.js`（`resolveApprovalContext`） | 新增可选入参 `commandLine` / `toolArgs`。`commandText` 取值优先级：① 会话记录（现状，最高优先，口径不变）→ ② `commandLine`（非空字符串）→ ③ `commandTextOf(toolArgs)` |
+| `lib/host-approval.js`（同上） | 判定字段与展示字段**同源**：`argsText` 与 `paths` 一并从第二来源取（拿不到结构化 args 时把正文当 `{command}` 交给同一套 `extractToolPathGroups`）；`commandRelativePaths` 与 `execLikely` 也对两个来源同一口径。只填展示字段等于判定侧还是瞎的 |
+| `index.js`（`approval/request` 监听器） | 把 `req.commandLine` / `req.toolArgs` 传给 `resolveApprovalContext`。适配器侧（`external-agent-approval.ts`）早就在请求上带这两个字段，宿主这一侧过去完全没读 |
+
+**判定语义一个字没动**：超长门 → 危险命令门 → 执行类无正文门 → 工作区档 → 工具名档 → 四档的
+顺序与判据全部保持原样。原来因取不到正文而 `next()` 的请求现在拿到正文后照常走这些门（能判就判），
+`askReason` 因此不再报 `no-command-text`，而由实际命中的门/档给出；面板只读区（v1.12.25/1.12.27）
+无需改动，`commandText` 非空即自动显示命令原文。
+
 ## 1.12.27（2026-11-01）
 
 > 一句话：**浮球面板显示命令原文与拦截原因** —— 1.12.25/1.12.26 只把「要执行什么 + 为什么被拦」

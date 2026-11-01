@@ -361,7 +361,15 @@ export function apply(ctx, config = {}) {
         const session = req?.agent?.session
         const sessionId = session?.id
         if (!sessionId) return next()
-        ctxInfo = resolveApprovalContext({ session, callId: req.callId, toolName: req.toolName, reason: req.reason })
+        // v1.12.28：`commandLine` / `toolArgs` 是**命令正文的第二来源**。ACP 适配器转发的
+        // 审批请求在本会话里**没有 tool/call 记录**（`findToolCallRecord` 反查不到），
+        // 但正文其实随请求传来了 —— 不传下去就会白白落到「执行类无正文」门
+        // （面板显示「无法解析命令正文」）。会话记录仍是最高优先，见
+        // lib/host-approval.js 的 resolveApprovalContext。
+        ctxInfo = resolveApprovalContext({
+          session, callId: req.callId, toolName: req.toolName, reason: req.reason,
+          commandLine: req.commandLine, toolArgs: req.toolArgs,
+        })
         // 解析根会话 id：同一主代理会话内所有子代理共享工具名授权
         const rootSessionId = resolveRootSessionId(session, dispatcher, (sid) => hostApproval.sessionRootOf(sid))
         // 注册映射：purgeSession 时可从子会话 id 反查根 id 清除 #toolGrants

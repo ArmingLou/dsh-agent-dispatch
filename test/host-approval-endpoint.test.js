@@ -18,11 +18,16 @@ import path from 'node:path'
 import { boot, mkSession } from './agent-api-harness.js'
 
 /** 驱动真实 approval/request 监听器：返回 {res, nextCalled}（res='allowed-once' 即自动放行） */
-async function approve(b, session, { callId = null, toolName = null, reason = 'tool requires approval' } = {}) {
+async function approve(b, session, { callId = null, toolName = null, reason = 'tool requires approval', commandLine, toolArgs } = {}) {
   let nextCalled = false
   const outs = b.fireEvent(
     'approval/request',
-    { agent: { session }, callId, toolName, reason },
+    {
+      agent: { session }, callId, toolName, reason,
+      // v1.12.28：ACP 适配器转发请求时带上的正文第二来源（缺省时不写，保持旧请求形状）
+      ...(commandLine === undefined ? {} : { commandLine }),
+      ...(toolArgs === undefined ? {} : { toolArgs }),
+    },
     () => { nextCalled = true; return 'NEXT' },
   )
   const res = await outs[0]
@@ -1270,6 +1275,86 @@ describe('v1.12.25 面板只读区：pending 上下文带 commandText + askReaso
       assert.equal(ctx.shapeRule, null)
       assert.equal(ctx.commandText, '')
       assert.equal(ctx.argsText, '')
+    } finally { await b.close() }
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// v1.12.28：命令正文的**第二来源**（`commandLine` / `toolArgs`）
+//
+// 现场（用户真机）：`dsh-acp-adapter` 把 ACP 权限请求转入宿主审批后，蓝球面板显示
+// 「拦截原因：无法解析命令正文」——命令原文其实**已经随请求传来了**，只是宿主过去只从
+// **本会话的 tool/call 记录**取正文，而 ACP 请求根本没有这条记录
+// （适配器侧注释：“ACP has no native tool-call record for an answerer to resolve”）。
+//
+// 本组钉住两件事，缺一不可：
+//   ① 展示字段 `commandText` 拿到原文（面板只读区据此显示命令）；
+//   ② 判定字段（`paths` / `argsText`）**同一口径**也拿到 —— 只填展示字段等于判定侧还是瞎的，
+//      所以「toolArgs 里的 rm -rf 必须被危险门拦下」这条用例是核心，不是陪衬。
+// 反向用例守住不回归：既无记录、也无第二来源 ⇒ 仍是 `no-command-text`。
+// ────────────────────────────────────────────────────────────────────────────
+describe('v1.12.28 命令正文第二来源：commandLine / toolArgs（ACP 适配器转发的审批）', () => {
+  const WS = '/tmp/dsh-acp-cmdline-ws'
+  const ctxOf = async (b, callId, sessionId) => {
+    const { status, json } = await b.req('GET', '/agent-api/host-approval-context?callId=' + callId + '&sessionId=' + sessionId)
+    assert.equal(status, 200)
+    return json
+  }
+
+  it('无 tool/call 记录 + commandLine ⇒ commandText 逐字下发，归因落在实际的门（不再是 no-command-text）', async () => {
+    const b = await boot()
+    try {
+      // 无 toolCalls ⇒ findToolCallRecord 反查不到 ⇒ callFound=false（现场同形）
+      const s = mkSession({ id: 'acp-1', cwd: WS })
+      const r = await approve(b, s, {
+        callId: 'a1', toolName: 'execute', commandLine: 'cat /etc/hosts', reason: 'ACP 会话的权限请求',
+      })
+      assert.equal(r.nextCalled, true, '前置：这条仍在人工审批（正文来源变了，判定链没变）')
+      const ctx = await ctxOf(b, 'a1', 'acp-1')
+      assert.equal(ctx.callFound, false, '前置：本会话确实没有这次调用的记录')
+      assert.equal(ctx.commandText, 'cat /etc/hosts', '面板必须显示命令原文，而不是空串')
+      assert.notEqual(ctx.askReason, 'no-command-text', '拿到正文后不得再报「无法解析命令正文」')
+      assert.equal(ctx.askReason, 'no-workspace-cover',
+        '归因应由实际门给出（/etc/hosts 在工作区外）——证明正文真的进了判定，不只是展示')
+      assert.ok(ctx.paths.includes('/etc/hosts'), '路径提取与正文同源：/etc/hosts 必须进判定集')
+    } finally { await b.close() }
+  })
+
+  it('无记录 + 只带 toolArgs ⇒ 正文正确，且**危险门真的命中**（新来源参与判定）', async () => {
+    const b = await boot()
+    try {
+      const s = mkSession({ id: 'acp-2', cwd: WS })
+      await approve(b, s, {
+        callId: 'a2', toolName: 'execute', toolArgs: { command: 'rm -rf /tmp/x' },
+      })
+      const ctx = await ctxOf(b, 'a2', 'acp-2')
+      assert.equal(ctx.commandText, 'rm -rf /tmp/x', 'toolArgs 的 command 键要能被取成正文')
+      assert.equal(ctx.askReason, 'danger', '新来源必须进危险命令门——只填展示字段就是安全漏洞')
+      assert.equal(ctx.dangerRule, 'rm -rf')
+      assert.ok(ctx.argsText.includes('rm -rf /tmp/x'), 'argsText 与正文同源（自定义执行工具那一格）')
+    } finally { await b.close() }
+  })
+
+  it('反向：既无记录也无第二来源 ⇒ 仍是 no-command-text（不回归）', async () => {
+    const b = await boot()
+    try {
+      const s = mkSession({ id: 'acp-3', cwd: WS })
+      const r = await approve(b, s, { callId: 'a3', toolName: 'execute' })
+      assert.equal(r.nextCalled, true)
+      const ctx = await ctxOf(b, 'a3', 'acp-3')
+      assert.equal(ctx.commandText, '')
+      assert.equal(ctx.askReason, 'no-command-text', '保守策略：判不出正文就不放行，归因保持不变')
+    } finally { await b.close() }
+  })
+
+  it('新来源也走完整判定链：工作区内命令 ⇒ 工作区档照常放行（不是「拿到正文就一律转人工」）', async () => {
+    const b = await boot()
+    try {
+      const s = mkSession({ id: 'acp-4', cwd: WS })
+      const r = await approve(b, s, {
+        callId: 'a4', toolName: 'execute', commandLine: `cat ${WS}/a.txt`,
+      })
+      assert.equal(r.res, 'allowed-once', '门序未变：危险门在前、工作区档在后，正文可判即可判')
     } finally { await b.close() }
   })
 })
